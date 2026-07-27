@@ -78,7 +78,7 @@ $tenantId = $org.Id
 $tenantDomain = ($org.VerifiedDomains | Where-Object IsInitial).Name
 $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName "$Prefix-dc" `
     -CommandId 'RunPowerShellScript' `
-    -ScriptPath (Join-Path $PSScriptRoot 'scripts\create-scp.ps1') `
+    -ScriptPath (Join-Path (Join-Path $PSScriptRoot 'scripts') 'create-scp.ps1') `
     -Parameter @{ TenantId = $tenantId; TenantDomain = $tenantDomain }
 ($r.Value | Where-Object Code -like '*StdOut*').Message | Write-Host
 
@@ -86,7 +86,7 @@ $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName "$Prefi
 Step '4/4 Configuring client (cloud TGT policy + hybrid join, reboots)'
 $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName "$Prefix-cli" `
     -CommandId 'RunPowerShellScript' `
-    -ScriptPath (Join-Path $PSScriptRoot 'scripts\client-config.ps1')
+    -ScriptPath (Join-Path (Join-Path $PSScriptRoot 'scripts') 'client-config.ps1')
 ($r.Value | Where-Object Code -like '*StdOut*').Message | Write-Host
 
 Write-Host @"

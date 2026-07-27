@@ -58,8 +58,10 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 # Prefer the precompiled ARM JSON so no Bicep CLI is required. If it's missing
 # but the Bicep CLI happens to be installed, fall back to main.bicep.
 Step '1/8 Deploying infrastructure'
-$jsonTemplate = Join-Path $scriptRoot 'bicep\azuredeploy.json'
-$bicepTemplate = Join-Path $scriptRoot 'bicep\main.bicep'
+# Nested Join-Path keeps paths correct on both Windows PowerShell 5.1 and
+# PowerShell 7 (Cloud Shell / Linux) - avoid literal backslashes.
+$jsonTemplate = Join-Path (Join-Path $scriptRoot 'bicep') 'azuredeploy.json'
+$bicepTemplate = Join-Path (Join-Path $scriptRoot 'bicep') 'main.bicep'
 if (Test-Path $jsonTemplate) {
     $templateFile = $jsonTemplate
     Write-Host 'Using ARM JSON template (no Bicep CLI needed).'
@@ -92,7 +94,7 @@ function Invoke-VmScript {
         try {
             $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VmName `
                 -CommandId 'RunPowerShellScript' `
-                -ScriptPath (Join-Path $scriptRoot "scripts\$ScriptFile") `
+                -ScriptPath (Join-Path (Join-Path $scriptRoot 'scripts') $ScriptFile) `
                 -Parameter $Params -ErrorAction Stop
             $out = ($r.Value | Where-Object Code -like '*StdOut*').Message
             $err = ($r.Value | Where-Object Code -like '*StdErr*').Message

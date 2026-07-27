@@ -1,0 +1,17 @@
+# Never commit the source support-wiki PDFs (Microsoft Confidential / NDA)
+*.pdf.source
+source-wikis/
+*Overview.pdf
+
+# Old/working copies
+docs/_archive-old/
+*_flowqa*.png
+
+# Local editor / OS cruft
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Keep the printable flowchart PDF (it's ours). If you prefer not to track
+# generated PDFs, uncomment the next line and regenerate from the .svg:
+# docs/diagnostic-flowchart.pdf

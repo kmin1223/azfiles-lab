@@ -21,7 +21,7 @@ everything at the end and redeploy before Session 2 (you'll get a reminder).
   `CONTOSO\labuser1`.
 
 Replace `<sa>` everywhere with your storage account name from the deploy output
-(e.g. `azflabphp4x4o7s4pa6`).
+(it looks like `azflab` + a random suffix, e.g. `azflababcd1234efgh`).
 
 **Handy to keep open:** `diagnostic-flowchart.pdf` — a one-page "symptom → cause"
 tree for both sessions.
@@ -43,11 +43,24 @@ this lab breaks one of those pieces.
 
 - Azure subscription with the **Owner** role and quota for two `Standard_B2ms`
   VMs.
-- PowerShell 7+ with the Az module: `Install-Module Az -Scope CurrentUser`
-- An RDP client, connected to your Azure VPN (RDP is allowed from the AzureCloud
-  service tag).
+- Where you'll run the deploy/fault commands — pick one:
+  - **Azure Cloud Shell (easiest):** nothing to install — Az and Microsoft.Graph
+    are already there, and there's no execution-policy / "unblock" friction.
+  - **Local PowerShell 7+:** `Install-Module Az -Scope CurrentUser`.
+- An **RDP client**, connected to your Azure VPN (RDP is allowed from the
+  AzureCloud service tag). *Required either way* — the klist / net use / mount
+  steps happen inside the VMs, which Cloud Shell can't do.
 
 No Bicep CLI required.
+
+> **Running in Cloud Shell?** Get the kit with
+> `git clone https://github.com/kmin1223/azfiles-lab.git`, `cd` into it, and
+> skip the `Unblock-File` /
+> `Set-ExecutionPolicy` lines below — they're Windows-only. Type paths with
+> forward slashes (`./deploy.ps1`, `./faults/Invoke-Fault.ps1`). One caveat:
+> Cloud Shell disconnects after ~20 min idle; the deploy prints output the
+> whole time so it stays alive, and if it ever drops just re-run the same
+> command (it resumes safely).
 
 ---
 
@@ -56,11 +69,13 @@ No Bicep CLI required.
 In PowerShell, from the `session1-adds` folder:
 
 ```powershell
-Get-ChildItem -Path .\ -Recurse | Unblock-File
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+Get-ChildItem -Path .\ -Recurse | Unblock-File            # local Windows only
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # local Windows only
 Connect-AzAccount
 .\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 ```
+
+*(In Cloud Shell, skip the first two lines and run `./deploy.ps1 …`.)*
 
 Enter a lab admin password when prompted (12+ chars; avoid spaces, quotes,
 backticks, `$`). The script runs unattended for ~15–30 minutes.

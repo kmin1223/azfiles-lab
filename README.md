@@ -1,5 +1,12 @@
 # Azure Files Identity-Based Auth — Hands-On Lab Kit
 
+> **Publishing this repo?** It's safe to make public — no secrets, keys,
+> subscription/tenant IDs, or real IPs are stored here (passwords are prompted
+> at runtime; kerb keys are fetched at runtime). Two rules: **do not add the
+> source Microsoft support-wiki PDFs** (they're Microsoft Confidential / NDA and
+> live outside this folder), and don't commit `docs/_archive-old/`. A
+> `.gitignore` already covers both.
+
 Two 60-minute sessions. Each session: attendees kick off an automation script
 in **their own subscription** at minute 0, the presenter covers concepts on
 slides while it deploys, then everyone does guided break/fix labs together.
@@ -50,14 +57,26 @@ azfiles-lab/
   needed for admin consent and Cloud Sync. A personal dev tenant
   (e.g., via the M365 developer program or a new trial) is strongly
   recommended over a corporate tenant.
-- PowerShell 7+, modules: `Install-Module Az, Microsoft.Graph -Scope CurrentUser`
-- RDP client.
+- Where to run the deploy/fault commands — either works:
+  - **Azure Cloud Shell (recommended):** Az + Microsoft.Graph are preinstalled,
+    and there's no execution-policy / unblock friction. Get the kit with
+    `git clone https://github.com/kmin1223/azfiles-lab.git`. Use forward-slash
+    paths (`./deploy.ps1`).
+  - **Local PowerShell 7+:** `Install-Module Az, Microsoft.Graph -Scope CurrentUser`.
+- RDP client (required either way — the in-VM klist/mount steps aren't a shell
+  task).
 - **No Bicep CLI needed** — the deployment uses a precompiled ARM JSON template.
+
+> Scripts use nested `Join-Path`, so they run unchanged on both Windows
+> PowerShell 5.1 and PowerShell 7 (Cloud Shell / Linux).
 
 ## Session 1 quick start (attendees)
 
 ```powershell
-# 0. Downloaded/extracted files carry a "block" flag - clear it once for the whole kit
+# Get the kit (Cloud Shell or local):
+#   git clone https://github.com/kmin1223/azfiles-lab.git ; cd azfiles-lab/session1-adds
+
+# 0. Downloaded/extracted files carry a "block" flag - clear it once for the whole kit (local Windows only)
 Get-ChildItem -Path .\ -Recurse | Unblock-File
 
 # 1. Allow the unsigned lab scripts to run in THIS window only (resets when you close it)

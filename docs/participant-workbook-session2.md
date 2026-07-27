@@ -40,7 +40,18 @@ Beyond your Session 1 subscription:
 - **Global Administrator** on a dev/trial Entra tenant (not corporate prod).
   Least-privilege alternative: **Hybrid Identity Administrator** (Cloud Sync) +
   **Cloud Application Administrator** (admin consent).
-- `Install-Module Microsoft.Graph -Scope CurrentUser`
+- Where you run the commands:
+  - **Azure Cloud Shell (easiest):** Az and Microsoft.Graph are already
+    installed — nothing to add.
+  - **Local PowerShell 7+:** `Install-Module Az, Microsoft.Graph -Scope CurrentUser`
+    (or just the two used here:
+    `Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Applications`).
+- An **RDP client** on your Azure VPN — still required for the in-VM steps.
+
+> **Cloud Shell note:** clone the kit
+> (`git clone https://github.com/kmin1223/azfiles-lab.git`), use forward-slash
+> paths (`./deploy.ps1`, `./setup.ps1`), and skip the Windows-only
+> `Unblock-File` / `Set-ExecutionPolicy` lines.
 
 ---
 
