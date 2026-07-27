@@ -57,50 +57,75 @@ azfiles-lab/
   needed for admin consent and Cloud Sync. A personal dev tenant
   (e.g., via the M365 developer program or a new trial) is strongly
   recommended over a corporate tenant.
-- Where to run the deploy/fault commands — either works:
-  - **Azure Cloud Shell (recommended):** Az + Microsoft.Graph are preinstalled,
-    and there's no execution-policy / unblock friction. Get the kit with
-    `git clone https://github.com/kmin1223/azfiles-lab.git`. Use forward-slash
-    paths (`./deploy.ps1`).
-  - **Local PowerShell 7+:** `Install-Module Az, Microsoft.Graph -Scope CurrentUser`.
+- Where to run the deploy/fault commands — two options (quick-start below has
+  a section for each):
+  - **Azure Cloud Shell (recommended):** nothing to install (Az + Microsoft.Graph
+    preinstalled), already signed in, no execution-policy / unblock friction.
+    Commands use forward slashes (`./deploy.ps1`).
+  - **Local Windows PowerShell:** run `Install-Module Az, Microsoft.Graph -Scope CurrentUser`
+    once; commands use back slashes (`.\deploy.ps1`).
 - RDP client (required either way — the in-VM klist/mount steps aren't a shell
   task).
 - **No Bicep CLI needed** — the deployment uses a precompiled ARM JSON template.
 
-> Scripts use nested `Join-Path`, so they run unchanged on both Windows
-> PowerShell 5.1 and PowerShell 7 (Cloud Shell / Linux).
+> The scripts themselves are cross-platform (nested `Join-Path`), so they run
+> unchanged on Windows PowerShell 5.1 and on Cloud Shell (PowerShell 7 / Linux).
+> The only difference is the path separator you type: `./` vs `.\`.
 
 ## Session 1 quick start (attendees)
 
+Pick the row that matches where you're running. Everything after the deploy
+command is identical.
+
+### Option A — Azure Cloud Shell (recommended)
+
+Open Cloud Shell (PowerShell) at <https://portal.azure.com> → the `>_` icon.
+You're already signed in, and Az/Microsoft.Graph are preinstalled — no setup.
+
 ```powershell
-# Get the kit (Cloud Shell or local):
-#   git clone https://github.com/kmin1223/azfiles-lab.git ; cd azfiles-lab/session1-adds
+git clone https://github.com/kmin1223/azfiles-lab.git
+cd azfiles-lab/session1-adds
+./deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
+```
 
-# 0. Downloaded/extracted files carry a "block" flag - clear it once for the whole kit (local Windows only)
+*(Multiple subscriptions? Run `Set-AzContext -Subscription "<name-or-id>"`
+before deploy.)*
+
+### Option B — Local Windows PowerShell
+
+```powershell
+# one-time per window: clear the internet "block" flag and allow unsigned scripts
 Get-ChildItem -Path .\ -Recurse | Unblock-File
-
-# 1. Allow the unsigned lab scripts to run in THIS window only (resets when you close it)
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
-# 2. Deploy
 Connect-AzAccount
 cd session1-adds
 .\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 ```
 
-> Two things that trip up files copied from the internet:
-> - **"file cannot be copied / opened" or a SmartScreen block** → run the
->   `Unblock-File` line above from the kit's root folder (clears Mark-of-the-Web).
-> - **"running scripts is disabled"** → the `Set-ExecutionPolicy` line fixes it.
->
-> The fault scripts are unsigned too, so keep the same window open for the labs.
+> Local-Windows-only snags: a **"file cannot be opened / SmartScreen"** block is
+> fixed by the `Unblock-File` line; **"running scripts is disabled"** by the
+> `Set-ExecutionPolicy` line. Keep the same window open for the fault labs.
 
-Everything else is automated: forest promotion, lab users
+The deploy is fully automated from here: forest promotion, lab users
 (`labuser1`/`labuser2`), client domain join, storage account domain join
 (computer account + SPN + kerb1 key), AD DS auth enablement, default share
-permission, NTFS ACLs.
+permission, and NTFS ACLs.
 
 ## Session 2 quick start (attendees)
+
+Session 2 reuses the Session 1 environment, so **redeploy Session 1 first** if
+you tore it down (see `docs/pre-session-announcements.md`).
+
+### Option A — Azure Cloud Shell
+
+```powershell
+cd azfiles-lab/session2-entra-kerberos
+./setup.ps1 -ResourceGroupName azfiles-lab
+# then follow MANUAL-STEP-cloud-sync.md (~10 min, Global Admin in browser)
+```
+
+### Option B — Local Windows PowerShell
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
@@ -112,14 +137,16 @@ cd session2-entra-kerberos
 
 ## Break/fix (presenter-driven, everyone follows along)
 
+Cloud Shell uses `./faults/...`; local Windows uses `.\faults\...`.
+
 ```powershell
-# Session 1
-.\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch
-.\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch -Repair
+# Session 1  (from the session1-adds folder)
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch -Repair
 # Faults: PasswordMismatch | SpnBroken | EtypeMismatch | Block445 | NoShareAccess
 
-# Session 2
-.\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
+# Session 2  (from the session2-entra-kerberos folder)
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
 # Faults: NoCloudTgt | ConsentRevoked | NotHybridJoined | NoShareAccess
 ```
 
