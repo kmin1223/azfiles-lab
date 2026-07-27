@@ -85,6 +85,12 @@ grants admin consent to its app, writes the hybrid-join SCP, configures the
 client for cloud tickets, and reboots the client. It ends by printing the
 remaining manual step.
 
+**Why:** a storage account can use only **one** identity source at a time, so
+the script first **disables the Session 1 AD DS auth**, then enables Entra
+Kerberos on the same account. Everything else from Session 1 is reused as-is —
+the DC, the domain-joined client, and the `labuser1` account (which Cloud Sync
+turns into a hybrid identity in the next step).
+
 ---
 
 # Lab 2 · Sync a hybrid identity (Entra Cloud Sync)

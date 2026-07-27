@@ -39,16 +39,34 @@ $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName |
     Where-Object StorageAccountName -like "$Prefix*" | Select-Object -First 1
 if (-not $sa) { throw "No $Prefix* storage account found in $ResourceGroupName." }
 $saName = $sa.StorageAccountName
+$dsOption = $sa.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
 $adProps = $sa.AzureFilesIdentityBasedAuth.ActiveDirectoryProperties
-if (-not $adProps) { throw 'Session 1 must be completed first (AD properties missing).' }
+if ($dsOption -ne 'AADKERB' -and -not $adProps) {
+    throw 'Session 1 must be completed first (AD DS auth not configured on the storage account).'
+}
+# Keep the domain details before we change anything (disabling AD DS clears them).
+$domainName = $adProps.DomainName
+$domainGuid = $adProps.DomainGuid
 
 # ------------------------------------------------ 1. Enable Entra Kerberos
 Step "1/4 Enabling Entra Kerberos on $saName"
-Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
-    -EnableAzureActiveDirectoryKerberosForFile $true `
-    -ActiveDirectoryDomainName $adProps.DomainName `
-    -ActiveDirectoryDomainGuid $adProps.DomainGuid | Out-Null
-Write-Host "directoryServiceOptions is now AADKERB (domain: $($adProps.DomainName))"
+if ($dsOption -eq 'AADKERB') {
+    Write-Host 'Entra Kerberos already enabled - skipping this step.'
+}
+else {
+    # Azure does NOT allow flipping AD DS -> Entra Kerberos directly; the storage
+    # account must have AD DS auth disabled first, then AADKERB enabled.
+    if ($dsOption -eq 'AD') {
+        Write-Host 'Disabling AD DS auth first (required before enabling Entra Kerberos)...'
+        Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
+            -EnableActiveDirectoryDomainServicesForFile $false | Out-Null
+    }
+    Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
+        -EnableAzureActiveDirectoryKerberosForFile $true `
+        -ActiveDirectoryDomainName $domainName `
+        -ActiveDirectoryDomainGuid $domainGuid | Out-Null
+    Write-Host "directoryServiceOptions is now AADKERB (domain: $domainName)"
+}
 
 # --------------------------------------------------- 2. Grant admin consent
 Step '2/4 Granting admin consent to the storage account app (Graph)'
