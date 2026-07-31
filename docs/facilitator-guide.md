@@ -229,6 +229,18 @@ is no longer true. Diagnose: user's "On-premises sync enabled" attribute +
 client OS version. Fix: sync from AD (Cloud Sync / Connect Sync), or move to
 a supported OS for Entra-only.
 
+**AadCredentialDisallowedByAppManagementPolicy — enabling Entra Kerberos fails**
+Cause: enabling AADKERB adds a symmetric (password) key to the auto-created
+storage app, but a tenant App Management Policy forbids password-credential
+addition (or caps key lifetime < 366 days). Very common in corporate/hardened
+tenants — it's why the lab asks for a dev tenant. Fix (Global Admin): grant an
+exception for the **Storage Resource Provider** (app ID
+`a6aa9161-5291-40bb-8c5c-923b567bee3b`) on the "Block password addition" and
+"Restrict max password lifetime" settings at <https://aka.ms/app-mgmt-policy-ux>,
+then re-run `setup.ps1`. If policy can't change, use a subscription whose tenant
+has no such policy. Note the storage account is left in `None` state after a
+failed attempt (AD DS already disabled) — `setup.ps1` is idempotent and resumes.
+
 **MFA / Conditional Access (discussion only)**
 CA policy requiring MFA on the storage app breaks SMB silently-ish.
 Fix: exclude the `[Storage Account]` app from MFA policies.

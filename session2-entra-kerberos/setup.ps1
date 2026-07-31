@@ -40,13 +40,10 @@ $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName |
 if (-not $sa) { throw "No $Prefix* storage account found in $ResourceGroupName." }
 $saName = $sa.StorageAccountName
 $dsOption = $sa.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
-$adProps = $sa.AzureFilesIdentityBasedAuth.ActiveDirectoryProperties
-if ($dsOption -ne 'AADKERB' -and -not $adProps) {
-    throw 'Session 1 must be completed first (AD DS auth not configured on the storage account).'
-}
-# Keep the domain details before we change anything (disabling AD DS clears them).
-$domainName = $adProps.DomainName
-$domainGuid = $adProps.DomainGuid
+# States we handle: 'AD' (from Session 1 - disable then enable AADKERB),
+# 'None' (mid-transition, e.g. a prior run disabled AD DS but the enable failed),
+# 'AADKERB' (already done - skip). All are fine to proceed from.
+Write-Host "Current storage identity option: $dsOption"
 
 # ------------------------------------------------ 1. Enable Entra Kerberos
 Step "1/4 Enabling Entra Kerberos on $saName"
@@ -60,12 +57,53 @@ else {
         Write-Host 'Disabling AD DS auth first (required before enabling Entra Kerberos)...'
         Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
             -EnableActiveDirectoryDomainServicesForFile $false | Out-Null
+
+        # Wait for the disable to propagate before enabling AADKERB, otherwise the
+        # next call can fail with BadRequest during the state transition.
+        Write-Host 'Waiting for AD DS to fully disable...'
+        for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 15
+            $cur = (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName).AzureFilesIdentityBasedAuth.DirectoryServiceOptions
+            if ($cur -eq 'None') { break }
+        }
     }
-    Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
-        -EnableAzureActiveDirectoryKerberosForFile $true `
-        -ActiveDirectoryDomainName $domainName `
-        -ActiveDirectoryDomainGuid $domainGuid | Out-Null
-    Write-Host "directoryServiceOptions is now AADKERB (domain: $domainName)"
+
+    # Enable Entra Kerberos, with a short retry for transient BadRequest.
+    $enabled = $false
+    for ($i = 1; $i -le 4; $i++) {
+        try {
+            Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
+                -EnableAzureActiveDirectoryKerberosForFile $true -ErrorAction Stop | Out-Null
+            $enabled = $true
+            break
+        } catch {
+            $msg = $_.Exception.Message
+            # Tenant app management policy blocks the symmetric key the storage app
+            # needs - this is NOT transient, so stop and explain rather than retry.
+            if ($msg -match 'AppManagementPolicy' -or $msg -match 'Credential type not allowed') {
+                Write-Host ''
+                Write-Warning @'
+Entra Kerberos is blocked by a tenant App Management Policy (it forbids the
+symmetric key the storage account's app needs).
+
+Fix (needs a Global Admin), then re-run this script:
+  - Entra admin center: https://aka.ms/app-mgmt-policy-ux
+  - Grant an exception for the "Storage Resource Provider"
+    (app ID a6aa9161-5291-40bb-8c5c-923b567bee3b) on the
+    "Block password addition" and "Restrict max password lifetime" settings.
+  Docs: https://learn.microsoft.com/azure/storage/files/storage-files-identity-auth-hybrid-identities-enable#prerequisites
+
+If you can't change tenant policy, run the whole lab in a subscription whose
+tenant has no such policy (a personal/dev tenant).
+'@
+                throw 'Entra Kerberos enablement blocked by tenant app management policy (see guidance above).'
+            }
+            Write-Host "  enable attempt $i failed ($($msg.Split("`n")[0])); retrying in 30s..."
+            Start-Sleep -Seconds 30
+        }
+    }
+    if (-not $enabled) { throw 'Could not enable Entra Kerberos after several attempts.' }
+    Write-Host 'directoryServiceOptions is now AADKERB'
 }
 
 # --------------------------------------------------- 2. Grant admin consent

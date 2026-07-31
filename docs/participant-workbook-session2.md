@@ -47,6 +47,14 @@ Beyond your Session 1 subscription:
     (or just the two used here:
     `Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Applications`).
 - An **RDP client** on your Azure VPN — still required for the in-VM steps.
+- **No restrictive App Management Policy in the tenant.** Enabling Entra Kerberos
+  adds a symmetric key to an auto-created app; a tenant policy that blocks
+  password-credential addition (common in corporate/hardened tenants) will fail
+  it with `AadCredentialDisallowedByAppManagementPolicy`. This is the main reason
+  the lab wants a **dev/trial tenant, not corporate**. If you must use such a
+  tenant, a Global Admin can grant an exception for the **Storage Resource
+  Provider** (app ID `a6aa9161-5291-40bb-8c5c-923b567bee3b`) at
+  <https://aka.ms/app-mgmt-policy-ux>.
 
 > **Cloud Shell note:** clone the kit
 > (`git clone https://github.com/kmin1223/azfiles-lab.git`), use forward-slash
