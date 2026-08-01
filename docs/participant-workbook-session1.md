@@ -261,7 +261,67 @@ existing key still carries the old salt.
 
 ---
 
-# Lab 4 · Fix a mount failure (error 1396) — different root cause
+# Lab 4 · Access denied — with a perfect Kerberos ticket ★
+
+A real support case: a share stopped being reachable and the error said
+*"the user name or password is incorrect."* Kerberos was healthy the whole time.
+
+## Break it
+
+```powershell
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault CipherMismatch
+```
+
+The storage account is set to allow **AES-256-GCM only**; the client is set to
+offer **AES-128-GCM**.
+
+## Reproduce (Client VM)
+
+```
+net use * /delete /y
+klist purge
+net use Z: \\<sa>.file.core.windows.net\labshare
+```
+
+**Expected:** `Access is denied` (or "The user name or password is incorrect").
+
+## Diagnose
+
+First confirm Kerberos is *not* the problem:
+
+```
+klist
+```
+
+The `cifs/<sa>…` ticket is there. On the DC, event 4769 shows success. So
+authentication worked — the failure is after it.
+
+Now compare the two sides of the cipher negotiation:
+
+```powershell
+# client
+Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers
+# storage: Azure portal -> storage account -> File shares -> Security
+```
+
+They have no cipher in common. SMB negotiates the cipher **before** the client
+even names the storage account, so the service can't pick one per account — if
+there's no overlap, the session is refused and the error surfaces as an access
+denial.
+
+## Fix
+
+```powershell
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault CipherMismatch -Repair
+```
+
+**Why this matters:** the error text points straight at credentials, so the
+natural reaction is to audit RBAC, then NTFS, then the domain join — and find
+nothing wrong, because nothing is. In the real case that cost several days.
+
+---
+
+# Lab 5 · Fix a mount failure (error 1396) — different root cause
 
 Same symptom as Lab 3, different cause: here the AD account password and the
 storage kerb key simply fall out of sync (rotation policy, a manual reset).
@@ -329,7 +389,7 @@ keys, kerb1/kerb2, and you rotate between them).
 
 ---
 
-# Lab 5 · Fix a broken SPN (error 0xc000018b)
+# Lab 6 · Fix a broken SPN (error 0xc000018b)
 
 **Break it:**
 
@@ -345,7 +405,7 @@ klist get cifs/<sa>.file.core.windows.net
 ```
 
 **Expected:** the request fails with `0xc000018b` / "the SAM database does not
-have a computer account…". Unlike Labs 3–4, no ticket is issued at all.
+have a computer account…". Unlike the earlier labs, no ticket is issued at all.
 
 **Diagnose** (DC VM):
 
@@ -369,9 +429,9 @@ SPNs commonly come from manual joins or multi-forest setups.
 
 ---
 
-# Lab 6 · Two quick ones
+# Lab 7 · Two quick ones
 
-## 6a · Blocked port 445
+## 7a · Blocked port 445
 
 ```powershell
 .\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault Block445
@@ -391,7 +451,7 @@ Fix: `-Fault Block445 -Repair`.
 the fix is to open it or use a private endpoint / VPN. (A related but different
 error, 64, means 445 connects but a proxy/NAT drops the SMB handshake.)
 
-## 6b · Lost share-level access
+## 7b · Lost share-level access
 
 ```powershell
 .\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoShareAccess
@@ -483,4 +543,4 @@ Wireshark filter:  kerberos || smb2
 | System error 1396 (AP_ERR_MODIFIED) | Kerb key ≠ AD account password — **or** an AES salt mismatch (wrong DomainName) |
 | 0xc000018b / PRINCIPAL_UNKNOWN | SPN missing or wrong |
 | "encryption type not supported" | Encryption mismatch (use AES-256) |
-| System error 5, ticket valid | Authorization — share RBAC or NTFS |
+| System error 5, ticket valid | Authorization (share RBAC / NTFS) — **or an SMB cipher mismatch** |

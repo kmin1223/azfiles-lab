@@ -35,6 +35,19 @@
                     Symptom : mount OK-ish but Access Denied at share level
                     Repair  : restore StorageFileDataSmbShareContributor
 
+  CipherMismatch    Storage allows AES-256-GCM only; client offers AES-128-GCM.
+                    Symptom : Access denied / "username or password is
+                              incorrect" - pointing straight at credentials,
+                              while Kerberos is perfectly healthy
+                    Diagnose: Get-SmbClientConfiguration vs the account's SMB
+                              security settings; on the wire, Negotiate succeeds
+                              then the session/tree connect is refused
+                    Teach   : this is a REAL Sev case that cost days - the
+                              error text blames the identity, the cause is
+                              cipher negotiation
+                    Repair  : re-allow AES-128-GCM on the account and restore
+                              the client cipher order
+
   --- advanced (evidence required - the error text alone won't tell you) ---
 
   ClockSkew         Push the CLIENT clock ~10 minutes off the DC.
@@ -61,7 +74,7 @@ param(
     [Parameter(Mandatory)] [string]$ResourceGroupName,
     [Parameter(Mandatory)]
     [ValidateSet('PasswordMismatch', 'SpnBroken', 'EtypeMismatch', 'Block445', 'NoShareAccess',
-                 'ClockSkew', 'DuplicateSpn')]
+                 'CipherMismatch', 'ClockSkew', 'DuplicateSpn')]
     [string]$Fault,
     [switch]$Repair,
     [string]$Prefix = 'azflab'
@@ -174,6 +187,34 @@ Write-Output 'Client encryption types restored to default'
         if (-not $Repair) {
             Write-Host 'Client: mount/access -> Access is denied (share level, NOT NTFS).'
             Write-Host 'Teach: contrast with an NTFS deny - different layer, different error surface.'
+        }
+    }
+
+    'CipherMismatch' {
+        if (-not $Repair) {
+            # Storage: allow ONLY AES-256-GCM. Client: offer ONLY AES-128-GCM.
+            Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName `
+                -StorageAccountName $saName -SmbChannelEncryption 'AES-256-GCM' | Out-Null
+            Write-Host 'Storage account now allows AES-256-GCM only.'
+            Invoke-OnVm $cliName @'
+Set-SmbClientConfiguration -EncryptionCiphers "AES_128_GCM" -Confirm:$false
+Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers |
+    ForEach-Object { Write-Output "client ciphers: $_" }
+'@ | Write-Host
+            Write-Host ''
+            Write-Host 'Client: net use * /delete /y; klist purge; then mount -> Access denied.'
+            Write-Host 'Note how the error blames credentials. Kerberos is fine - compare:'
+            Write-Host '  client : Get-SmbClientConfiguration | select EncryptionCiphers'
+            Write-Host '  storage: Portal > File shares > Security (or Get-AzStorageFileServiceProperty)'
+        } else {
+            Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName `
+                -StorageAccountName $saName `
+                -SmbChannelEncryption 'AES-128-GCM;AES-256-GCM' | Out-Null
+            Invoke-OnVm $cliName @'
+Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_128_GCM,AES_128_CCM" -Confirm:$false
+Write-Output 'client cipher order restored'
+'@ | Write-Host
+            Write-Host 'Both sides can agree on a cipher again.'
         }
     }
 

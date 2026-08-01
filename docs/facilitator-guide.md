@@ -30,30 +30,25 @@ Session 2.
 | Time | Activity |
 |---|---|
 | 0:00–0:05 | Welcome. Everyone starts `deploy.ps1` in Cloud Shell (verify step 1/9 is running before moving on). |
-| 0:05–0:30 | Slides. Two blocks: **mechanism** (what the join creates → when tickets are issued → what decrypts what) and **evidence** (where the truth lives → reading a failed exchange). Poll deployment progress at ~0:26. |
-| 0:30–0:40 | Lab 1 (healthy state): mount, inspect the `cifs/` ticket, and **capture a known-good trace** with `Get-KerberosEvidence.ps1`. |
-| 0:40–0:55 | Labs 2–4 (break/fix): inject, reproduce, then diagnose **from evidence** (trace + event 4769), repair. Order: PasswordMismatch → SpnBroken → Block445/NoShareAccess. |
-| 0:55–1:00 | Wrap-up: triage table, Session 2 teaser. **Have everyone tear down** (`Remove-AzResourceGroup -Name azfiles-lab -Force`) to avoid idle VM costs over the gap between sessions. |
+| 0:05–0:28 | **Foundations** while it deploys: the four-stage exchange → the mechanism trio (join / tickets / encryption) → where the evidence lives → reading a failed exchange → identity sources, line of sight, what the automation built, the collector. |
+| 0:30–0:38 | **Lab 1** — the legacy environment. It mounts fine on RC4. Capture a known-good trace. |
+| 0:38–0:40 | *Concept:* RC4 retirement + the three-year-old defect (real Sev A). |
+| 0:40–0:50 | **Lab 2 ★** — the AES-256 migration: enforce → 1396 → diagnose from evidence → repair in the right order. |
+| 0:50–0:52 | *Concept:* SMB cipher negotiation. |
+| 0:52–0:56 | **Lab 3 ★** — access denied with a perfect ticket (cipher mismatch). |
+| 0:56–1:00 | Wrap-up: triage table, tear-down, Session 2 prereqs. |
 
-## Talking points while deploying (13 concept slides ≈ 25 min)
+Labs 4–7 in the workbook (blocked 445, share-level denial, plain 1396 key drift,
+broken SPN) plus the advanced faults are **self-service** — cover them only if
+you are ahead of schedule.
 
-This audience knows Kerberos — don't teach the protocol, teach **where Azure
-Files sits in it and how to prove where it broke**. Slide 4 sets up the four
-stages (AS / TGS / SessionSetup / TreeConnect) and names event 4769 for the
-first time.
+## Structure note — concepts sit next to their lab
 
-Give the most time to two clusters. First, the **mechanism trio**: what a domain
-join actually creates (AD account + password = kerb key + SPN), when tickets are
-issued and where they're cached, and — the payoff — what encrypts what, ending
-with "if neither kerb key opens the ticket, that's 1396." Second, the **evidence
-pair**: the five sources and what each uniquely answers, then the KRB-ERROR →
-stage mapping. The two rows that matter most there are "no 4769 at all" (the
-client never asked) and "4769 success + ACCESS_DENIED" (authorization, not
-authentication).
-
-The remaining slides — identity sources, line of sight, RC4 retirement, the
-three doors, the effective-access matrix — are 1 minute each. The RC4 slide
-lands better if you tie it back to key derivation from the mechanism trio.
+Foundations go up front because the deployment needs ~25 minutes of airtime.
+Everything after that is paired: the concept slide immediately precedes the lab
+that exercises it (RC4 → migration lab; cipher negotiation → cipher lab; three
+doors + matrix → the authorization labs). Say this out loud at the agenda slide
+so nobody wonders why RC4 shows up late.
 
 ## Lab flow details
 
@@ -180,16 +175,34 @@ layers together with the effective-access matrix (see slide): the user gets the
 storage key (bypasses share-level RBAC), check role assignments, `icacls`. Fix:
 assign share-level permission and/or NTFS rights.
 
-**System error 5 with all permissions correct — SMB cipher mismatch**
+**System error 5 / "the user name or password is incorrect" — SMB cipher mismatch**
+*(Lab 3, from a real support case that took days to resolve.)*
 Cause: cipher is negotiated in the SMB Negotiate, before the client names the
 storage account, so Azure Files can't choose a per-account cipher. If the
-account's SMB security allows only (say) AES-256-GCM and the client offers a
-different cipher first, the connection fails before auth. Diagnose: Portal →
-Storage account → File service → Security (which ciphers are allowed) vs
+account's SMB security allows only AES-256-GCM and the client offers only
+AES-128-GCM, there is no overlap and the session is refused — surfacing as an
+access denial that **accuses the identity**. In the real case, Kerberos was
+verified healthy (tickets issued, both SPNs present) and the investigation still
+went RBAC → NTFS → NTLMv2 before the traces pointed at cipher negotiation.
+Diagnose: Portal → Storage account → File shares → Security (allowed ciphers) vs
 `Get-SmbClientConfiguration | select EncryptionCiphers` on the client. Fix:
-`Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_128_GCM,AES_128_CCM"`
-— keep AES-128-CCM in the list, mounting with the storage key still needs it.
+allow AES-128-GCM on the account, or set the client to offer AES-256-GCM first.
 AES-256-GCM requires Win 11 / WS2022+.
+
+**Reading `Debug-AzStorageAccountAuth` output critically**
+The cmdlet reports RBAC/Entra checks as failures whenever the environment simply
+doesn't use them — e.g. a share relying on **DefaultSharePermission** with no
+Entra sync will fail `CheckSidHasAadUser` / `CheckUserRbacAssignment`, and that
+is *expected*, not a defect. Teach attendees to map each reported failure to
+their design before acting on it; chasing an expected failure is a common way to
+lose a day.
+
+**Custom domain names — three facts worth stating**
+Domain-joining a storage account does **not** create any DNS record in on-prem
+DNS; a CNAME (`<sa>.contoso.com → <sa>.file.core.windows.net`) must be created
+manually. Using that custom FQDN also requires a **second SPN** on the AD object
+(`cifs/<sa>.contoso.com`). And cached credentials for either name will mask your
+test results — `cmdkey /list` then `cmdkey /delete:<name>` before retesting.
 
 **System error 5 when EDITING NTFS ACLs (not just reading)**
 Cause: to change NTFS permissions you must mount with the **storage account
