@@ -41,9 +41,10 @@
     "clientName": "[concat(parameters('prefix'), '-cli')]",
     "dcIp": "10.100.0.4",
     "subnetId": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'lab')]",
+    "_comment_ips": "Both NICs use STATIC addresses on purpose. The copy loop below runs in parallel, so a dynamically-assigned client NIC could grab 10.100.0.4 before the DC NIC claims it (PrivateIPAddressIsAllocated).",
     "vms": [
-      { "name": "[concat(parameters('prefix'), '-dc')]", "ip": "10.100.0.4", "static": true },
-      { "name": "[concat(parameters('prefix'), '-cli')]", "ip": "", "static": false }
+      { "name": "[concat(parameters('prefix'), '-dc')]", "ip": "10.100.0.4" },
+      { "name": "[concat(parameters('prefix'), '-cli')]", "ip": "10.100.0.5" }
     ]
   },
   "resources": [
@@ -129,8 +130,8 @@
             "name": "ipconfig1",
             "properties": {
               "subnet": { "id": "[variables('subnetId')]" },
-              "privateIPAllocationMethod": "[if(variables('vms')[copyIndex()].static, 'Static', 'Dynamic')]",
-              "privateIPAddress": "[if(variables('vms')[copyIndex()].static, variables('vms')[copyIndex()].ip, json('null'))]",
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[variables('vms')[copyIndex()].ip]",
               "publicIPAddress": {
                 "id": "[resourceId('Microsoft.Network/publicIPAddresses', concat(variables('vms')[copyIndex()].name, '-pip'))]"
               }
