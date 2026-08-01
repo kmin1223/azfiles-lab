@@ -6,16 +6,25 @@
   Single command, no interaction after the password prompt:
     1. Resource group + ARM template deployment (VNet/DC/client/storage/share)
     2. Promote DC to a new AD forest (contoso.local)
-    3. Create lab users (labuser1/labuser2)
+    3. Create lab users (labuser1/labuser2) + Kerberos auditing on the DC
     4. Domain-join the client VM
     5. Domain-join the STORAGE ACCOUNT (computer account + SPN + kerb1 key)
     6. Enable AD DS auth on the storage account (Set-AzStorageAccount)
     7. Final kerb key rotation + AD password sync (1396 guard)
     8. Default share-level permission + NTFS ACLs
-    9. Install Az + AzFilesHybrid on both VMs (Debug-AzStorageAccountAuth etc.)
+    9. Verify the client actually mounts the share
 
-  Total time: ~25-35 minutes. Run it at the START of the session, present
-  slides while it cooks.
+  Two long, independent stretches run in the background rather than in
+  sequence, which is where most of the wall-clock time used to go:
+    * client tooling (Az + AzFilesHybrid, several minutes of downloads)
+      installs while the DC is promoting - it needs nothing from AD, but it
+      must finish before the client reboots into the domain
+    * the client's domain join and reboot happen while the storage account is
+      being joined and configured, which only touches the DC and Azure
+
+  Total time: ~18-22 minutes (the client tooling download is now the critical
+  path, not the sum of every step). Run it at the START of the session and
+  present slides while it cooks.
 
 .EXAMPLE
   Connect-AzAccount
@@ -92,10 +101,15 @@ function Invoke-VmScript {
     param([string]$VmName, [string]$ScriptFile, [hashtable]$Params = @{}, [int]$Retries = 1, [int]$RetryDelaySec = 60)
     for ($i = 1; $i -le $Retries; $i++) {
         try {
-            $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VmName `
-                -CommandId 'RunPowerShellScript' `
-                -ScriptPath (Join-Path (Join-Path $scriptRoot 'scripts') $ScriptFile) `
-                -Parameter $Params -ErrorAction Stop
+            $rc = @{
+                ResourceGroupName = $ResourceGroupName; VMName = $VmName
+                CommandId = 'RunPowerShellScript'
+                ScriptPath = (Join-Path (Join-Path $scriptRoot 'scripts') $ScriptFile)
+                ErrorAction = 'Stop'
+            }
+            # An empty -Parameter hashtable is rejected, so only pass it when used.
+            if ($Params -and $Params.Count -gt 0) { $rc['Parameter'] = $Params }
+            $r = Invoke-AzVMRunCommand @rc
             $out = ($r.Value | Where-Object Code -like '*StdOut*').Message
             $err = ($r.Value | Where-Object Code -like '*StdErr*').Message
             if ($err) { Write-Warning $err }
@@ -108,14 +122,76 @@ function Invoke-VmScript {
     }
 }
 
+# Same thing as a background job, for work on one VM that can overlap work on
+# the other. Az context autosave means the job picks up the current login.
+function Start-VmScriptJob {
+    param([string]$VmName, [string]$ScriptFile, [hashtable]$Params = @{}, [int]$Retries = 4)
+    Start-Job -Name "job-$VmName-$ScriptFile" -ScriptBlock {
+        param($rg, $vmName, $path, $p, $retries)
+        Import-Module Az.Compute -ErrorAction SilentlyContinue
+        $rc = @{
+            ResourceGroupName = $rg; VMName = $vmName
+            CommandId = 'RunPowerShellScript'; ScriptPath = $path; ErrorAction = 'Stop'
+        }
+        # An empty -Parameter hashtable is rejected, so only pass it when used.
+        if ($p -and $p.Count -gt 0) { $rc['Parameter'] = $p }
+        # Retry inside the job: right after an ARM deployment the guest agent
+        # may not be accepting Run Commands yet, and a job has no other way back.
+        for ($i = 1; $i -le $retries; $i++) {
+            try { return Invoke-AzVMRunCommand @rc }
+            catch { if ($i -eq $retries) { throw }; Start-Sleep -Seconds 45 }
+        }
+    } -ArgumentList $ResourceGroupName, $VmName, (Join-Path (Join-Path $scriptRoot 'scripts') $ScriptFile), $Params, $Retries
+}
+
+function Receive-VmScriptJob {
+    param($Job, [int]$TimeoutSec = 1200, [string]$Label)
+    $Job | Wait-Job -Timeout $TimeoutSec | Out-Null
+    if ($Job.State -ne 'Completed') {
+        Write-Warning "$Label did not complete cleanly (state: $($Job.State))"
+        Remove-Job $Job -Force -ErrorAction SilentlyContinue
+        return ''
+    }
+    $r = Receive-Job $Job
+    Remove-Job $Job -Force -ErrorAction SilentlyContinue
+    return ($r.Value | Where-Object Code -like '*StdOut*').Message
+}
+
+# --------------------------------- PARALLEL: client tooling starts right now
+# Installing Az + AzFilesHybrid (and its Microsoft.Graph.Applications
+# dependency) takes several minutes of pure downloading, and it needs nothing
+# from AD - so it runs while the DC promotes instead of after everything else.
+# It MUST finish before the client is domain-joined, because that reboots the
+# machine and would kill an in-flight Run Command.
+Step 'Starting client tooling install in the background (overlaps DC promotion)'
+$clientToolsJob = Start-VmScriptJob -VmName $cliName -ScriptFile '07-install-tools.ps1'
+
 # ------------------------------------------------------- 2. Promote the DC
-Step '2/9 Promoting DC to a new forest (reboots itself, ~10 min)'
+Step '2/9 Promoting DC to a new forest (reboots itself)'
 $promoteOut = Invoke-VmScript -VmName $dcName -ScriptFile '01-promote-dc.ps1' `
     -Params @{ DomainName = $DomainName; SafeModePassword = $plainPw }
 $promoteOut | Write-Host
 if ($promoteOut -notmatch 'ALREADY_PROMOTED') {
-    Write-Host 'Waiting 4 minutes for DC reboot...'
-    Start-Sleep -Seconds 240
+    # Poll instead of sleeping a flat 4 minutes: the DC is usually back sooner,
+    # and when it isn't, a fixed sleep wouldn't have been long enough anyway.
+    Write-Host 'Waiting for the DC to come back (polling)...'
+    Start-Sleep -Seconds 120   # no point probing before this
+    $dcReady = $false
+    for ($i = 1; $i -le 16; $i++) {
+        try {
+            $probe = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $dcName `
+                -CommandId 'RunPowerShellScript' -ScriptString `
+                "if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 2 -and (Get-Service ADWS -ErrorAction SilentlyContinue).Status -eq 'Running') { 'DC_READY' }" `
+                -ErrorAction Stop
+            if ((($probe.Value | Where-Object Code -like '*StdOut*').Message) -match 'DC_READY') {
+                $dcReady = $true
+                Write-Host "  DC ready after $([int]$sw.Elapsed.TotalMinutes) min total."
+                break
+            }
+        } catch { }
+        Start-Sleep -Seconds 30
+    }
+    if (-not $dcReady) { Write-Warning 'DC readiness probe timed out - continuing; later steps retry.' }
 }
 
 # ----------------------------------------------------------- 3. Lab users
@@ -123,11 +199,29 @@ Step '3/9 Creating lab users (retries until AD is up)'
 Invoke-VmScript -VmName $dcName -ScriptFile '02-create-lab-users.ps1' `
     -Params @{ Password = $plainPw } -Retries 8 -RetryDelaySec 60 | Write-Host
 
+# DC-side prep is small now (Kerberos auditing + operational logs, no Azure
+# tooling by design) and has to run after promotion, so it goes here.
+Step 'Enabling Kerberos auditing on the DC (events 4768/4769)'
+$dcPrep = Invoke-VmScript -VmName $dcName -ScriptFile '07-install-tools.ps1' -Retries 2 -RetryDelaySec 30
+($dcPrep -split "`n" | Where-Object { $_ -match 'TOOLS_|auditing|logs enabled' }) | Write-Host
+
+# ------------------------------- Collect the client tooling job before reboot
+Step 'Waiting for the client tooling install to finish'
+$toolsOut = Receive-VmScriptJob -Job $clientToolsJob -TimeoutSec 1200 -Label 'client tooling'
+if ($toolsOut -match 'TOOLS_READY') {
+    Write-Host '  client tooling: OK'
+} else {
+    $detail = ($toolsOut -split "`n" | Select-String 'TOOLS_PARTIAL|FAILED').Line -join '; '
+    Write-Warning "  client tooling incomplete: $detail"
+    Write-Warning '  rerun scripts\07-install-tools.ps1 on the client if diagnostics are missing.'
+}
+
 # ----------------------------------------------------- 4. Join client VM
-Step '4/9 Domain-joining the client VM (reboots itself)'
-Invoke-VmScript -VmName $cliName -ScriptFile '03-join-domain-client.ps1' `
-    -Params @{ DomainName = $DomainName; JoinUser = $AdminUsername; JoinPassword = $plainPw } `
-    -Retries 3 -RetryDelaySec 60 | Write-Host
+# Started as a job: the client reboot (~3 min) overlaps the storage-account
+# work below, which only touches the DC and Azure.
+Step '4/9 Domain-joining the client VM in the background (reboots itself)'
+$clientJoinJob = Start-VmScriptJob -VmName $cliName -ScriptFile '03-join-domain-client.ps1' `
+    -Params @{ DomainName = $DomainName; JoinUser = $AdminUsername; JoinPassword = $plainPw }
 
 # --------------------------------------- 5. Domain-join the storage account
 Step '5/9 Domain-joining the storage account (kerb key + computer account + SPN)'
@@ -185,31 +279,17 @@ Invoke-VmScript -VmName $dcName -ScriptFile '05-set-ntfs-perms.ps1' `
     -Params @{ StorageAccountName = $saName; StorageKey = $key1; NetBios = $ad.NetBiosDomainName } `
     -Retries 3 -RetryDelaySec 30 | Write-Host
 
-# ------------------------------------------- 9. Diagnostic tooling on the VMs
-# Az modules + AzFilesHybrid so attendees can run Debug-AzStorageAccountAuth
-# and the kerb-key cmdlets directly on the lab machines.
-Step '9/9 Installing diagnostic tools on both VMs (Az + AzFilesHybrid)'
-$toolJobs = @($cliName, $dcName) | ForEach-Object {
-    $vm = $_
-    Start-Job -Name "tools-$vm" -ScriptBlock {
-        param($rg, $vmName, $path)
-        Import-Module Az.Compute -ErrorAction SilentlyContinue
-        Invoke-AzVMRunCommand -ResourceGroupName $rg -VMName $vmName `
-            -CommandId 'RunPowerShellScript' -ScriptPath $path -ErrorAction Stop
-    } -ArgumentList $ResourceGroupName, $vm, (Join-Path (Join-Path $scriptRoot 'scripts') '07-install-tools.ps1')
-}
-Write-Host '  installing on both VMs in parallel (a few minutes)...'
-$toolJobs | Wait-Job -Timeout 900 | Out-Null
-foreach ($j in $toolJobs) {
-    if ($j.State -eq 'Completed') {
-        $out = (Receive-Job $j).Value | Where-Object Code -like '*StdOut*'
-        if ($out.Message -match 'TOOLS_READY') { Write-Host "  $($j.Name): OK" }
-        else { Write-Warning "  $($j.Name): finished with warnings - see the lab VM if tools are missing" }
-    }
-    else {
-        Write-Warning "  $($j.Name): $($j.State) - install tools manually if needed (scripts\07-install-tools.ps1)"
-    }
-    Remove-Job $j -Force -ErrorAction SilentlyContinue
+# ------------------------------- 9. Collect the background client domain join
+# Everything above ran on the DC or against Azure, so the client's join and
+# reboot happened for free alongside it.
+Step '9/9 Confirming the client domain join'
+$joinOutput = Receive-VmScriptJob -Job $clientJoinJob -TimeoutSec 900 -Label 'client domain join'
+$joinOutput | Write-Host
+if (-not $joinOutput) {
+    Write-Host '  retrying the domain join in the foreground...'
+    Invoke-VmScript -VmName $cliName -ScriptFile '03-join-domain-client.ps1' `
+        -Params @{ DomainName = $DomainName; JoinUser = $AdminUsername; JoinPassword = $plainPw } `
+        -Retries 3 -RetryDelaySec 60 | Write-Host
 }
 
 # ------------------------------------- 10. Verify the mount actually works
@@ -269,7 +349,8 @@ Write-Host @"
    net use Z: \\$saName.file.core.windows.net\labshare
    klist   # look for the cifs/ ticket
 
- Diagnostics are preinstalled on both VMs (Az + AzFilesHybrid):
+ Diagnostics are preinstalled on the CLIENT VM (Az + AzFilesHybrid).
+ The DC deliberately has no Azure tooling - only Kerberos auditing (4768/4769):
    Connect-AzAccount
    Debug-AzStorageAccountAuth -StorageAccountName $saName ``
      -ResourceGroupName $ResourceGroupName -Verbose

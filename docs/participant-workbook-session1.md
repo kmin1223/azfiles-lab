@@ -125,9 +125,11 @@ a service ticket for the `cifs` SPN — no extra credentials needed. Take a quic
 screenshot of this `klist` output; it's your "known good" reference for the
 fault labs.
 
-**The one-command health check.** Both lab VMs already have the Az and
+**The one-command health check.** The **Client VM** has the Az and
 **AzFilesHybrid** modules installed, so you can run the official diagnostic
-right there (PowerShell on the DC or Client VM):
+right there. Run it on the **client, not the DC** — that is where these cmdlets
+belong in a real environment too, and the DC in this lab has no Azure tooling on
+purpose:
 
 ```powershell
 Connect-AzAccount
@@ -136,6 +138,55 @@ Debug-AzStorageAccountAuth -StorageAccountName <sa> -ResourceGroupName azfiles-l
 
 Every check should pass. Re-run it after each fault below and watch which check
 flips to a failure.
+
+> **If the cmdlet is "found in the module AzFilesHybrid, but the module could
+> not be loaded"**, don't trust that error — it describes the symptom, not the
+> cause. Force the import to get the real one:
+>
+> ```powershell
+> Import-Module AzFilesHybrid -Force -Verbose
+> ```
+>
+> It names an unmet `RequiredModules` entry — e.g. *"The required module
+> 'Az.Compute' is not loaded."* Fixing them one at a time is slow (0.3.3.0 also
+> needs `Microsoft.Graph.Applications`), so read the manifest and install
+> everything missing at once, from a **fresh** elevated window — a session that
+> already loaded `Az.Accounts` will refuse the install with *"currently in use"*:
+>
+> ```powershell
+> $psd1 = 'C:\Program Files\WindowsPowerShell\Modules\AzFilesHybrid\0.3.3.0\AzFilesHybrid.psd1'
+> foreach ($m in (Import-PowerShellDataFile $psd1).RequiredModules) {
+>     $n = if ($m -is [hashtable]) { $m.ModuleName } else { $m }
+>     if (-not (Get-Module -ListAvailable -Name $n)) {
+>         Install-Module $n -Scope AllUsers -Force -AllowClobber
+>     }
+> }
+> ```
+>
+> Then `Import-Module AzFilesHybrid -Force` in another new window.
+>
+> This is worth internalizing: *"command not found"* on a module that is plainly
+> installed is a **dependency** failure, not a missing-install failure. The same
+> reasoning applies to customer environments where a partial Az install breaks
+> AzFilesHybrid.
+
+> **If `Connect-AzAccount` fails on the VM** with "user interaction is required"
+> or a token error, the interactive sign-in window is being blocked. Use device
+> code instead — it prints a code you enter at
+> <https://microsoft.com/devicelogin> from your own browser:
+>
+> ```powershell
+> Connect-AzAccount -UseDeviceAuthentication
+> ```
+>
+> Everything else in these labs (`klist`, `net use`, the evidence collector,
+> `setspn`, event 4769) needs **no** Azure sign-in on the VM.
+
+> **Reading the output critically:** this cmdlet flags RBAC/Entra checks as
+> failures whenever your design simply doesn't use them — our lab relies on
+> `DefaultSharePermission` with no Entra sync, so `CheckSidHasAadUser` and
+> `CheckUserRbacAssignment` are *expected* to fail. Map each reported failure to
+> your design before chasing it.
 
 ## Capture your known-good reference
 

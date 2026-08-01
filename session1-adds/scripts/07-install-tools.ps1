@@ -5,10 +5,54 @@
 $ErrorActionPreference = 'Continue'   # never fail the deployment over tooling
 $ProgressPreference = 'SilentlyContinue'  # much faster downloads
 
-Write-Output "=== Installing lab tooling on $env:COMPUTERNAME ==="
+# Role decides what gets installed. ProductType 2 = domain controller.
+# The DC only needs Kerberos AUDITING (events 4768/4769) - it is not where the
+# Azure-side tooling belongs. AzFilesHybrid and the Az modules go on the CLIENT,
+# which is the domain-joined admin workstation the lab (and real guidance) uses
+# for Join-/Debug-/Update-AzStorageAccount*. Installing them on a DC would also
+# mean signing into Azure on a DC, which is exactly what we don't want to teach.
+$isDC = (Get-CimInstance Win32_OperatingSystem).ProductType -eq 2
+$role = if ($isDC) { 'DOMAIN CONTROLLER' } else { 'CLIENT' }
+
+Write-Output "=== Installing lab tooling on $env:COMPUTERNAME ($role) ==="
 
 # TLS 1.2 is required to reach the PowerShell Gallery on Windows Server
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# --- Turn off IE Enhanced Security Configuration -------------------------
+# Without this, the interactive sign-in that Connect-AzAccount opens is blocked
+# on Windows Server, so Debug-AzStorageAccountAuth can't be used on the VM.
+# {..A7..} = Administrators, {..A8..} = Users.
+try {
+    $escKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}',
+        'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}'
+    )
+    foreach ($k in $escKeys) {
+        if (Test-Path $k) { Set-ItemProperty -Path $k -Name IsInstalled -Value 0 -Force }
+    }
+    # Applies at next sign-in; restart Explorer so a current session picks it up too.
+    Stop-Process -Name Explorer -Force -ErrorAction SilentlyContinue
+    Write-Output 'IE Enhanced Security Configuration disabled'
+} catch {
+    Write-Output "IE ESC change skipped: $($_.Exception.Message)"
+}
+
+if (-not $isDC) {
+
+# --- ActiveDirectory PowerShell module (RSAT) ------------------------------
+# The AzFilesHybrid cmdlets read and write AD objects, so the client needs the
+# AD module. A DC has it already; a member server does not.
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    try {
+        Install-WindowsFeature RSAT-AD-PowerShell -ErrorAction Stop | Out-Null
+        Write-Output 'RSAT-AD-PowerShell installed'
+    } catch {
+        Write-Output "RSAT-AD-PowerShell install failed: $($_.Exception.Message)"
+    }
+} else {
+    Write-Output 'ActiveDirectory module already present'
+}
 
 # --- NuGet provider + trust the gallery (needed for unattended installs) ---
 try {
@@ -19,8 +63,12 @@ try {
     Write-Output "PSGallery prep warning: $($_.Exception.Message)"
 }
 
-# --- Az modules (only what the lab uses, to keep this quick) ---
-$azModules = 'Az.Accounts', 'Az.Storage', 'Az.Resources', 'Az.Network'
+# --- Az modules ---
+# This list must cover everything in AzFilesHybrid's RequiredModules, or the
+# module fails to load with "The required module 'Az.X' is not loaded" and its
+# cmdlets look missing. Verify against the shipped manifest after any upgrade:
+#   (Import-PowerShellDataFile "$env:ProgramFiles\WindowsPowerShell\Modules\AzFilesHybrid\<ver>\AzFilesHybrid.psd1").RequiredModules
+$azModules = 'Az.Accounts', 'Az.Storage', 'Az.Resources', 'Az.Network', 'Az.Compute'
 foreach ($m in $azModules) {
     if (Get-Module -ListAvailable -Name $m) {
         Write-Output "$m already present"
@@ -67,7 +115,39 @@ if ($azfhInstalled) {
     }
 }
 
+# --- Satisfy AzFilesHybrid's declared dependencies -------------------------
+# Don't guess this list. 0.3.3.0 needs Microsoft.Graph.Applications on top of
+# the Az modules above, and it changes between releases. Read the shipped
+# manifest and install whatever is still missing, so a version bump can't
+# silently break the module with "command was found ... but could not be loaded".
+$psd1 = Get-ChildItem 'C:\Program Files\WindowsPowerShell\Modules\AzFilesHybrid' `
+    -Filter 'AzFilesHybrid.psd1' -Recurse -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($psd1) {
+    try {
+        $required = (Import-PowerShellDataFile $psd1.FullName).RequiredModules
+        foreach ($r in $required) {
+            $name = if ($r -is [hashtable]) { $r.ModuleName } else { [string]$r }
+            if (-not $name) { continue }
+            if (Get-Module -ListAvailable -Name $name) { continue }
+            try {
+                Install-Module -Name $name -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
+                Write-Output "dependency $name installed"
+            } catch {
+                Write-Output "dependency $name FAILED: $($_.Exception.Message)"
+            }
+        }
+    } catch {
+        Write-Output "could not read AzFilesHybrid manifest: $($_.Exception.Message)"
+    }
+}
+
+} else {
+    Write-Output 'DC: skipping Az/AzFilesHybrid on purpose - those belong on the client'
+}
+
 # --- Evidence tooling: etl2pcapng (converts netsh traces to pcapng) ---
+# Kept on both: a DC-side capture of the KDC exchange is a legitimate technique.
 $toolDir = 'C:\LabTools'
 New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
 if (-not (Test-Path "$toolDir\etl2pcapng.exe")) {
@@ -89,7 +169,8 @@ try {
 } catch { Write-Output 'log enable warning' }
 
 # On a DC: audit Kerberos service-ticket operations (event 4769) incl. failures.
-if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 2) {
+# This is the one thing the DC genuinely has to have for the labs.
+if ($isDC) {
     try {
         auditpol /set /subcategory:"Kerberos Service Ticket Operations" /success:enable /failure:enable | Out-Null
         auditpol /set /subcategory:"Kerberos Authentication Service" /success:enable /failure:enable | Out-Null
@@ -161,8 +242,31 @@ Set-Content -Path "$toolDir\Get-KerberosEvidence.ps1" -Value $helper -Encoding U
 Write-Output 'Get-KerberosEvidence.ps1 placed in C:\LabTools'
 
 # --- Report what's available ---
-Write-Output '--- installed modules ---'
-Get-Module -ListAvailable -Name Az.Accounts, Az.Storage, AzFilesHybrid |
-    Select-Object Name, Version | Format-Table -AutoSize | Out-String | Write-Output
+# Emit the success marker FIRST: Run Command truncates long output, and a
+# trailing marker can get cut off, making a successful install look failed.
+if ($isDC) {
+    # Nothing to install here by design - auditing above is the DC's whole job.
+    Write-Output 'TOOLS_READY (DC: Kerberos auditing + logs only, no Azure tooling by design)'
+    return
+}
 
-Write-Output 'TOOLS_READY'
+$have = Get-Module -ListAvailable -Name Az.Accounts, Az.Storage, Az.Compute, AzFilesHybrid |
+    Select-Object -ExpandProperty Name -Unique
+
+# Presence on disk is not enough: AzFilesHybrid can be installed yet unloadable
+# because a RequiredModules entry is missing. Prove it actually imports.
+$azfhLoads = $false
+$azfhError = ''
+try {
+    Import-Module AzFilesHybrid -Force -ErrorAction Stop
+    $azfhLoads = $null -ne (Get-Command Debug-AzStorageAccountAuth -ErrorAction SilentlyContinue)
+} catch {
+    $azfhError = $_.Exception.Message
+}
+
+if ($azfhLoads -and $have -contains 'Az.Accounts') {
+    Write-Output 'TOOLS_READY'
+} else {
+    Write-Output "TOOLS_PARTIAL (present: $($have -join ', ')) AzFilesHybrid import: $azfhError"
+}
+Write-Output "modules: $($have -join ', ')"
