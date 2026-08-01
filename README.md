@@ -39,8 +39,8 @@ azfiles-lab/
 │   └── pre-session-announcements.docx      <- copy/paste reminders (esp. "redeploy before Session 2")
 ├── session1-adds/
 │   ├── deploy.ps1                   <- attendees run THIS at session start
-│   ├── bicep/main.bicep
-│   ├── scripts/                     <- run-command payloads (DC/client)
+│   ├── template/azuredeploy.json     <- ARM template (no Bicep needed)
+│   ├── scripts/                     <- run-command payloads (DC/client, incl. tool install)
 │   └── faults/Invoke-Fault.ps1      <- break/fix scenarios (5 faults)
 └── session2-entra-kerberos/
     ├── setup.ps1                    <- attendees run THIS at session start
@@ -66,7 +66,7 @@ azfiles-lab/
     once; commands use back slashes (`.\deploy.ps1`).
 - RDP client (required either way — the in-VM klist/mount steps aren't a shell
   task).
-- **No Bicep CLI needed** — the deployment uses a precompiled ARM JSON template.
+- **Plain ARM template** — nothing extra to install.
 
 > The scripts themselves are cross-platform (nested `Join-Path`), so they run
 > unchanged on Windows PowerShell 5.1 and on Cloud Shell (PowerShell 7 / Linux).

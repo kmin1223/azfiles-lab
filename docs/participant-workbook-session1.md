@@ -37,6 +37,12 @@ presents it to the file service over SMB (port 445). Access then passes through
 three layers: network (445) → share-level RBAC → NTFS permissions. Each fault in
 this lab breaks one of those pieces.
 
+> **Your lab starts as a "2023 vintage" environment**, on purpose: RC4 Kerberos
+> encryption, and a storage account whose `ActiveDirectoryDomainName` holds the
+> **NetBIOS** name instead of the DNS root. It mounts perfectly — RC4 keys aren't
+> salted, so that wrong value is never used. Lab 3 is the AES-256 migration,
+> where the salt suddenly matters. This mirrors a real Sev A incident.
+
 ---
 
 # Prerequisites
@@ -51,7 +57,7 @@ this lab breaks one of those pieces.
   AzureCloud service tag). *Required either way* — the klist / net use / mount
   steps happen inside the VMs, which Cloud Shell can't do.
 
-No Bicep CLI required.
+The deployment uses a plain ARM template — nothing extra to install.
 
 > **Running in Cloud Shell?** Get the kit with
 > `git clone https://github.com/kmin1223/azfiles-lab.git`, `cd` into it, and
@@ -66,16 +72,23 @@ No Bicep CLI required.
 
 # Lab 1 · Deploy the environment
 
-In PowerShell, from the `session1-adds` folder:
+**Azure Cloud Shell (recommended)** — open Cloud Shell (PowerShell) from the
+Azure portal (`>_` icon):
 
 ```powershell
-Get-ChildItem -Path .\ -Recurse | Unblock-File            # local Windows only
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # local Windows only
+git clone https://github.com/kmin1223/azfiles-lab.git
+cd azfiles-lab/session1-adds
+./deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
+```
+
+**Local Windows PowerShell** — from the `session1-adds` folder:
+
+```powershell
+Get-ChildItem -Path .\ -Recurse | Unblock-File
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 Connect-AzAccount
 .\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 ```
-
-*(In Cloud Shell, skip the first two lines and run `./deploy.ps1 …`.)*
 
 Enter a lab admin password when prompted (12+ chars; avoid spaces, quotes,
 backticks, `$`). The script runs unattended for ~15–30 minutes.
@@ -99,9 +112,9 @@ klist
 ```
 
 **Expected:** the share maps with no password prompt. `klist` shows a ticket
-with **Server = cifs/<sa>.file.core.windows.net** and **encryption type
-AES-256**. Open `Z:\` — you'll see `hello-from-setup.txt`, and you can create a
-file:
+with **Server = cifs/<sa>.file.core.windows.net** and encryption type
+**RSADSI RC4-HMAC(NT)** — this is the legacy environment you inherited. Open
+`Z:\` — you'll see `hello-from-setup.txt`, and you can create a file:
 
 ```
 echo hello > Z:\%username%.txt
@@ -112,12 +125,146 @@ a service ticket for the `cifs` SPN — no extra credentials needed. Take a quic
 screenshot of this `klist` output; it's your "known good" reference for the
 fault labs.
 
+**The one-command health check.** Both lab VMs already have the Az and
+**AzFilesHybrid** modules installed, so you can run the official diagnostic
+right there (PowerShell on the DC or Client VM):
+
+```powershell
+Connect-AzAccount
+Debug-AzStorageAccountAuth -StorageAccountName <sa> -ResourceGroupName azfiles-lab -Verbose
+```
+
+Every check should pass. Re-run it after each fault below and watch which check
+flips to a failure.
+
+## Capture your known-good reference
+
+Before you break anything, capture what a **working** mount looks like on the
+wire. Every later capture is a diff against this one. In an **elevated**
+PowerShell on the Client VM:
+
+```powershell
+C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
+```
+
+It purges tickets, starts a network trace, performs the mount, stops the trace,
+converts it to `.pcapng`, and collects the Kerberos/SMBClient logs into
+`C:\LabTools\evidence\<timestamp>\`.
+
+Open `trace.pcapng` in Wireshark (or copy it off the VM) and filter:
+
+```
+kerberos || smb2
+```
+
+**What a healthy attempt looks like:** `TGS-REQ` naming `cifs/<sa>…`, a `TGS-REP`
+back, then SMB2 `Negotiate` → `Session Setup` (success) → `Tree Connect`
+(success).
+
+And on the **DC**, the KDC's own record of that ticket:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 5 |
+  Format-List TimeCreated, Message
+```
+
+Note three fields in event 4769: the **Service Name** (the SPN as the client
+asked for it), the **Ticket Encryption Type** (`0x17` = RC4 in this legacy
+baseline; `0x12` = AES-256 after the migration), and the **Failure Code**
+(`0x0` on success).
+
 ---
 
-# Lab 3 · Fix a mount failure (error 1396)
+# Lab 3 · The AES-256 migration ★
 
-The most common issue in the field: the AD account password and the storage
-kerb key fall out of sync.
+You're the admin who has to comply with the 2026 mandate: move this share off
+RC4. Do it, and deal with what happens.
+
+## Step 1 — look before you leap
+
+```powershell
+cd session1-adds
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Status
+```
+
+Note what it reports — especially `ActiveDirectoryDomainName`. Keep it in mind;
+don't act on it yet.
+
+## Step 2 — perform the migration
+
+```powershell
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Enforce
+```
+
+This flips the AD object to AES-256 only — the change most people would make.
+
+## Step 3 — retest (drop sessions first!)
+
+On the **Client VM**:
+
+```
+net use * /delete /y
+klist purge
+net use Z: \\<sa>.file.core.windows.net\labshare
+```
+
+**Expected:** `System error 1396`.
+
+> The `net use * /delete /y` is not optional. An already-mapped share keeps
+> working after a key change, so skipping it produces a false "everything's
+> fine" result.
+
+## Step 4 — diagnose from evidence
+
+```powershell
+C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
+klist
+```
+
+The ticket **is** issued, and it's **AES-256**. On the **DC**:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 3 |
+  Format-List TimeCreated, Message
+```
+
+Event 4769 says **success**. So the KDC, the SPN, and the encryption type are
+all fine — the only thing left is the key the **service** uses to decrypt. Why
+would that be wrong when nothing about the password changed?
+
+Because the AES key is derived with a **salt** built from
+`DomainName + SamAccountName + AccountType`. Run `-Step Status` again and look
+at `ActiveDirectoryDomainName`: it holds the **NetBIOS** name, not the DNS root.
+Under RC4 (unsalted) that never mattered. Under AES-256 it's fatal.
+
+## Step 5 — repair, in the right order
+
+```powershell
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Repair
+```
+
+It does three things, and the order is the lesson:
+
+1. correct `ActiveDirectoryDomainName` to the DNS root — passing the **full**
+   parameter set (a partial `Set-AzStorageAccount` is silently ignored)
+2. **regenerate the kerb key** — this is when the new salt is baked in
+3. reset the AD object's password to that key, and force replication
+
+Retest on the Client VM (`net use * /delete /y`, `klist purge`, mount). `klist`
+should now show **AES-256-CTS-HMAC-SHA1-96**.
+
+**Why fixing the property alone isn't enough:** the salt is consumed at key
+generation time. Change the property and stop there, and nothing happens — the
+existing key still carries the old salt.
+
+*Want to run it again?* `-Step Rollback` restores the legacy state.
+
+---
+
+# Lab 4 · Fix a mount failure (error 1396) — different root cause
+
+Same symptom as Lab 3, different cause: here the AD account password and the
+storage kerb key simply fall out of sync (rotation policy, a manual reset).
 
 **Break it** (in your PowerShell window):
 
@@ -135,15 +282,38 @@ net use Z: \\<sa>.file.core.windows.net\labshare
 
 **Expected:** `System error 1396 — The target account name is incorrect.`
 
-**Diagnose** (Client VM):
+**Diagnose — from evidence, not the error text** (Client VM):
 
-```
-klist get cifs/<sa>.file.core.windows.net
+```powershell
+C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
 ```
 
-The ticket *is* issued — so the DC and SPN are fine. The failure is that the
-file service can't decrypt the ticket because its kerb key no longer matches the
-AD account password.
+Open the new `trace.pcapng` with filter `kerberos || smb2` and compare it to
+your known-good capture:
+
+| Stage | Healthy capture | This capture |
+|---|---|---|
+| TGS-REQ / REP | ticket issued | **still issued** — the KDC is fine |
+| SMB2 Session Setup | success | **fails** — `KRB_AP_ERR_MODIFIED` |
+
+Then confirm from the KDC's side, on the **DC**:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 3 |
+  Format-List TimeCreated, Message
+```
+
+Event 4769 shows a **successful** ticket issue for the SPN. That single fact
+eliminates the DC, the SPN, and the encryption type in one step — the only thing
+left is the key the *service* uses to decrypt. This is the difference between
+guessing from an error string and proving it.
+
+Cross-check with the module:
+
+```powershell
+Debug-AzStorageAccountAuth -StorageAccountName <sa> -ResourceGroupName azfiles-lab -Verbose
+# CheckADObjectPasswordIsCorrect fails
+```
 
 **Fix** (PowerShell window):
 
@@ -159,7 +329,7 @@ keys, kerb1/kerb2, and you rotate between them).
 
 ---
 
-# Lab 4 · Fix a broken SPN (error 0xc000018b)
+# Lab 5 · Fix a broken SPN (error 0xc000018b)
 
 **Break it:**
 
@@ -175,7 +345,7 @@ klist get cifs/<sa>.file.core.windows.net
 ```
 
 **Expected:** the request fails with `0xc000018b` / "the SAM database does not
-have a computer account…". Unlike Lab 3, no ticket is issued at all.
+have a computer account…". Unlike Labs 3–4, no ticket is issued at all.
 
 **Diagnose** (DC VM):
 
@@ -199,9 +369,9 @@ SPNs commonly come from manual joins or multi-forest setups.
 
 ---
 
-# Lab 5 · Two quick ones
+# Lab 6 · Two quick ones
 
-## 5a · Blocked port 445
+## 6a · Blocked port 445
 
 ```powershell
 .\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault Block445
@@ -221,7 +391,7 @@ Fix: `-Fault Block445 -Repair`.
 the fix is to open it or use a private endpoint / VPN. (A related but different
 error, 64, means 445 connects but a proxy/NAT drops the SMB handshake.)
 
-## 5b · Lost share-level access
+## 6b · Lost share-level access
 
 ```powershell
 .\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoShareAccess
@@ -242,16 +412,28 @@ restrictive of the share-level role and the NTFS permission.
 
 ---
 
-# Optional · More faults to try
+# Optional · Advanced faults (evidence required)
 
-If you have time (or want to practice after redeploying):
+These three can't be identified from the error message alone — you need the
+trace or event 4769. That's the point.
 
-- `-Fault EtypeMismatch` — forces an unsupported encryption type on the client;
-  mount fails with "the encryption type requested is not supported by the KDC."
-  This is the same failure class as the 2026 RC4 retirement. Repair resets the
-  client policy.
-- Have a partner inject a fault of their choice without telling you, and see how
-  quickly you can identify and fix it using the flowchart.
+- **`-Fault EtypeMismatch`** — forces an unsupported encryption type on the
+  client. In 4769 you'll see the request fail with an etype mismatch; on the
+  wire, `KDC_ERR_ETYPE_NOSUPP` in the TGS-REP. Same failure class as the 2026
+  RC4 retirement.
+- **`-Fault ClockSkew`** — pushes the client clock ~10 minutes off. The mount
+  error is vague; the trace shows `KRB_AP_ERR_SKEW`. Confirm with
+  `w32tm /stripchart /computer:azflab-dc /samples:3`. (Kerberos tolerates about
+  5 minutes.)
+- **`-Fault DuplicateSpn`** — registers the storage SPN on a second AD object.
+  On the DC, `setspn -X` reveals the duplicate; the KDC can end up encrypting the
+  ticket for the wrong account. A classic, hard-to-spot production issue.
+
+Repair each with `-Repair`, as usual.
+
+**Pair exercise:** have a partner inject any fault without telling you. Diagnose
+it using only `Get-KerberosEvidence.ps1`, event 4769, and the flowchart — then
+name the fault before you repair it.
 
 ---
 
@@ -277,16 +459,28 @@ klist get cifs/<sa>.file.core.windows.net    request a service ticket
 net use Z: \\<sa>.file.core.windows.net\labshare   mount the share
 Test-NetConnection <sa>.file.core.windows.net -Port 445   check SMB reachability
 setspn -Q cifs/<sa>.file.core.windows.net    look up the SPN (on the DC)
+setspn -X                                    find DUPLICATE SPNs (on the DC)
 Debug-AzStorageAccountAuth -StorageAccountName <sa> -ResourceGroupName azfiles-lab -Verbose
+
+--- migration lab ---
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Status|Enforce|Repair|Rollback
+
+--- evidence ---
+C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>    trace + logs for one attempt
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 5    KDC record (DC)
+w32tm /stripchart /computer:azflab-dc /samples:3             clock skew vs the DC
+Wireshark filter:  kerberos || smb2
 ```
 
 # Error → cause quick map
 
-| You see | Likely cause |
+| You see (error, or on the wire) | Likely cause |
 |---|---|
+| `KRB_AP_ERR_SKEW` | Clock skew > ~5 min between client and DC |
+| duplicate SPN in `setspn -X` | Two AD objects claim the same SPN |
 | System error 53 / 67 / timeout | Port 445 blocked or DNS |
 | System error 64 | 445 connects, proxy/NAT drops the SMB handshake |
-| System error 1396 (AP_ERR_MODIFIED) | Kerb key ≠ AD account password |
+| System error 1396 (AP_ERR_MODIFIED) | Kerb key ≠ AD account password — **or** an AES salt mismatch (wrong DomainName) |
 | 0xc000018b / PRINCIPAL_UNKNOWN | SPN missing or wrong |
 | "encryption type not supported" | Encryption mismatch (use AES-256) |
 | System error 5, ticket valid | Authorization — share RBAC or NTFS |

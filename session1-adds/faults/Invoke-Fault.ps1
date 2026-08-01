@@ -35,6 +35,23 @@
                     Symptom : mount OK-ish but Access Denied at share level
                     Repair  : restore StorageFileDataSmbShareContributor
 
+  --- advanced (evidence required - the error text alone won't tell you) ---
+
+  ClockSkew         Push the CLIENT clock ~10 minutes off the DC.
+                    Symptom : mount fails; the error is generic, but the wire
+                              shows KRB_AP_ERR_SKEW / KRB_ERR_TIME_SKEW and
+                              event 4769 may not even appear
+                    Teach   : Kerberos tolerates only ~5 min skew; in the field
+                              this looks like "it broke for no reason"
+                    Repair  : re-sync time (w32tm /resync)
+
+  DuplicateSpn      Register the storage SPN on a SECOND AD object.
+                    Symptom : intermittent/odd failures - the KDC can't decide
+                              which account owns the SPN
+                    Diagnose: setspn -X (or -Q) shows the duplicate; the trace
+                              shows the TGS-REP encrypted for the wrong account
+                    Repair  : remove the SPN from the decoy object
+
 .EXAMPLE
   .\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch
   .\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch -Repair
@@ -43,7 +60,8 @@
 param(
     [Parameter(Mandatory)] [string]$ResourceGroupName,
     [Parameter(Mandatory)]
-    [ValidateSet('PasswordMismatch', 'SpnBroken', 'EtypeMismatch', 'Block445', 'NoShareAccess')]
+    [ValidateSet('PasswordMismatch', 'SpnBroken', 'EtypeMismatch', 'Block445', 'NoShareAccess',
+                 'ClockSkew', 'DuplicateSpn')]
     [string]$Fault,
     [switch]$Repair,
     [string]$Prefix = 'azflab'
@@ -156,6 +174,56 @@ Write-Output 'Client encryption types restored to default'
         if (-not $Repair) {
             Write-Host 'Client: mount/access -> Access is denied (share level, NOT NTFS).'
             Write-Host 'Teach: contrast with an NTFS deny - different layer, different error surface.'
+        }
+    }
+
+    'ClockSkew' {
+        if (-not $Repair) {
+            # Stop time sync and jump the clock ~10 min (Kerberos tolerance is ~5)
+            Invoke-OnVm $cliName @'
+Stop-Service w32time -ErrorAction SilentlyContinue
+Set-Service w32time -StartupType Disabled -ErrorAction SilentlyContinue
+Set-Date (Get-Date).AddMinutes(10)
+Write-Output "Client clock is now $(Get-Date) (skewed +10 min)"
+'@ | Write-Host
+            Write-Host 'Client: klist purge; net use -> fails. The message is vague on purpose.'
+            Write-Host 'Evidence: trace shows KRB_AP_ERR_SKEW; compare w32tm /stripchart against the DC.'
+        } else {
+            Invoke-OnVm $cliName @'
+Set-Service w32time -StartupType Automatic
+Start-Service w32time
+w32tm /resync /force 2>&1 | Out-Null
+Start-Sleep -Seconds 5
+Write-Output "Client clock re-synced: $(Get-Date)"
+'@ | Write-Host
+        }
+    }
+
+    'DuplicateSpn' {
+        $spn = "cifs/$saName.file.core.windows.net"
+        $decoy = "$saName-decoy"
+        if (-not $Repair) {
+            Invoke-OnVm $dcName @"
+Import-Module ActiveDirectory
+`$ou = (Get-ADOrganizationalUnit -Filter "Name -eq 'AzureFilesLab'").DistinguishedName
+if (-not (Get-ADComputer -Filter "Name -eq '$decoy'" -ErrorAction SilentlyContinue)) {
+    New-ADComputer -Name '$decoy' -Path `$ou -Enabled `$true ``
+        -Description 'decoy holding a duplicate SPN (lab fault)'
+}
+Set-ADComputer -Identity '$decoy' -ServicePrincipalNames @{Add='$spn'}
+Write-Output 'Duplicate SPN registered on $decoy'
+setspn -X -P 2>&1 | Select-String -Pattern 'duplicate|$saName' | ForEach-Object { `$_.ToString() }
+"@ | Write-Host
+            Write-Host "Client: klist purge; net use -> fails or behaves oddly."
+            Write-Host "Evidence: on the DC run  setspn -X   (or setspn -Q $spn) to reveal TWO owners."
+        } else {
+            Invoke-OnVm $dcName @"
+Import-Module ActiveDirectory
+if (Get-ADComputer -Filter "Name -eq '$decoy'" -ErrorAction SilentlyContinue) {
+    Remove-ADComputer -Identity '$decoy' -Confirm:`$false
+    Write-Output 'Decoy object removed - SPN is unique again'
+}
+"@ | Write-Host
         }
     }
 }

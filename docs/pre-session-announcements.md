@@ -26,7 +26,7 @@ break/fix real Kerberos issues with us. Please have this ready beforehand:
   from Azure — [VPN setup link/notes]).
 - The lab kit: [download link]. Unzip it somewhere simple like `C:\temp`.
 
-You don't need the Bicep CLI — the deployment is self-contained.
+The deployment uses a plain ARM template and is self-contained.
 
 We'll kick off the deployment together at the start, so nothing to run in
 advance. See you there!

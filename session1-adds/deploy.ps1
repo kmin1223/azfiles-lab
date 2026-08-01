@@ -4,7 +4,7 @@
 
 .DESCRIPTION
   Single command, no interaction after the password prompt:
-    1. Resource group + Bicep deployment (VNet/DC/client/storage/share)
+    1. Resource group + ARM template deployment (VNet/DC/client/storage/share)
     2. Promote DC to a new AD forest (contoso.local)
     3. Create lab users (labuser1/labuser2)
     4. Domain-join the client VM
@@ -12,6 +12,7 @@
     6. Enable AD DS auth on the storage account (Set-AzStorageAccount)
     7. Final kerb key rotation + AD password sync (1396 guard)
     8. Default share-level permission + NTFS ACLs
+    9. Install Az + AzFilesHybrid on both VMs (Debug-AzStorageAccountAuth etc.)
 
   Total time: ~25-35 minutes. Run it at the START of the session, present
   slides while it cooks.
@@ -27,7 +28,13 @@ param(
     [string]$Prefix = 'azflab',
     [string]$DomainName = 'contoso.local',
     [string]$AdminUsername = 'labadmin',
-    [SecureString]$AdminPassword
+    [SecureString]$AdminPassword,
+    # Default: build the "2023 vintage" state - RC4 encryption and a storage
+    # account whose ActiveDirectoryDomainName holds the NetBIOS name instead of
+    # the DNS root. It mounts fine on RC4; the latent salt defect only surfaces
+    # when you migrate to AES-256 (Lab: Invoke-Aes256Migration.ps1).
+    # Use -Modern to deploy the correct AES-256 configuration instead.
+    [switch]$Modern
 )
 $ErrorActionPreference = 'Stop'
 $scriptRoot = $PSScriptRoot
@@ -55,22 +62,15 @@ if ($plainPw -match '[\s"''`$]') {
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 # ---------------------------------------------------- 1. RG + template deploy
-# Prefer the precompiled ARM JSON so no Bicep CLI is required. If it's missing
-# but the Bicep CLI happens to be installed, fall back to main.bicep.
-Step '1/8 Deploying infrastructure'
+# Plain ARM JSON - no extra tooling required, works in Cloud Shell and locally.
+Step '1/9 Deploying infrastructure'
 # Nested Join-Path keeps paths correct on both Windows PowerShell 5.1 and
 # PowerShell 7 (Cloud Shell / Linux) - avoid literal backslashes.
-$jsonTemplate = Join-Path (Join-Path $scriptRoot 'bicep') 'azuredeploy.json'
-$bicepTemplate = Join-Path (Join-Path $scriptRoot 'bicep') 'main.bicep'
-if (Test-Path $jsonTemplate) {
-    $templateFile = $jsonTemplate
-    Write-Host 'Using ARM JSON template (no Bicep CLI needed).'
-} elseif (Test-Path $bicepTemplate) {
-    $templateFile = $bicepTemplate
-    Write-Host 'ARM JSON not found; using Bicep (requires the Bicep CLI).'
-} else {
-    throw "No template found under $scriptRoot\bicep."
+$templateFile = Join-Path (Join-Path $scriptRoot 'template') 'azuredeploy.json'
+if (-not (Test-Path $templateFile)) {
+    throw "ARM template not found: $templateFile"
 }
+Write-Host 'Using ARM template.'
 
 New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Force | Out-Null
 $dep = New-AzResourceGroupDeployment `
@@ -109,7 +109,7 @@ function Invoke-VmScript {
 }
 
 # ------------------------------------------------------- 2. Promote the DC
-Step '2/8 Promoting DC to a new forest (reboots itself, ~10 min)'
+Step '2/9 Promoting DC to a new forest (reboots itself, ~10 min)'
 $promoteOut = Invoke-VmScript -VmName $dcName -ScriptFile '01-promote-dc.ps1' `
     -Params @{ DomainName = $DomainName; SafeModePassword = $plainPw }
 $promoteOut | Write-Host
@@ -119,32 +119,41 @@ if ($promoteOut -notmatch 'ALREADY_PROMOTED') {
 }
 
 # ----------------------------------------------------------- 3. Lab users
-Step '3/8 Creating lab users (retries until AD is up)'
+Step '3/9 Creating lab users (retries until AD is up)'
 Invoke-VmScript -VmName $dcName -ScriptFile '02-create-lab-users.ps1' `
     -Params @{ Password = $plainPw } -Retries 8 -RetryDelaySec 60 | Write-Host
 
 # ----------------------------------------------------- 4. Join client VM
-Step '4/8 Domain-joining the client VM (reboots itself)'
+Step '4/9 Domain-joining the client VM (reboots itself)'
 Invoke-VmScript -VmName $cliName -ScriptFile '03-join-domain-client.ps1' `
     -Params @{ DomainName = $DomainName; JoinUser = $AdminUsername; JoinPassword = $plainPw } `
     -Retries 3 -RetryDelaySec 60 | Write-Host
 
 # --------------------------------------- 5. Domain-join the storage account
-Step '5/8 Domain-joining the storage account (kerb key + computer account + SPN)'
+Step '5/9 Domain-joining the storage account (kerb key + computer account + SPN)'
 New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
 $kerbKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
     Where-Object KeyName -eq 'kerb1').Value
 
+$encType = if ($Modern) { 'AES256' } else { 'RC4' }
 $joinOut = Invoke-VmScript -VmName $dcName -ScriptFile '04-domain-join-storage.ps1' `
-    -Params @{ StorageAccountName = $saName; KerbKey = $kerbKey } -Retries 3 -RetryDelaySec 30
+    -Params @{ StorageAccountName = $saName; KerbKey = $kerbKey; KerberosEncryptionType = $encType } `
+    -Retries 3 -RetryDelaySec 30
 if ($joinOut -notmatch '===JSON_BEGIN===(.+)===JSON_END===') { throw "Unexpected output: $joinOut" }
 $ad = $Matches[1] | ConvertFrom-Json
 
 # ------------------------------------------- 6. Enable AD DS auth on the SA
-Step '6/8 Enabling AD DS authentication on the storage account'
+Step '6/9 Enabling AD DS authentication on the storage account'
+# LEGACY MODE (default): ActiveDirectoryDomainName gets the NetBIOS name rather
+# than the DNS root. Harmless under RC4 (no salt), fatal under AES-256 - the
+# exact latent defect behind a real Sev A incident.
+$adDomainNameValue = if ($Modern) { $ad.DomainName } else { $ad.NetBiosDomainName }
+if (-not $Modern) {
+    Write-Host "Legacy mode: ActiveDirectoryDomainName = '$adDomainNameValue' (NetBIOS, not the DNS root)"
+}
 Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
     -EnableActiveDirectoryDomainServicesForFile $true `
-    -ActiveDirectoryDomainName $ad.DomainName `
+    -ActiveDirectoryDomainName $adDomainNameValue `
     -ActiveDirectoryNetBiosDomainName $ad.NetBiosDomainName `
     -ActiveDirectoryForestName $ad.ForestName `
     -ActiveDirectoryDomainGuid $ad.DomainGuid `
@@ -160,7 +169,7 @@ Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
 # -------------------------------------------- 7. Final kerb key sync
 # Rotate kerb1 once more AFTER the SA is fully configured and push it to the
 # AD object. Prevents the propagation race that surfaces as error 1396.
-Step '7/8 Final kerb key sync (1396/AP_ERR_MODIFIED guard)'
+Step '7/9 Final kerb key sync (1396/AP_ERR_MODIFIED guard)'
 New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
 Start-Sleep -Seconds 15  # let the new key value settle before reading it back
 $kerbKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
@@ -170,11 +179,77 @@ Invoke-VmScript -VmName $dcName -ScriptFile '06-sync-kerb-password.ps1' `
     -Retries 3 -RetryDelaySec 30 | Write-Host
 
 # ------------------------------------------------------------ 8. NTFS ACLs
-Step '8/8 Setting NTFS permissions on the share'
+Step '8/9 Setting NTFS permissions on the share'
 $key1 = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName)[0].Value
 Invoke-VmScript -VmName $dcName -ScriptFile '05-set-ntfs-perms.ps1' `
     -Params @{ StorageAccountName = $saName; StorageKey = $key1; NetBios = $ad.NetBiosDomainName } `
     -Retries 3 -RetryDelaySec 30 | Write-Host
+
+# ------------------------------------------- 9. Diagnostic tooling on the VMs
+# Az modules + AzFilesHybrid so attendees can run Debug-AzStorageAccountAuth
+# and the kerb-key cmdlets directly on the lab machines.
+Step '9/9 Installing diagnostic tools on both VMs (Az + AzFilesHybrid)'
+$toolJobs = @($cliName, $dcName) | ForEach-Object {
+    $vm = $_
+    Start-Job -Name "tools-$vm" -ScriptBlock {
+        param($rg, $vmName, $path)
+        Import-Module Az.Compute -ErrorAction SilentlyContinue
+        Invoke-AzVMRunCommand -ResourceGroupName $rg -VMName $vmName `
+            -CommandId 'RunPowerShellScript' -ScriptPath $path -ErrorAction Stop
+    } -ArgumentList $ResourceGroupName, $vm, (Join-Path (Join-Path $scriptRoot 'scripts') '07-install-tools.ps1')
+}
+Write-Host '  installing on both VMs in parallel (a few minutes)...'
+$toolJobs | Wait-Job -Timeout 900 | Out-Null
+foreach ($j in $toolJobs) {
+    if ($j.State -eq 'Completed') {
+        $out = (Receive-Job $j).Value | Where-Object Code -like '*StdOut*'
+        if ($out.Message -match 'TOOLS_READY') { Write-Host "  $($j.Name): OK" }
+        else { Write-Warning "  $($j.Name): finished with warnings - see the lab VM if tools are missing" }
+    }
+    else {
+        Write-Warning "  $($j.Name): $($j.State) - install tools manually if needed (scripts\07-install-tools.ps1)"
+    }
+    Remove-Job $j -Force -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------- 10. Verify the mount actually works
+# Legacy mode depends on RC4 still being usable in this environment. If it
+# isn't, fall back to the correct AES-256 config so the rest of the lab runs.
+Step 'Verifying the environment (mount test from the client)'
+$labMode = if ($Modern) { 'MODERN (AES-256)' } else { 'LEGACY (RC4)' }
+$verify = Invoke-VmScript -VmName $cliName -ScriptFile '08-verify-mount.ps1' `
+    -Params @{ StorageAccountName = $saName } -Retries 3 -RetryDelaySec 30
+$verify | Write-Host
+
+if ($verify -notmatch 'MOUNT_OK') {
+    if (-not $Modern) {
+        Write-Warning 'Legacy RC4 mount did not work here - falling back to AES-256 so the lab still runs.'
+        Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
+            -EnableActiveDirectoryDomainServicesForFile $true `
+            -ActiveDirectoryDomainName $ad.DomainName `
+            -ActiveDirectoryNetBiosDomainName $ad.NetBiosDomainName `
+            -ActiveDirectoryForestName $ad.ForestName `
+            -ActiveDirectoryDomainGuid $ad.DomainGuid `
+            -ActiveDirectoryDomainSid $ad.DomainSid `
+            -ActiveDirectoryAzureStorageSid $ad.AzureStorageSid `
+            -ActiveDirectorySamAccountName $ad.SamAccountName `
+            -ActiveDirectoryAccountType 'Computer' | Out-Null
+        New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
+        Start-Sleep -Seconds 15
+        $kerbKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
+            Where-Object KeyName -eq 'kerb1').Value
+        Invoke-VmScript -VmName $dcName -ScriptFile '04-domain-join-storage.ps1' `
+            -Params @{ StorageAccountName = $saName; KerbKey = $kerbKey; KerberosEncryptionType = 'AES256' } `
+            -Retries 2 -RetryDelaySec 30 | Out-Null
+        $verify = Invoke-VmScript -VmName $cliName -ScriptFile '08-verify-mount.ps1' `
+            -Params @{ StorageAccountName = $saName } -Retries 2 -RetryDelaySec 30
+        $verify | Write-Host
+        $labMode = 'MODERN (AES-256) - RC4 unavailable, AES-256 migration lab not applicable'
+    }
+    if ($verify -notmatch 'MOUNT_OK') {
+        Write-Warning 'Mount still failing - check Test-NetConnection 445 and Debug-AzStorageAccountAuth on the client.'
+    }
+}
 
 $sw.Stop()
 Write-Host @"
@@ -182,6 +257,7 @@ Write-Host @"
 ==============================================================
  DEPLOYMENT COMPLETE  ($([int]$sw.Elapsed.TotalMinutes) min)
 ==============================================================
+ Lab mode        : $labMode
  Storage account : $saName
  File share      : \\$saName.file.core.windows.net\labshare
  Domain          : $DomainName
@@ -192,5 +268,10 @@ Write-Host @"
    klist purge
    net use Z: \\$saName.file.core.windows.net\labshare
    klist   # look for the cifs/ ticket
+
+ Diagnostics are preinstalled on both VMs (Az + AzFilesHybrid):
+   Connect-AzAccount
+   Debug-AzStorageAccountAuth -StorageAccountName $saName ``
+     -ResourceGroupName $ResourceGroupName -Verbose
 ==============================================================
 "@ -ForegroundColor Green

@@ -5,7 +5,11 @@
 # Args: -StorageAccountName <sa> -KerbKey <kerb1 value>
 param(
     [string]$StorageAccountName,
-    [string]$KerbKey
+    [string]$KerbKey,
+    # AES256 = modern/correct. RC4 = the "legacy 2023 vintage" state the lab
+    # starts from, so attendees can perform the AES-256 migration themselves.
+    [ValidateSet('AES256', 'RC4')]
+    [string]$KerberosEncryptionType = 'AES256'
 )
 $ErrorActionPreference = 'Stop'
 Import-Module ActiveDirectory
@@ -19,10 +23,8 @@ $ouDn = "OU=$ouName,$domainDn"
 $spn = "cifs/$StorageAccountName.file.core.windows.net"
 $sec = ConvertTo-SecureString $KerbKey -AsPlainText -Force
 
-# AES-256 from the start: the April/July 2026 Windows hardening retires RC4,
-# so an RC4-only account would fail on patched clients/DCs.
 # Order matters - set the encryption type BEFORE the final password reset,
-# because AES keys are derived from the password at set time.
+# because the AES keys are derived from the password (and the salt) at set time.
 $existing = Get-ADComputer -Filter "Name -eq '$StorageAccountName'" -ErrorAction SilentlyContinue
 if (-not $existing) {
     New-ADComputer -Name $StorageAccountName `
@@ -35,7 +37,8 @@ if (-not $existing) {
 }
 Set-ADComputer -Identity $StorageAccountName `
     -ServicePrincipalNames @{Replace = $spn } `
-    -KerberosEncryptionType AES256
+    -KerberosEncryptionType $KerberosEncryptionType
+Write-Output "KerberosEncryptionType set to $KerberosEncryptionType"
 
 # NOTE: computer accounts' SamAccountName ends with '$'. Set-ADAccountPassword
 # does NOT auto-append it (unlike the *-ADComputer cmdlets), so resolve the

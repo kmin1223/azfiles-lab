@@ -29,41 +29,47 @@ Session 2.
 
 | Time | Activity |
 |---|---|
-| 0:00–0:05 | Welcome. Everyone runs `deploy.ps1` (verify no errors in step 1/7 before moving on). |
-| 0:05–0:30 | Slides: Kerberos fundamentals → Azure Files auth matrix → three security layers → what the automation is doing right now. Poll deployment progress at ~0:20. |
-| 0:30–0:40 | Lab 1 (healthy state): RDP to client as `CONTOSO\labuser1`, `klist purge`, mount, inspect the `cifs/` ticket, create a file. |
-| 0:40–0:55 | Labs 2–4 (break/fix): presenter injects faults; attendees diagnose with the toolkit, then repair. Order: PasswordMismatch → SpnBroken → Block445. Keep EtypeMismatch and NoShareAccess as backups if time allows. |
-| 0:55–1:00 | Wrap-up: troubleshooting decision tree, Session 2 teaser. **Have everyone tear down** (`Remove-AzResourceGroup -Name azfiles-lab -Force`) to avoid idle VM costs over the gap between sessions. |
+| 0:00–0:05 | Welcome. Everyone starts `deploy.ps1` in Cloud Shell (verify step 1/9 is running before moving on). |
+| 0:05–0:30 | Slides. Two blocks: **mechanism** (what the join creates → when tickets are issued → what decrypts what) and **evidence** (where the truth lives → reading a failed exchange). Poll deployment progress at ~0:26. |
+| 0:30–0:40 | Lab 1 (healthy state): mount, inspect the `cifs/` ticket, and **capture a known-good trace** with `Get-KerberosEvidence.ps1`. |
+| 0:40–0:55 | Labs 2–4 (break/fix): inject, reproduce, then diagnose **from evidence** (trace + event 4769), repair. Order: PasswordMismatch → SpnBroken → Block445/NoShareAccess. |
+| 0:55–1:00 | Wrap-up: triage table, Session 2 teaser. **Have everyone tear down** (`Remove-AzResourceGroup -Name azfiles-lab -Force`) to avoid idle VM costs over the gap between sessions. |
 
-## Talking points while deploying (10 concept slides ≈ 25 min)
+## Talking points while deploying (13 concept slides ≈ 25 min)
 
-The Kerberos "kingdom" analogy (king = AS, queen = TGS, ticket = ST) lands
-well before showing AS-REQ/TGS-REQ/AP-REQ. Emphasize what "domain joining a
-storage account" actually is: a computer account in AD whose password is the
-storage account's kerb1 key and whose SPN is
-`cifs/<sa>.file.core.windows.net`. Once attendees hold that mental model,
-faults 1 and 2 become obvious rather than mysterious. Also stress the three
-authorization layers (storage firewall → share-level RBAC → NTFS), because
-"Kerberos succeeded but access denied" confusion is the single most common
-support pattern. Three slides deserve extra time: line-of-sight mechanics
-(DNS → DC locator → ports — most attendees have never seen it broken down),
-the 2026 RC4 retirement (live issue this year; the lab deploys AES-256 and
-the slide explains the migration), and share-level permission options
-(per-identity RBAC vs default share permission — sets up the NoShareAccess
-fault).
+This audience knows Kerberos — don't teach the protocol, teach **where Azure
+Files sits in it and how to prove where it broke**. Slide 4 sets up the four
+stages (AS / TGS / SessionSetup / TreeConnect) and names event 4769 for the
+first time.
+
+Give the most time to two clusters. First, the **mechanism trio**: what a domain
+join actually creates (AD account + password = kerb key + SPN), when tickets are
+issued and where they're cached, and — the payoff — what encrypts what, ending
+with "if neither kerb key opens the ticket, that's 1396." Second, the **evidence
+pair**: the five sources and what each uniquely answers, then the KRB-ERROR →
+stage mapping. The two rows that matter most there are "no 4769 at all" (the
+client never asked) and "4769 success + ACCESS_DENIED" (authorization, not
+authentication).
+
+The remaining slides — identity sources, line of sight, RC4 retirement, the
+three doors, the effective-access matrix — are 1 minute each. The RC4 slide
+lands better if you tie it back to key derivation from the mechanism trio.
 
 ## Lab flow details
 
-Lab 1 (healthy): on the client VM as `CONTOSO\labuser1`:
+Lab 1 (healthy): on the client VM as `CONTOSO\labuser1`, mount and inspect —
+then insist everyone runs the collector once on the **working** mount:
 
-    klist purge
-    klist get cifs/<sa>.file.core.windows.net
-    net use Z: \\<sa>.file.core.windows.net\labshare
-    klist        # show the cifs ticket, encryption type, validity
+    C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
 
-Labs 2–4: for each fault — inject, let attendees hit the error, diagnose
-together (see catalog), repair, re-mount. Attendees can also self-serve
-faults against their own environment with `Invoke-Fault.ps1`.
+That capture is the reference every later diagnosis diffs against. Without it
+the evidence labs lose their punch.
+
+Labs 2–4: inject → reproduce → **capture** → compare against known-good →
+repair. In Lab 2, put the trace or the 4769 entry on screen: a successful ticket
+issue alongside a failed SessionSetup is the single most convincing artifact in
+the session. If time remains, `ClockSkew` and `DuplicateSpn` are the best
+advanced faults — neither is identifiable without the evidence.
 
 # Session 2 — Microsoft Entra Kerberos (Hybrid Identities)
 
@@ -254,9 +260,50 @@ Kerberos tab. For a PG escalation, capture the **Request ID** from the response
 (`x-ms-request-id` header, or the Trace ID in the KRB_ERROR EText) plus the
 timestamp — and remember a KRB_ERROR still returns HTTP 200.
 
+**KRB_AP_ERR_SKEW — vague mount failure, everything looks configured**
+Cause: client/DC clock difference beyond Kerberos' ~5 minute tolerance. The
+mount error text is unhelpful; only the trace (or the Kerberos operational log)
+names the skew. Diagnose: `w32tm /stripchart /computer:<dc> /samples:3`. Fix:
+re-enable/restart w32time and `w32tm /resync /force`. Lab: `-Fault ClockSkew`.
+
+**Duplicate SPN — intermittent or nonsensical failures**
+Cause: the same `cifs/<sa>…` SPN registered on two AD objects; the KDC may
+encrypt the ticket for the wrong account. Diagnose: `setspn -X` on the DC (or
+`setspn -Q` and count the owners). Fix: remove the SPN from the wrong object.
+Lab: `-Fault DuplicateSpn`. This one is genuinely hard to spot from symptoms —
+use it to make the evidence-first point.
+
+# Evidence-first diagnosis (the specialist habit)
+
+Both lab VMs ship with `C:\LabTools\Get-KerberosEvidence.ps1`, which captures a
+whole mount attempt: network trace (converted to `.pcapng` via etl2pcapng),
+klist before/after, and the Kerberos + SMBClient operational logs. Kerberos
+auditing (4768/4769) is enabled on the DC by the deployment.
+
+Teach the loop: **capture a working mount first**, then every failure is a diff
+against known-good. The three questions the evidence answers that an error
+string can't:
+
+1. **Did the KDC issue a ticket?** — event 4769 on the DC (and the TGS-REP in
+   the trace). Success here eliminates SPN, etype and DC problems in one step.
+2. **What did the client actually ask for?** — 4769's Service Name shows the SPN
+   string as requested, which exposes CNAME/suffix and typo problems.
+3. **Where did it stop?** — TGS vs SessionSetup vs TreeConnect in the trace maps
+   directly to authentication vs service-key vs authorization.
+
+The flagship demo is Lab 2: 4769 shows a **successful** ticket issue while SMB
+SessionSetup fails with KRB_AP_ERR_MODIFIED — proof that only the service's key
+is wrong. Show this on screen; it's the moment the session earns its level.
+
 # Troubleshooting toolkit (both sessions)
 
+    C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>   # one-shot evidence capture
+    Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 5   # KDC record (DC)
+    setspn -X                             # duplicate SPNs (DC)
+    w32tm /stripchart /computer:<dc>      # clock skew
+    Wireshark filter:  kerberos || smb2
     klist / klist purge / klist get cifs/<sa>.file.core.windows.net
+    klist -li 0x3e7                       # the SYSTEM session's tickets
     klist cloud_debug                     # Entra Kerberos: cloud TGT state
     Get-AzStorageKerberosTicketStatus     # ticket etype + "Azure Files Health Status"
     dsregcmd /status ; dsregcmd /refreshprt
