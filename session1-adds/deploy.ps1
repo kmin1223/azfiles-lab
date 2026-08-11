@@ -45,12 +45,39 @@ param(
     [switch]$Modern,
     # Override the prebuilt module bundle location (see tools\New-LabToolsBundle.ps1).
     # Leave empty to use the default baked into scripts\07-install-tools.ps1.
-    [string]$ModuleBundleUri
+    [string]$ModuleBundleUri,
+    # Where the transcript and lab-info file land. $HOME survives a Cloud Shell
+    # reconnect, so a dropped session doesn't take the results with it.
+    [string]$LogPath = (Join-Path $HOME 'azfiles-lab-logs')
 )
 $ErrorActionPreference = 'Stop'
 $scriptRoot = $PSScriptRoot
 
-function Step([string]$msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
+# Stamped so the transcript shows where the time actually went - useful both for
+# tuning the deployment and for telling a hung step from a slow one.
+function Step([string]$msg) {
+    $elapsed = if ($script:sw) { '{0:mm\:ss}' -f $script:sw.Elapsed } else { '00:00' }
+    Write-Host "`n[+$elapsed] === $msg ===" -ForegroundColor Cyan
+}
+
+# ------------------------------------------------------------------ Logging
+# Cloud Shell disconnects after ~20 minutes without interaction, which kills
+# this script mid-run. Everything therefore goes to disk as it happens, and the
+# resource details are written as soon as they exist rather than at the end.
+New-Item -ItemType Directory -Path $LogPath -Force | Out-Null
+$stamp    = Get-Date -Format 'yyyyMMdd-HHmmss'
+$logFile  = Join-Path $LogPath "deploy-$stamp.log"
+$infoFile = Join-Path $LogPath "lab-info-$stamp.txt"
+try { Start-Transcript -Path $logFile -Force | Out-Null } catch { }
+
+Write-Host "Transcript : $logFile" -ForegroundColor Yellow
+Write-Host "Lab info   : $infoFile" -ForegroundColor Yellow
+Write-Host 'Both survive a Cloud Shell disconnect - read them if this window dies.' -ForegroundColor Yellow
+
+function Write-LabInfo([string]$text) {
+    $text | Out-File -FilePath $infoFile -Encoding utf8
+    Write-Host $text
+}
 
 # ---------------------------------------------------------------- Preflight
 foreach ($m in 'Az.Accounts', 'Az.Resources', 'Az.Compute', 'Az.Storage', 'Az.Network') {
@@ -97,7 +124,30 @@ $dcName    = $dep.Outputs.dcVmName.Value
 $cliName   = $dep.Outputs.clientVmName.Value
 $dcIpPub   = $dep.Outputs.dcPublicIp.Value
 $cliIpPub  = $dep.Outputs.clientPublicIp.Value
-Write-Host "Storage account: $saName | DC: $dcIpPub | Client: $cliIpPub"
+
+# Record the resource details NOW. If the session drops during the long middle
+# stretch, this file is what tells you what was created and how to reach it.
+Write-LabInfo @"
+==============================================================
+ AZURE FILES LAB - SESSION 1  (deployment IN PROGRESS)
+==============================================================
+ Started         : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+ Lab mode        : $(if ($Modern) { 'MODERN (AES-256)' } else { 'LEGACY (RC4)' })
+ Subscription    : $((Get-AzContext).Subscription.Name)
+ Resource group  : $ResourceGroupName  ($Location)
+ Storage account : $saName
+ File share      : \\$saName.file.core.windows.net\labshare
+ Domain          : $DomainName
+ DC (RDP)        : $dcIpPub   ($AdminUsername)
+ Client (RDP)    : $cliIpPub  ($AdminUsername, later CONTOSO\labuser1)
+ Transcript      : $logFile
+
+ This file is rewritten with the final result when the deployment finishes.
+ If it still says IN PROGRESS, the run did not complete - check the transcript
+ for the last '=== step ===' line, then re-run deploy.ps1 with the same
+ -ResourceGroupName (the steps are re-runnable).
+==============================================================
+"@
 
 function Invoke-VmScript {
     param([string]$VmName, [string]$ScriptFile, [hashtable]$Params = @{}, [int]$Retries = 1, [int]$RetryDelaySec = 60)
@@ -336,17 +386,21 @@ if ($verify -notmatch 'MOUNT_OK') {
 }
 
 $sw.Stop()
-Write-Host @"
-
+$summary = @"
 ==============================================================
- DEPLOYMENT COMPLETE  ($([int]$sw.Elapsed.TotalMinutes) min)
+ DEPLOYMENT COMPLETE  ($([int]$sw.Elapsed.TotalMinutes) min $($sw.Elapsed.Seconds % 60) s)
 ==============================================================
+ Finished        : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
  Lab mode        : $labMode
+ Mount check     : $(if ($verify -match 'MOUNT_OK') { 'PASSED' } else { 'FAILED - see notes below' })
+ Subscription    : $((Get-AzContext).Subscription.Name)
+ Resource group  : $ResourceGroupName  ($Location)
  Storage account : $saName
  File share      : \\$saName.file.core.windows.net\labshare
  Domain          : $DomainName
  DC (RDP)        : $dcIpPub  ($AdminUsername)
  Client (RDP)    : $cliIpPub ($($ad.NetBiosDomainName)\labuser1)
+ Transcript      : $logFile
 
  Lab quick start (on the CLIENT VM as $($ad.NetBiosDomainName)\labuser1):
    klist purge
@@ -358,5 +412,12 @@ Write-Host @"
    Connect-AzAccount
    Debug-AzStorageAccountAuth -StorageAccountName $saName ``
      -ResourceGroupName $ResourceGroupName -Verbose
+
+ Teardown when finished:
+   Remove-AzResourceGroup -Name $ResourceGroupName -Force
 ==============================================================
-"@ -ForegroundColor Green
+"@
+$summary | Out-File -FilePath $infoFile -Encoding utf8
+Write-Host "`n$summary" -ForegroundColor Green
+Write-Host "Saved to: $infoFile" -ForegroundColor Yellow
+try { Stop-Transcript | Out-Null } catch { }

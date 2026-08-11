@@ -134,7 +134,26 @@ cd session1-adds
 The deploy is fully automated from here: forest promotion, lab users
 (`labuser1`/`labuser2`), client domain join, storage account domain join
 (computer account + SPN + kerb1 key), AD DS auth enablement, default share
-permission, and NTFS ACLs.
+permission, and NTFS ACLs. It takes about 12–15 minutes.
+
+### If your shell disconnects mid-deploy
+
+Cloud Shell drops the session after roughly 20 minutes without interaction, and
+that kills the running script. Nothing is lost, because the deploy writes to
+`~/azfiles-lab-logs/` as it goes:
+
+| File | What it holds |
+|---|---|
+| `lab-info-<timestamp>.txt` | resource group, storage account, RDP addresses, credentials to use — written **as soon as the ARM deployment finishes**, then rewritten with the final result and total run time |
+| `deploy-<timestamp>.log` | full transcript, each step stamped with elapsed time |
+
+```powershell
+Get-Content ~/azfiles-lab-logs/lab-info-*.txt | Select-Object -Last 30
+```
+
+If `lab-info` still says **IN PROGRESS**, the run didn't finish. Find the last
+`[+mm:ss] === step ===` line in the transcript, then re-run `deploy.ps1` with the
+same `-ResourceGroupName` — the steps are re-runnable and skip completed work.
 
 ## Session 2 quick start (attendees)
 
