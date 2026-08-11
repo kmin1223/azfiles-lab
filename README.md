@@ -134,7 +134,9 @@ cd session1-adds
 The deploy is fully automated from here: forest promotion, lab users
 (`labuser1`/`labuser2`), client domain join, storage account domain join
 (computer account + SPN + kerb1 key), AD DS auth enablement, default share
-permission, and NTFS ACLs. It takes about 12–15 minutes.
+permission, and NTFS ACLs. A verified environment takes about 13–16 minutes;
+the diagnostic tooling (Az + AzFilesHybrid) installs on the client **after**
+that, off the critical path, so a slow download can't hold up the lab.
 
 ### If your shell disconnects mid-deploy
 

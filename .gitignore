@@ -7,6 +7,10 @@ source-wikis/
 docs/_archive-old/
 *_flowqa*.png
 
+# The module bundle ships as a GitHub RELEASE ASSET, not in the repo -
+# 64 MB in git history would bloat every clone. Built by tools/New-LabToolsBundle.ps1.
+labtools-modules.zip
+
 # Local editor / OS cruft
 .DS_Store
 Thumbs.db

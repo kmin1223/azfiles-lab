@@ -119,10 +119,22 @@ if (-not $bundleWorked) {
 # module fails to load with "The required module 'Az.X' is not loaded" and its
 # cmdlets look missing. Verify against the shipped manifest after any upgrade:
 #   (Import-PowerShellDataFile "$env:ProgramFiles\WindowsPowerShell\Modules\AzFilesHybrid\<ver>\AzFilesHybrid.psd1").RequiredModules
+#
+# HARD TIME BUDGET on the gallery fallback. PowerShellGet v2 on a B-series VM
+# has been observed taking 20-30+ minutes for this set, and a Run Command can't
+# be cancelled from outside - a slow install literally holds the VM hostage.
+# Better to stop, report TOOLS_PARTIAL honestly, and let the operator rerun
+# once the bundle is published.
+$galleryBudget = [System.Diagnostics.Stopwatch]::StartNew()
+$galleryBudgetMin = 8
 $azModules = 'Az.Accounts', 'Az.Storage', 'Az.Resources', 'Az.Network', 'Az.Compute'
 foreach ($m in $azModules) {
     if (Get-Module -ListAvailable -Name $m) {
         Write-Output "$m already present"
+        continue
+    }
+    if ($galleryBudget.Elapsed.TotalMinutes -gt $galleryBudgetMin) {
+        Write-Output "$m SKIPPED: gallery time budget (${galleryBudgetMin} min) exhausted - publish the module bundle and rerun"
         continue
     }
     try {
@@ -181,6 +193,10 @@ if ($psd1) {
             $name = if ($r -is [hashtable]) { $r.ModuleName } else { [string]$r }
             if (-not $name) { continue }
             if (Get-Module -ListAvailable -Name $name) { continue }
+            if ($galleryBudget.Elapsed.TotalMinutes -gt $galleryBudgetMin) {
+                Write-Output "dependency $name SKIPPED: gallery time budget exhausted"
+                continue
+            }
             try {
                 Install-Module -Name $name -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
                 Write-Output "dependency $name installed"

@@ -14,16 +14,17 @@
     8. Default share-level permission + NTFS ACLs
     9. Verify the client actually mounts the share
 
-  Three things keep the wall clock down:
-    * the client fetches a PREBUILT module bundle (one zip) instead of running
-      Install-Module per module - see tools\New-LabToolsBundle.ps1
-    * that install runs while the DC is promoting; it needs nothing from AD,
-      but it must finish before the client reboots into the domain
-    * the client's domain join and reboot happen while the storage account is
-      being joined and configured, which only touches the DC and Azure
+  Timing design:
+    * the client's domain join and reboot run in the background while the
+      storage account is joined and configured (DC + Azure only)
+    * diagnostic tooling (Az + AzFilesHybrid) is NOT part of the critical
+      path. It installs LAST, after the mount is verified and the summary is
+      written, from a prebuilt bundle (tools\New-LabToolsBundle.ps1). A slow
+      or failed tooling install can no longer delay or break the deployment.
 
-  Total time: ~12-15 minutes. Run it at the START of the session and present
-  slides while it cooks.
+  Total time to a verified environment: ~13-16 minutes, plus a few background
+  minutes for tooling. Run it at the START of the session and present slides
+  while it cooks.
 
 .EXAMPLE
   Connect-AzAccount
@@ -264,22 +265,6 @@ function Receive-VmScriptJob {
     return ($r.Value | Where-Object Code -like '*StdOut*').Message
 }
 
-# --------------------------------- PARALLEL: client tooling starts right now
-# The client pulls a prebuilt module bundle (Az + AzFilesHybrid + the Graph
-# dependency) as a single zip rather than running Install-Module per module -
-# roughly a minute instead of nine. It needs nothing from AD, so it also runs
-# while the DC promotes.
-#
-# Note what this parallelism can and cannot be: work overlaps ACROSS the two
-# VMs, never on one of them. Azure runs a single Run Command per VM and rejects
-# a second with HTTP 409, so this install must genuinely finish before the
-# domain join is issued against the same client - and that join reboots the
-# machine, which would kill an in-flight Run Command anyway.
-Step 'Starting client tooling install in the background (overlaps DC promotion)'
-$toolParams = @{}
-if ($ModuleBundleUri) { $toolParams['ModuleBundleUri'] = $ModuleBundleUri }
-$clientToolsJob = Start-VmScriptJob -VmName $cliName -ScriptFile '07-install-tools.ps1' -Params $toolParams
-
 # ------------------------------------------------------- 2. Promote the DC
 Step '2/9 Promoting DC to a new forest (reboots itself)'
 $promoteOut = Invoke-VmScript -VmName $dcName -ScriptFile '01-promote-dc.ps1' `
@@ -318,21 +303,6 @@ Invoke-VmScript -VmName $dcName -ScriptFile '02-create-lab-users.ps1' `
 Step 'Enabling Kerberos auditing on the DC (events 4768/4769)'
 $dcPrep = Invoke-VmScript -VmName $dcName -ScriptFile '07-install-tools.ps1' -Retries 2 -RetryDelaySec 30
 ($dcPrep -split "`n" | Where-Object { $_ -match 'TOOLS_|auditing|logs enabled' }) | Write-Host
-
-# ------------------------------- Collect the client tooling job before reboot
-Step 'Waiting for the client tooling install to finish'
-$toolsOut = Receive-VmScriptJob -Job $clientToolsJob -TimeoutSec 2400 -Label 'client tooling' -VmName $cliName
-if ($toolsOut -match 'TOOLS_READY') {
-    Write-Host '  client tooling: OK'
-} elseif ($toolsOut -match 'Module bundle unavailable') {
-    Write-Warning '  the prebuilt module bundle could not be downloaded, so this fell back'
-    Write-Warning '  to Install-Module (many minutes slower). Publish the bundle before the'
-    Write-Warning '  session: tools\New-LabToolsBundle.ps1, then gh release create.'
-} else {
-    $detail = ($toolsOut -split "`n" | Select-String 'TOOLS_PARTIAL|FAILED').Line -join '; '
-    Write-Warning "  client tooling incomplete: $detail"
-    Write-Warning '  rerun scripts\07-install-tools.ps1 on the client if diagnostics are missing.'
-}
 
 # ----------------------------------------------------- 4. Join client VM
 # Started as a job: the client reboot (~3 min) overlaps the storage-account
@@ -484,4 +454,34 @@ $summary = @"
 $summary | Out-File -FilePath $infoFile -Encoding utf8
 Write-Host "`n$summary" -ForegroundColor Green
 Write-Host "Saved to: $infoFile" -ForegroundColor Yellow
+
+# --------------- POST-DEPLOY: diagnostic tooling (off the critical path)
+# This step burned two deployments by sitting in the middle of the run: the
+# PowerShell Gallery fallback can take 20-30+ minutes on a B-series VM, and a
+# Run Command can neither be cancelled nor share the VM with another one.
+# So it now runs LAST, after the environment is complete and verified and the
+# summary above is already on disk. Nothing later depends on it: the fault labs
+# use klist/net use/setspn, and AzFilesHybrid is only needed once attendees
+# reach the Debug-AzStorageAccountAuth part - a good half hour into the session.
+Step 'Post-deploy: installing diagnostics on the client (bundle path, ~2-4 min)'
+Write-Host '  The lab environment is READY - this last step is optional tooling.' -ForegroundColor Yellow
+Write-Host '  Safe to Ctrl+C: once issued, the VM finishes the install on its own.' -ForegroundColor Yellow
+$toolParams = @{}
+if ($ModuleBundleUri) { $toolParams['ModuleBundleUri'] = $ModuleBundleUri }
+try {
+    $toolsOut = Invoke-VmScript -VmName $cliName -ScriptFile '07-install-tools.ps1' -Params $toolParams
+    if ($toolsOut -match 'TOOLS_READY') {
+        Write-Host '  client diagnostics: OK' -ForegroundColor Green
+    } elseif ($toolsOut -match 'Module bundle unavailable') {
+        Write-Warning '  bundle download failed; the VM fell back to the slow gallery path.'
+        Write-Warning '  Check the release asset: tools\New-LabToolsBundle.ps1 + gh release create.'
+    } else {
+        $detail = ($toolsOut -split "`n" | Select-String 'TOOLS_PARTIAL|FAILED').Line -join '; '
+        Write-Warning "  diagnostics incomplete: $detail (rerun scripts\07-install-tools.ps1 on the VM)"
+    }
+} catch {
+    Write-Warning "  diagnostics install did not finish: $($_.Exception.Message.Split("`n")[0])"
+    Write-Warning '  The lab itself is unaffected. Rerun scripts\07-install-tools.ps1 on the client later.'
+}
+
 try { Stop-Transcript | Out-Null } catch { }
