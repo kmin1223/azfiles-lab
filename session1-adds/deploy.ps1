@@ -14,17 +14,16 @@
     8. Default share-level permission + NTFS ACLs
     9. Verify the client actually mounts the share
 
-  Two long, independent stretches run in the background rather than in
-  sequence, which is where most of the wall-clock time used to go:
-    * client tooling (Az + AzFilesHybrid, several minutes of downloads)
-      installs while the DC is promoting - it needs nothing from AD, but it
-      must finish before the client reboots into the domain
+  Three things keep the wall clock down:
+    * the client fetches a PREBUILT module bundle (one zip) instead of running
+      Install-Module per module - see tools\New-LabToolsBundle.ps1
+    * that install runs while the DC is promoting; it needs nothing from AD,
+      but it must finish before the client reboots into the domain
     * the client's domain join and reboot happen while the storage account is
       being joined and configured, which only touches the DC and Azure
 
-  Total time: ~18-22 minutes (the client tooling download is now the critical
-  path, not the sum of every step). Run it at the START of the session and
-  present slides while it cooks.
+  Total time: ~12-15 minutes. Run it at the START of the session and present
+  slides while it cooks.
 
 .EXAMPLE
   Connect-AzAccount
@@ -43,7 +42,10 @@ param(
     # the DNS root. It mounts fine on RC4; the latent salt defect only surfaces
     # when you migrate to AES-256 (Lab: Invoke-Aes256Migration.ps1).
     # Use -Modern to deploy the correct AES-256 configuration instead.
-    [switch]$Modern
+    [switch]$Modern,
+    # Override the prebuilt module bundle location (see tools\New-LabToolsBundle.ps1).
+    # Leave empty to use the default baked into scripts\07-install-tools.ps1.
+    [string]$ModuleBundleUri
 )
 $ErrorActionPreference = 'Stop'
 $scriptRoot = $PSScriptRoot
@@ -158,13 +160,15 @@ function Receive-VmScriptJob {
 }
 
 # --------------------------------- PARALLEL: client tooling starts right now
-# Installing Az + AzFilesHybrid (and its Microsoft.Graph.Applications
-# dependency) takes several minutes of pure downloading, and it needs nothing
-# from AD - so it runs while the DC promotes instead of after everything else.
-# It MUST finish before the client is domain-joined, because that reboots the
-# machine and would kill an in-flight Run Command.
+# The client pulls a prebuilt module bundle (Az + AzFilesHybrid + the Graph
+# dependency) as a single zip rather than running Install-Module per module -
+# roughly a minute instead of nine. It needs nothing from AD, so it also runs
+# while the DC promotes. It MUST finish before the client is domain-joined,
+# because that reboots the machine and would kill an in-flight Run Command.
 Step 'Starting client tooling install in the background (overlaps DC promotion)'
-$clientToolsJob = Start-VmScriptJob -VmName $cliName -ScriptFile '07-install-tools.ps1'
+$toolParams = @{}
+if ($ModuleBundleUri) { $toolParams['ModuleBundleUri'] = $ModuleBundleUri }
+$clientToolsJob = Start-VmScriptJob -VmName $cliName -ScriptFile '07-install-tools.ps1' -Params $toolParams
 
 # ------------------------------------------------------- 2. Promote the DC
 Step '2/9 Promoting DC to a new forest (reboots itself)'

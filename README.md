@@ -42,12 +42,36 @@ azfiles-lab/
 │   ├── template/azuredeploy.json     <- ARM template (no Bicep needed)
 │   ├── scripts/                     <- run-command payloads (DC/client, incl. tool install)
 │   └── faults/Invoke-Fault.ps1      <- break/fix scenarios (5 faults)
-└── session2-entra-kerberos/
-    ├── setup.ps1                    <- attendees run THIS at session start
-    ├── MANUAL-STEP-cloud-sync.md    <- the one interactive step
-    ├── scripts/
-    └── faults/Invoke-Fault.ps1      <- break/fix scenarios (4 faults)
+├── session2-entra-kerberos/
+│   ├── setup.ps1                    <- attendees run THIS at session start
+│   ├── MANUAL-STEP-cloud-sync.md    <- the one interactive step
+│   ├── scripts/
+│   └── faults/Invoke-Fault.ps1      <- break/fix scenarios (4 faults)
+└── tools/
+    └── New-LabToolsBundle.ps1       <- PRESENTER ONLY: build the module bundle
 ```
+
+## Presenter prerequisite: publish the module bundle (one time)
+
+The client VM needs Az + AzFilesHybrid. Installing those from the PowerShell
+Gallery takes about nine minutes per attendee and sits on the critical path of
+the deployment, so the VM downloads a prebuilt bundle instead — one zip, about
+a minute.
+
+Build and publish it once (Cloud Shell is fine):
+
+```powershell
+./tools/New-LabToolsBundle.ps1 -Trim
+gh release create tools-v1 labtools-modules.zip --repo kmin1223/azfiles-lab \
+  --title 'Lab tooling module bundle' --notes 'Prebuilt Az + AzFilesHybrid modules.'
+```
+
+`scripts/07-install-tools.ps1` points at `/releases/latest/download/labtools-modules.zip`,
+so refreshing later is just `gh release upload tools-v1 labtools-modules.zip --clobber`.
+
+> If the bundle is missing or unreachable, the deployment still works — the
+> script falls back to `Install-Module` and simply takes longer. Point somewhere
+> else with `deploy.ps1 -ModuleBundleUri <url>`.
 
 ## Attendee prerequisites (send before Session 1)
 

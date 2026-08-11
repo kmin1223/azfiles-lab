@@ -2,6 +2,12 @@
 # diagnostics: Az modules + the AzFilesHybrid module (Debug-AzStorageAccountAuth,
 # Test-AzStorageAccountADObjectPasswordIsKerbKey, Update-AzStorageAccountADObjectPassword).
 # Safe to re-run - skips whatever is already present.
+param(
+    # Prebuilt module bundle (see tools\New-LabToolsBundle.ps1). One HTTPS GET
+    # beats ~9 minutes of Install-Module round trips. Pass '' to force the
+    # gallery path.
+    [string]$ModuleBundleUri = 'https://github.com/kmin1223/azfiles-lab/releases/latest/download/labtools-modules.zip'
+)
 $ErrorActionPreference = 'Continue'   # never fail the deployment over tooling
 $ProgressPreference = 'SilentlyContinue'  # much faster downloads
 
@@ -54,13 +60,58 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
     Write-Output 'ActiveDirectory module already present'
 }
 
-# --- NuGet provider + trust the gallery (needed for unattended installs) ---
-try {
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop | Out-Null
-    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
-    Write-Output 'PSGallery ready'
-} catch {
-    Write-Output "PSGallery prep warning: $($_.Exception.Message)"
+# --- FAST PATH: prebuilt module bundle -------------------------------------
+# One HTTPS GET + a local extract, instead of ~9 minutes of Install-Module.
+# The archive holds module folders at its root, laid out exactly as the module
+# path expects, so extraction IS the install. Built by tools\New-LabToolsBundle.ps1.
+# If anything about this fails we simply fall through to the gallery below.
+$modulePath = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+if ($ModuleBundleUri) {
+    try {
+        $zip = Join-Path $env:TEMP 'labtools-modules.zip'
+        Write-Output 'Downloading prebuilt module bundle...'
+        $t0 = Get-Date
+        Invoke-WebRequest -Uri $ModuleBundleUri -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+        Write-Output ("  downloaded ${mb} MB in {0:n0}s" -f ((Get-Date) - $t0).TotalSeconds)
+
+        # Expand-Archive is slow in PS 5.1 and refuses to overwrite; go through
+        # the .NET API and overwrite entry by entry so re-runs are safe.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+        try {
+            foreach ($entry in $archive.Entries) {
+                $target = Join-Path $modulePath $entry.FullName
+                if (-not $entry.Name) {
+                    New-Item -ItemType Directory -Path $target -Force | Out-Null
+                    continue
+                }
+                New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force | Out-Null
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+            }
+        } finally {
+            $archive.Dispose()
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        }
+        Write-Output ("Module bundle extracted in {0:n0}s total" -f ((Get-Date) - $t0).TotalSeconds)
+    } catch {
+        Write-Output "Module bundle unavailable ($($_.Exception.Message)); falling back to PowerShell Gallery"
+    }
+}
+
+# --- NuGet provider + trust the gallery ------------------------------------
+# Only needed for the fallback path, and Install-PackageProvider itself takes
+# the better part of a minute - so skip it when the bundle already delivered.
+$bundleWorked = (Get-Module -ListAvailable -Name AzFilesHybrid, Az.Accounts, Az.Storage |
+    Select-Object -ExpandProperty Name -Unique).Count -ge 3
+if (-not $bundleWorked) {
+    try {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop | Out-Null
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+        Write-Output 'PSGallery ready'
+    } catch {
+        Write-Output "PSGallery prep warning: $($_.Exception.Message)"
+    }
 }
 
 # --- Az modules ---
