@@ -149,9 +149,36 @@ Write-LabInfo @"
 ==============================================================
 "@
 
+# Azure allows ONE Run Command per VM at a time; a second one is rejected with
+# HTTP 409 "Run command extension execution is in progress". That is not a
+# failure, it is a queue - so it gets its own generous wait budget and must not
+# burn the real retry allowance.
+function Test-RunCommandBusy($ErrorRecord) {
+    return ($ErrorRecord.Exception.Message -match 'execution is in progress|Conflict')
+}
+
+function Wait-VmRunCommandFree {
+    param([string]$VmName, [int]$MaxWaitMin = 30)
+    $deadline = (Get-Date).AddMinutes($MaxWaitMin)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VmName `
+                -CommandId 'RunPowerShellScript' -ScriptString "'FREE'" -ErrorAction Stop | Out-Null
+            return $true
+        } catch {
+            if (-not (Test-RunCommandBusy $_)) { return $true }  # busy is the only thing we wait on
+            Write-Host '  another Run Command is still executing on this VM; waiting 45s...'
+            Start-Sleep -Seconds 45
+        }
+    }
+    Write-Warning "  gave up waiting for $VmName to be free after $MaxWaitMin min"
+    return $false
+}
+
 function Invoke-VmScript {
     param([string]$VmName, [string]$ScriptFile, [hashtable]$Params = @{}, [int]$Retries = 1, [int]$RetryDelaySec = 60)
-    for ($i = 1; $i -le $Retries; $i++) {
+    $busyWaits = 0
+    for ($i = 1; $i -le $Retries; ) {
         try {
             $rc = @{
                 ResourceGroupName = $ResourceGroupName; VMName = $VmName
@@ -167,8 +194,16 @@ function Invoke-VmScript {
             if ($err) { Write-Warning $err }
             return $out
         } catch {
-            if ($i -eq $Retries) { throw }
-            Write-Host "  attempt $i failed ($($_.Exception.Message.Split("`n")[0])); retrying in ${RetryDelaySec}s..."
+            if (Test-RunCommandBusy $_) {
+                $busyWaits++
+                if ($busyWaits -gt 40) { throw }   # ~30 min of queueing is enough
+                Write-Host "  $VmName is busy with another Run Command; waiting 45s (attempt $busyWaits)..."
+                Start-Sleep -Seconds 45
+                continue                            # does NOT consume a retry
+            }
+            $i++
+            if ($i -gt $Retries) { throw }
+            Write-Host "  attempt $($i - 1) failed ($($_.Exception.Message.Split("`n")[0])); retrying in ${RetryDelaySec}s..."
             Start-Sleep -Seconds $RetryDelaySec
         }
     }
@@ -189,19 +224,39 @@ function Start-VmScriptJob {
         if ($p -and $p.Count -gt 0) { $rc['Parameter'] = $p }
         # Retry inside the job: right after an ARM deployment the guest agent
         # may not be accepting Run Commands yet, and a job has no other way back.
-        for ($i = 1; $i -le $retries; $i++) {
+        # A 409 means another Run Command owns the VM - wait it out separately,
+        # since that can legitimately take much longer than a transient error.
+        $busy = 0
+        for ($i = 1; $i -le $retries; ) {
             try { return Invoke-AzVMRunCommand @rc }
-            catch { if ($i -eq $retries) { throw }; Start-Sleep -Seconds 45 }
+            catch {
+                if ($_.Exception.Message -match 'execution is in progress|Conflict') {
+                    $busy++
+                    if ($busy -gt 40) { throw }
+                    Start-Sleep -Seconds 45
+                    continue
+                }
+                $i++
+                if ($i -gt $retries) { throw }
+                Start-Sleep -Seconds 45
+            }
         }
     } -ArgumentList $ResourceGroupName, $VmName, (Join-Path (Join-Path $scriptRoot 'scripts') $ScriptFile), $Params, $Retries
 }
 
 function Receive-VmScriptJob {
-    param($Job, [int]$TimeoutSec = 1200, [string]$Label)
+    param($Job, [int]$TimeoutSec = 2400, [string]$Label, [string]$VmName)
     $Job | Wait-Job -Timeout $TimeoutSec | Out-Null
     if ($Job.State -ne 'Completed') {
         Write-Warning "$Label did not complete cleanly (state: $($Job.State))"
         Remove-Job $Job -Force -ErrorAction SilentlyContinue
+        # Removing the JOB does not cancel the script running on the VM, and
+        # Azure permits only one Run Command per VM. Moving on now would make
+        # the next call fail with 409, so block until the VM is actually free.
+        if ($VmName) {
+            Write-Host "  making sure $VmName is free before continuing..."
+            Wait-VmRunCommandFree -VmName $VmName | Out-Null
+        }
         return ''
     }
     $r = Receive-Job $Job
@@ -213,8 +268,13 @@ function Receive-VmScriptJob {
 # The client pulls a prebuilt module bundle (Az + AzFilesHybrid + the Graph
 # dependency) as a single zip rather than running Install-Module per module -
 # roughly a minute instead of nine. It needs nothing from AD, so it also runs
-# while the DC promotes. It MUST finish before the client is domain-joined,
-# because that reboots the machine and would kill an in-flight Run Command.
+# while the DC promotes.
+#
+# Note what this parallelism can and cannot be: work overlaps ACROSS the two
+# VMs, never on one of them. Azure runs a single Run Command per VM and rejects
+# a second with HTTP 409, so this install must genuinely finish before the
+# domain join is issued against the same client - and that join reboots the
+# machine, which would kill an in-flight Run Command anyway.
 Step 'Starting client tooling install in the background (overlaps DC promotion)'
 $toolParams = @{}
 if ($ModuleBundleUri) { $toolParams['ModuleBundleUri'] = $ModuleBundleUri }
@@ -261,9 +321,13 @@ $dcPrep = Invoke-VmScript -VmName $dcName -ScriptFile '07-install-tools.ps1' -Re
 
 # ------------------------------- Collect the client tooling job before reboot
 Step 'Waiting for the client tooling install to finish'
-$toolsOut = Receive-VmScriptJob -Job $clientToolsJob -TimeoutSec 1200 -Label 'client tooling'
+$toolsOut = Receive-VmScriptJob -Job $clientToolsJob -TimeoutSec 2400 -Label 'client tooling' -VmName $cliName
 if ($toolsOut -match 'TOOLS_READY') {
     Write-Host '  client tooling: OK'
+} elseif ($toolsOut -match 'Module bundle unavailable') {
+    Write-Warning '  the prebuilt module bundle could not be downloaded, so this fell back'
+    Write-Warning '  to Install-Module (many minutes slower). Publish the bundle before the'
+    Write-Warning '  session: tools\New-LabToolsBundle.ps1, then gh release create.'
 } else {
     $detail = ($toolsOut -split "`n" | Select-String 'TOOLS_PARTIAL|FAILED').Line -join '; '
     Write-Warning "  client tooling incomplete: $detail"
@@ -337,7 +401,7 @@ Invoke-VmScript -VmName $dcName -ScriptFile '05-set-ntfs-perms.ps1' `
 # Everything above ran on the DC or against Azure, so the client's join and
 # reboot happened for free alongside it.
 Step '9/9 Confirming the client domain join'
-$joinOutput = Receive-VmScriptJob -Job $clientJoinJob -TimeoutSec 900 -Label 'client domain join'
+$joinOutput = Receive-VmScriptJob -Job $clientJoinJob -TimeoutSec 1200 -Label 'client domain join' -VmName $cliName
 $joinOutput | Write-Host
 if (-not $joinOutput) {
     Write-Host '  retrying the domain join in the foreground...'
