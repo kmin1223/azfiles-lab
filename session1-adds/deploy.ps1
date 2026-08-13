@@ -61,6 +61,33 @@ function Step([string]$msg) {
     Write-Host "`n[+$elapsed] === $msg ===" -ForegroundColor Cyan
 }
 
+# Echo the main command a step runs, so the deployment doubles as a walkthrough
+# of how you'd do this by hand. Secret VALUES are never shown - remote-script
+# parameters appear as names only.
+function Show-Cmd([string]$Command) {
+    $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  PS> $_" -ForegroundColor DarkCyan }
+}
+
+# What actually runs inside each Run Command payload - the one-line essence.
+$scriptCore = @{
+    '01-promote-dc.ps1'         = "Install-ADDSForest -DomainName $DomainName (then reboot)"
+    '02-create-lab-users.ps1'   = 'New-ADUser labuser1/labuser2; New-ADOrganizationalUnit AzureFilesLab'
+    '03-join-domain-client.ps1' = "Add-Computer -DomainName $DomainName (then reboot); RDP group for Domain Users"
+    '04-domain-join-storage.ps1'= 'New-ADComputer <sa>; setspn cifs/<sa>.file.core.windows.net; Set-ADAccountPassword = kerb1'
+    '06-sync-kerb-password.ps1' = 'Set-ADAccountPassword (AD object) = current kerb1; repadmin /syncall'
+    '05-set-ntfs-perms.ps1'     = 'net use with the storage KEY, then icacls on the share root'
+    '07-install-tools.ps1'      = 'client: module bundle + RSAT | DC: auditpol Kerberos 4768/4769 + operational logs'
+    '08-verify-mount.ps1'       = 'net use \\<sa>.file.core.windows.net\labshare as a domain user; report etype'
+}
+
+function Show-VmCmd([string]$VmName, [string]$ScriptFile, [hashtable]$Params) {
+    $paramNote = if ($Params -and $Params.Count) { " -Parameter @{ $($Params.Keys -join '; ') }" } else { '' }
+    Show-Cmd "Invoke-AzVMRunCommand -VMName $VmName -ScriptPath scripts\$ScriptFile$paramNote"
+    if ($scriptCore[$ScriptFile]) {
+        Write-Host "      inside: $($scriptCore[$ScriptFile])" -ForegroundColor DarkGray
+    }
+}
+
 # ------------------------------------------------------------------ Logging
 # Cloud Shell disconnects after ~20 minutes without interaction, which kills
 # this script mid-run. Everything therefore goes to disk as it happens, and the
@@ -111,6 +138,12 @@ if (-not (Test-Path $templateFile)) {
 }
 Write-Host 'Using ARM template.'
 
+Show-Cmd @"
+New-AzResourceGroup -Name $ResourceGroupName -Location $Location
+New-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName ``
+    -TemplateFile template\azuredeploy.json -prefix $Prefix
+"@
+Write-Host '      inside: VNet(DNS->DC) + NSG + 2 VMs (static 10.100.0.4/.5) + storage account + share' -ForegroundColor DarkGray
 New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Force | Out-Null
 $dep = New-AzResourceGroupDeployment `
     -ResourceGroupName $ResourceGroupName `
@@ -178,6 +211,7 @@ function Wait-VmRunCommandFree {
 
 function Invoke-VmScript {
     param([string]$VmName, [string]$ScriptFile, [hashtable]$Params = @{}, [int]$Retries = 1, [int]$RetryDelaySec = 60)
+    Show-VmCmd -VmName $VmName -ScriptFile $ScriptFile -Params $Params
     $busyWaits = 0
     for ($i = 1; $i -le $Retries; ) {
         try {
@@ -214,6 +248,8 @@ function Invoke-VmScript {
 # the other. Az context autosave means the job picks up the current login.
 function Start-VmScriptJob {
     param([string]$VmName, [string]$ScriptFile, [hashtable]$Params = @{}, [int]$Retries = 4)
+    Show-VmCmd -VmName $VmName -ScriptFile $ScriptFile -Params $Params
+    Write-Host '      (as a background job)' -ForegroundColor DarkGray
     Start-Job -Name "job-$VmName-$ScriptFile" -ScriptBlock {
         param($rg, $vmName, $path, $p, $retries)
         Import-Module Az.Compute -ErrorAction SilentlyContinue
@@ -313,6 +349,10 @@ $clientJoinJob = Start-VmScriptJob -VmName $cliName -ScriptFile '03-join-domain-
 
 # --------------------------------------- 5. Domain-join the storage account
 Step '5/9 Domain-joining the storage account (kerb key + computer account + SPN)'
+Show-Cmd @"
+New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1
+`$kerbKey = (Get-AzStorageAccountKey ... -ListKerbKey | Where-Object KeyName -eq 'kerb1').Value
+"@
 New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
 $kerbKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
     Where-Object KeyName -eq 'kerb1').Value
@@ -333,6 +373,15 @@ $adDomainNameValue = if ($Modern) { $ad.DomainName } else { $ad.NetBiosDomainNam
 if (-not $Modern) {
     Write-Host "Legacy mode: ActiveDirectoryDomainName = '$adDomainNameValue' (NetBIOS, not the DNS root)"
 }
+Show-Cmd @"
+Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName ``
+    -EnableActiveDirectoryDomainServicesForFile `$true ``
+    -ActiveDirectoryDomainName '$adDomainNameValue' ``
+    -ActiveDirectoryNetBiosDomainName '$($ad.NetBiosDomainName)' ``
+    -ActiveDirectorySamAccountName '$($ad.SamAccountName)' -ActiveDirectoryAccountType 'Computer' ``
+    (+ ForestName / DomainGuid / DomainSid / AzureStorageSid - the FULL set, always)
+Set-AzStorageAccount ... -DefaultSharePermission 'StorageFileDataSmbShareContributor'
+"@
 Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
     -EnableActiveDirectoryDomainServicesForFile $true `
     -ActiveDirectoryDomainName $adDomainNameValue `
@@ -352,6 +401,7 @@ Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
 # Rotate kerb1 once more AFTER the SA is fully configured and push it to the
 # AD object. Prevents the propagation race that surfaces as error 1396.
 Step '7/9 Final kerb key sync (1396/AP_ERR_MODIFIED guard)'
+Show-Cmd "New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1   # rotate once more, then push to AD"
 New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
 Start-Sleep -Seconds 15  # let the new key value settle before reading it back
 $kerbKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |

@@ -89,7 +89,18 @@ $dcName = "$Prefix-dc"
 $cliName = "$Prefix-cli"
 $nsgName = "$Prefix-nsg"
 
-function Invoke-OnVm([string]$Vm, [string]$Script) {
+# Every command is echoed BEFORE it runs, so attendees can see exactly what the
+# fault does (and could do it by hand). Secrets are masked in the echo.
+function Show-Cmd([string]$Where, [string]$Command) {
+    Write-Host ''
+    Write-Host "  .-- commands ($Where) " -ForegroundColor DarkCyan
+    $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  | $_" -ForegroundColor Gray }
+    Write-Host "  '--" -ForegroundColor DarkCyan
+}
+
+function Invoke-OnVm([string]$Vm, [string]$Script, [string]$Display) {
+    # $Display: what to SHOW instead of $Script, when the script embeds a secret.
+    Show-Cmd -Where "runs on $Vm" -Command ($(if ($Display) { $Display } else { $Script }))
     $tmp = New-TemporaryFile
     Set-Content -Path $tmp -Value $Script
     try {
@@ -107,25 +118,34 @@ switch ($Fault) {
     'PasswordMismatch' {
         if (-not $Repair) {
             $rand = -join ((33..126) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
-            Invoke-OnVm $dcName @"
+            $s = @"
 Import-Module ActiveDirectory
 `$comp = Get-ADComputer -Identity '$saName'
 Set-ADAccountPassword -Identity `$comp.DistinguishedName -Reset ``
   -NewPassword (ConvertTo-SecureString '$($rand.Replace("'","''"))' -AsPlainText -Force)
 Write-Output 'AD password rotated (out of sync with kerb1)'
-"@ | Write-Host
+"@
+            Invoke-OnVm $dcName -Script $s `
+                -Display ($s -replace [regex]::Escape($rand.Replace("'","''")), '<random-password>') | Write-Host
             Write-Host 'Now on the client: klist purge; net use Z: \\...\labshare  -> error 1396 / AP_ERR_MODIFIED'
         } else {
+            Show-Cmd -Where 'runs here, against Azure' -Command @"
+New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1
+`$kerb = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
+    Where-Object KeyName -eq kerb1).Value
+"@
             New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
             $kerb = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
                 Where-Object KeyName -eq kerb1).Value
-            Invoke-OnVm $dcName @"
+            $s = @"
 Import-Module ActiveDirectory
 `$comp = Get-ADComputer -Identity '$saName'
 Set-ADAccountPassword -Identity `$comp.DistinguishedName -Reset ``
   -NewPassword (ConvertTo-SecureString '$($kerb.Replace("'","''"))' -AsPlainText -Force)
 Write-Output 'kerb1 re-synced to AD password'
-"@ | Write-Host
+"@
+            Invoke-OnVm $dcName -Script $s `
+                -Display ($s -replace [regex]::Escape($kerb.Replace("'","''")), '<kerb1-key>') | Write-Host
         }
     }
 
@@ -165,6 +185,14 @@ Write-Output 'Client encryption types restored to default'
     'Block445' {
         $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Name $nsgName
         if (-not $Repair) {
+            Show-Cmd -Where 'runs here, against Azure' -Command @"
+Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Name $nsgName |
+    Add-AzNetworkSecurityRuleConfig -Name 'Deny-SMB-445' ``
+        -Direction Outbound -Access Deny -Protocol Tcp -Priority 100 ``
+        -SourceAddressPrefix '*' -SourcePortRange '*' ``
+        -DestinationAddressPrefix 'Storage' -DestinationPortRange 445 |
+    Set-AzNetworkSecurityGroup
+"@
             $nsg | Add-AzNetworkSecurityRuleConfig -Name 'Deny-SMB-445' `
                 -Direction Outbound -Access Deny -Protocol Tcp -Priority 100 `
                 -SourceAddressPrefix '*' -SourcePortRange '*' `
@@ -173,6 +201,10 @@ Write-Output 'Client encryption types restored to default'
             Write-Host 'Outbound 445 to Storage blocked. Client: net use -> System error 53/67 (timeout)'
             Write-Host "Diagnose: Test-NetConnection $saName.file.core.windows.net -Port 445"
         } else {
+            Show-Cmd -Where 'runs here, against Azure' -Command @"
+Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Name $nsgName |
+    Remove-AzNetworkSecurityRuleConfig -Name 'Deny-SMB-445' | Set-AzNetworkSecurityGroup
+"@
             $nsg | Remove-AzNetworkSecurityRuleConfig -Name 'Deny-SMB-445' |
                 Set-AzNetworkSecurityGroup | Out-Null
             Write-Host '445 unblocked.'
@@ -181,6 +213,8 @@ Write-Output 'Client encryption types restored to default'
 
     'NoShareAccess' {
         $perm = if ($Repair) { 'StorageFileDataSmbShareContributor' } else { 'None' }
+        Show-Cmd -Where 'runs here, against Azure' -Command `
+            "Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName -DefaultSharePermission '$perm'"
         Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
             -DefaultSharePermission $perm | Out-Null
         Write-Host "DefaultSharePermission = $perm"
@@ -193,6 +227,10 @@ Write-Output 'Client encryption types restored to default'
     'CipherMismatch' {
         if (-not $Repair) {
             # Storage: allow ONLY AES-256-GCM. Client: offer ONLY AES-128-GCM.
+            Show-Cmd -Where 'runs here, against Azure' -Command @"
+Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName ``
+    -StorageAccountName $saName -SmbChannelEncryption 'AES-256-GCM'
+"@
             Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName `
                 -StorageAccountName $saName -SmbChannelEncryption 'AES-256-GCM' | Out-Null
             Write-Host 'Storage account now allows AES-256-GCM only.'
@@ -207,6 +245,10 @@ Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers |
             Write-Host '  client : Get-SmbClientConfiguration | select EncryptionCiphers'
             Write-Host '  storage: Portal > File shares > Security (or Get-AzStorageFileServiceProperty)'
         } else {
+            Show-Cmd -Where 'runs here, against Azure' -Command @"
+Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName ``
+    -StorageAccountName $saName -SmbChannelEncryption 'AES-128-GCM;AES-256-GCM'
+"@
             Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName `
                 -StorageAccountName $saName `
                 -SmbChannelEncryption 'AES-128-GCM;AES-256-GCM' | Out-Null

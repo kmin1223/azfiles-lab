@@ -249,21 +249,32 @@ don't act on it yet.
 
 This flips the AD object to AES-256 only — the change most people would make.
 
-## Step 3 — retest (drop sessions first!)
+## Step 3 — retest (drop the SMB *session* first!)
 
 On the **Client VM**:
 
 ```
 net use * /delete /y
+net use \\<sa>.file.core.windows.net\labshare /delete /y
 klist purge
+Get-SmbConnection
 net use Z: \\<sa>.file.core.windows.net\labshare
 ```
 
 **Expected:** `System error 1396`.
 
-> The `net use * /delete /y` is not optional. An already-mapped share keeps
-> working after a key change, so skipping it produces a false "everything's
-> fine" result.
+> Deleting mappings and purging tickets is **not enough** — neither kills the
+> SMB *session*, and a TreeConnect on a live session performs no new
+> authentication, so the old session keeps working after any key change.
+> `Get-SmbConnection` must show **no entry** for the storage account before you
+> retest.
+>
+> **How to spot it when it bites you:** the mount "succeeds" but `klist` shows
+> **zero tickets**. Success without tickets means no Kerberos exchange happened
+> — you tested the old session, not the new configuration. Sign out/in (or,
+> elevated, `Restart-Service LanmanWorkstation -Force`) and retest. The same
+> trap shows up in real support cases as *"we changed the auth config and
+> nothing happened"*.
 
 ## Step 4 — diagnose from evidence
 

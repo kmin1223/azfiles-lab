@@ -27,9 +27,17 @@
 
 .NOTES
   After any change, on the CLIENT VM you must drop existing SMB sessions before
-  retesting - a mapped share keeps working even after the keys change:
-      net use * /delete /y
+  retesting - an established session keeps working even after the keys change,
+  because TreeConnect on a live session performs no new authentication.
+
+  'net use * /delete' removes drive MAPPINGS and 'klist purge' removes TICKETS;
+  neither kills the SMB SESSION itself. The tell: the mount "succeeds" while
+  klist shows zero tickets - that success came from the old session, not from
+  a new Kerberos exchange. Verify and kill it:
+      Get-SmbConnection | ? ServerName -like '*file.core.windows.net*'
+      net use \\<sa>.file.core.windows.net\labshare /delete /y
       klist purge
+  Still listed? Sign out/in, or (elevated) Restart-Service LanmanWorkstation -Force.
 #>
 [CmdletBinding()]
 param(
@@ -48,7 +56,18 @@ $saName = $sa.StorageAccountName
 $dcName = "$Prefix-dc"
 $adProps = $sa.AzureFilesIdentityBasedAuth.ActiveDirectoryProperties
 
-function Invoke-OnDc([string]$Script) {
+# Every command this lab runs is echoed BEFORE it runs, so you can follow what
+# the script does and reuse the commands yourself. Secrets are masked.
+function Show-Cmd([string]$Where, [string]$Command) {
+    Write-Host ''
+    Write-Host "  .-- commands ($Where) " -ForegroundColor DarkCyan
+    $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  | $_" -ForegroundColor Gray }
+    Write-Host "  '--" -ForegroundColor DarkCyan
+}
+
+function Invoke-OnDc([string]$Script, [string]$Display) {
+    # $Display: what to SHOW instead of $Script, when the script embeds a secret.
+    Show-Cmd -Where "runs on the DC, $dcName" -Command ($(if ($Display) { $Display } else { $Script }))
     $tmp = New-TemporaryFile
     Set-Content -Path $tmp -Value $Script
     try {
@@ -61,6 +80,18 @@ function Invoke-OnDc([string]$Script) {
 # Set-AzStorageAccount silently ignores a partial AD property update - you must
 # pass the whole set every time, or the value you think you changed won't change.
 function Set-AdProperties([string]$DomainNameValue) {
+    Show-Cmd -Where 'runs here, against Azure' -Command @"
+Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName ``
+    -EnableActiveDirectoryDomainServicesForFile `$true ``
+    -ActiveDirectoryDomainName '$DomainNameValue' ``
+    -ActiveDirectoryNetBiosDomainName '$($adProps.NetBiosDomainName)' ``
+    -ActiveDirectoryForestName '$($adProps.ForestName)' ``
+    -ActiveDirectoryDomainGuid '$($adProps.DomainGuid)' ``
+    -ActiveDirectoryDomainSid '$($adProps.DomainSid)' ``
+    -ActiveDirectoryAzureStorageSid '$($adProps.AzureStorageSid)' ``
+    -ActiveDirectorySamAccountName '$($adProps.SamAccountName)' ``
+    -ActiveDirectoryAccountType '$($adProps.AccountType)'
+"@
     Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
         -EnableActiveDirectoryDomainServicesForFile $true `
         -ActiveDirectoryDomainName $DomainNameValue `
@@ -74,11 +105,16 @@ function Set-AdProperties([string]$DomainNameValue) {
 }
 
 function Sync-KerbKeyToAd {
+    Show-Cmd -Where 'runs here, against Azure' -Command @"
+New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1
+`$kerb = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
+    Where-Object KeyName -eq 'kerb1').Value
+"@
     New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
     Start-Sleep -Seconds 15   # let the new key value settle before reading it
     $kerb = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
         Where-Object KeyName -eq 'kerb1').Value
-    Invoke-OnDc @"
+    $dcScript = @"
 Import-Module ActiveDirectory
 `$pdc = (Get-ADDomain).PDCEmulator
 `$comp = Get-ADComputer -Identity '$saName' -Server `$pdc
@@ -86,7 +122,9 @@ Set-ADAccountPassword -Identity `$comp.DistinguishedName -Server `$pdc -Reset ``
   -NewPassword (ConvertTo-SecureString '$($kerb.Replace("'","''"))' -AsPlainText -Force)
 repadmin /syncall `$pdc /AdeP 2>&1 | Out-Null
 Write-Output "AD password re-synced to the new kerb1 key on `$pdc"
-"@ | Write-Host
+"@
+    Invoke-OnDc -Script $dcScript -Display ($dcScript -replace [regex]::Escape($kerb.Replace("'","''")), '<kerb1-key>') |
+        Write-Host
 }
 
 switch ($Step) {
@@ -123,10 +161,17 @@ Write-Output 'AD object now advertises AES256 only'
 "@ | Write-Host
         Write-Host @"
 
-Now retest on the CLIENT VM (drop sessions first - this matters):
+Now retest on the CLIENT VM. Drop the SMB SESSION first - this matters, and
+deleting mappings or purging tickets is NOT enough:
     net use * /delete /y
+    net use \\$saName.file.core.windows.net\labshare /delete /y
     klist purge
+    Get-SmbConnection    <- must show NO entry for $saName before you retest
     net use Z: \\$saName.file.core.windows.net\labshare
+
+If the mount 'succeeds' but klist shows ZERO tickets, you reused the old
+session - no authentication happened at all. Sign out/in (or, elevated,
+Restart-Service LanmanWorkstation -Force) and retest.
 
 Expect: System error 1396. Then prove where it broke:
     klist                         <- an AES-256 ticket IS issued

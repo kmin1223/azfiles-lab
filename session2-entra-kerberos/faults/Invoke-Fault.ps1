@@ -53,7 +53,17 @@ if (-not $sa) { throw "No $Prefix* storage account in $ResourceGroupName" }
 $saName = $sa.StorageAccountName
 $cliName = "$Prefix-cli"
 
+# Every command is echoed BEFORE it runs, so attendees can see exactly what the
+# fault does (and could do it by hand).
+function Show-Cmd([string]$Where, [string]$Command) {
+    Write-Host ''
+    Write-Host "  .-- commands ($Where) " -ForegroundColor DarkCyan
+    $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  | $_" -ForegroundColor Gray }
+    Write-Host "  '--" -ForegroundColor DarkCyan
+}
+
 function Invoke-OnVm([string]$Vm, [string]$Script) {
+    Show-Cmd -Where "runs on $Vm" -Command $Script
     $tmp = New-TemporaryFile
     Set-Content -Path $tmp -Value $Script
     try {
@@ -83,12 +93,24 @@ Write-Output "CloudKerberosTicketRetrievalEnabled = $val"
         $spn = Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $saName.file.core.windows.net'"
         if (-not $spn) { throw 'Storage account service principal not found.' }
         if (-not $Repair) {
+            Show-Cmd -Where 'runs here, against Microsoft Graph' -Command @"
+Get-MgOauth2PermissionGrant -Filter "clientId eq '$($spn.Id)'" |
+    ForEach-Object { Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId `$_.Id }
+"@
             Get-MgOauth2PermissionGrant -Filter "clientId eq '$($spn.Id)'" |
                 ForEach-Object { Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId $_.Id }
             Write-Host 'OAuth2 grants removed. New sessions: TGT issuance for the SA fails.'
             Write-Host 'Diagnose in portal: Entra ID -> Enterprise applications -> [Storage Account]... -> Permissions.'
         } else {
             $graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
+            Show-Cmd -Where 'runs here, against Microsoft Graph' -Command @"
+New-MgOauth2PermissionGrant -BodyParameter @{
+    clientId    = '$($spn.Id)'          # the storage account's service principal
+    consentType = 'AllPrincipals'
+    resourceId  = '$($graphSp.Id)'      # Microsoft Graph
+    scope       = 'openid profile User.Read'
+}
+"@
             New-MgOauth2PermissionGrant -BodyParameter @{
                 clientId    = $spn.Id
                 consentType = 'AllPrincipals'
@@ -119,6 +141,8 @@ Write-Output 'Re-join triggered, rebooting. Registration may take a few minutes.
 
     'NoShareAccess' {
         $perm = if ($Repair) { 'StorageFileDataSmbShareContributor' } else { 'None' }
+        Show-Cmd -Where 'runs here, against Azure' -Command `
+            "Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName -DefaultSharePermission '$perm'"
         Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
             -DefaultSharePermission $perm | Out-Null
         Write-Host "DefaultSharePermission = $perm"
