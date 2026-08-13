@@ -10,8 +10,8 @@
     4. Domain-join the client VM
     5. Domain-join the STORAGE ACCOUNT (computer account + SPN + kerb1 key)
     6. Enable AD DS auth on the storage account (Set-AzStorageAccount)
-    7. Final kerb key rotation + AD password sync (1396 guard)
-    8. Default share-level permission + NTFS ACLs
+    7. Final kerb key rotation + AD password sync (1396 guard) + NTFS ACLs
+       (one Run Command - each round-trip costs ~60s fixed overhead)
     9. Verify the client actually mounts the share
 
   Timing design:
@@ -71,10 +71,10 @@ function Show-Cmd([string]$Command) {
 # What actually runs inside each Run Command payload - the one-line essence.
 $scriptCore = @{
     '01-promote-dc.ps1'         = "Install-ADDSForest -DomainName $DomainName (then reboot)"
-    '02-create-lab-users.ps1'   = 'New-ADUser labuser1/labuser2; New-ADOrganizationalUnit AzureFilesLab'
+    '02-create-lab-users.ps1'   = 'New-ADUser labuser1/labuser2; OU AzureFilesLab; auditpol Kerberos 4768/4769'
     '03-join-domain-client.ps1' = "Add-Computer -DomainName $DomainName (then reboot); RDP group for Domain Users"
     '04-domain-join-storage.ps1'= 'New-ADComputer <sa>; setspn cifs/<sa>.file.core.windows.net; Set-ADAccountPassword = kerb1'
-    '06-sync-kerb-password.ps1' = 'Set-ADAccountPassword (AD object) = current kerb1; repadmin /syncall'
+    '06-sync-kerb-password.ps1' = 'Set-ADAccountPassword (AD object) = current kerb1; then net use with the storage KEY + icacls'
     '05-set-ntfs-perms.ps1'     = 'net use with the storage KEY, then icacls on the share root'
     '07-install-tools.ps1'      = 'client: module bundle + RSAT | DC: auditpol Kerberos 4768/4769 + operational logs'
     '08-verify-mount.ps1'       = 'net use \\<sa>.file.core.windows.net\labshare as a domain user; report etype'
@@ -286,6 +286,14 @@ function Receive-VmScriptJob {
     $Job | Wait-Job -Timeout $TimeoutSec | Out-Null
     if ($Job.State -ne 'Completed') {
         Write-Warning "$Label did not complete cleanly (state: $($Job.State))"
+        # Surface WHY, so a recurring failure is diagnosable from the transcript.
+        $reason = $Job.ChildJobs[0].JobStateInfo.Reason.Message
+        if (-not $reason) {
+            $reason = (Receive-Job $Job -ErrorAction SilentlyContinue 2>&1 |
+                Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                Select-Object -First 1).Exception.Message
+        }
+        if ($reason) { Write-Warning "  reason: $($reason.Split("`n")[0])" }
         Remove-Job $Job -Force -ErrorAction SilentlyContinue
         # Removing the JOB does not cancel the script running on the VM, and
         # Azure permits only one Run Command per VM. Moving on now would make
@@ -330,15 +338,12 @@ if ($promoteOut -notmatch 'ALREADY_PROMOTED') {
 }
 
 # ----------------------------------------------------------- 3. Lab users
-Step '3/9 Creating lab users (retries until AD is up)'
+# The script also enables Kerberos auditing (4768/4769 incl. failures) and the
+# operational logs - folded in rather than a separate call, because each Run
+# Command round-trip costs ~60s regardless of what it does.
+Step '3/9 Creating lab users + DC Kerberos auditing (retries until AD is up)'
 Invoke-VmScript -VmName $dcName -ScriptFile '02-create-lab-users.ps1' `
     -Params @{ Password = $plainPw } -Retries 8 -RetryDelaySec 60 | Write-Host
-
-# DC-side prep is small now (Kerberos auditing + operational logs, no Azure
-# tooling by design) and has to run after promotion, so it goes here.
-Step 'Enabling Kerberos auditing on the DC (events 4768/4769)'
-$dcPrep = Invoke-VmScript -VmName $dcName -ScriptFile '07-install-tools.ps1' -Retries 2 -RetryDelaySec 30
-($dcPrep -split "`n" | Where-Object { $_ -match 'TOOLS_|auditing|logs enabled' }) | Write-Host
 
 # ----------------------------------------------------- 4. Join client VM
 # Started as a job: the client reboot (~3 min) overlaps the storage-account
@@ -400,21 +405,17 @@ Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
 # -------------------------------------------- 7. Final kerb key sync
 # Rotate kerb1 once more AFTER the SA is fully configured and push it to the
 # AD object. Prevents the propagation race that surfaces as error 1396.
-Step '7/9 Final kerb key sync (1396/AP_ERR_MODIFIED guard)'
+# Steps 7+8 ride the same Run Command: both run on the DC back to back, and
+# each separate invocation would cost ~60s of fixed overhead.
+Step '7-8/9 Final kerb key sync (1396 guard) + NTFS permissions'
 Show-Cmd "New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1   # rotate once more, then push to AD"
 New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1 | Out-Null
 Start-Sleep -Seconds 15  # let the new key value settle before reading it back
 $kerbKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
     Where-Object KeyName -eq 'kerb1').Value
-Invoke-VmScript -VmName $dcName -ScriptFile '06-sync-kerb-password.ps1' `
-    -Params @{ StorageAccountName = $saName; KerbKey = $kerbKey } `
-    -Retries 3 -RetryDelaySec 30 | Write-Host
-
-# ------------------------------------------------------------ 8. NTFS ACLs
-Step '8/9 Setting NTFS permissions on the share'
 $key1 = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName)[0].Value
-Invoke-VmScript -VmName $dcName -ScriptFile '05-set-ntfs-perms.ps1' `
-    -Params @{ StorageAccountName = $saName; StorageKey = $key1; NetBios = $ad.NetBiosDomainName } `
+Invoke-VmScript -VmName $dcName -ScriptFile '06-sync-kerb-password.ps1' `
+    -Params @{ StorageAccountName = $saName; KerbKey = $kerbKey; StorageKey = $key1; NetBios = $ad.NetBiosDomainName } `
     -Retries 3 -RetryDelaySec 30 | Write-Host
 
 # ------------------------------- 9. Collect the background client domain join

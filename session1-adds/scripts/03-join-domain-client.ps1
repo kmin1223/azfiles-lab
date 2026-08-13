@@ -32,4 +32,8 @@ $cred = New-Object System.Management.Automation.PSCredential("$netbios\$JoinUser
 Add-Computer -DomainName $DomainName -Credential $cred -Force
 Grant-RdpToDomainUsers
 Write-Output 'JOINED_REBOOTING'
-shutdown /r /t 10 /f
+# 60s, not 10: the Run Command extension needs time to report this script's
+# output back to Azure. Rebooting too soon leaves the operation looking failed
+# even though the join succeeded, which forces a pointless retry. The reboot
+# overlaps other deployment work anyway, so the extra 50s costs nothing.
+shutdown /r /t 60 /f
