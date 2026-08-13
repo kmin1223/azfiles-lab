@@ -28,8 +28,6 @@ instead leave the environment running.
 azfiles-lab/
 ├── README.md                        <- you are here
 ├── cleanup.ps1                      <- full teardown (both sessions)
-├── session1-adds-deck.pptx          <- Session 1 slides
-├── session2-entra-kerberos-deck.pptx<- Session 2 slides
 ├── docs/
 │   ├── facilitator-guide.docx              <- presenter: run-of-show, timings, issue catalog
 │   ├── cuesheet-session1.docx              <- presenter: slide-by-slide Korean cue sheet (Session 1)

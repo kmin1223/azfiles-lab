@@ -39,14 +39,22 @@
                     Symptom : Access denied / "username or password is
                               incorrect" - pointing straight at credentials,
                               while Kerberos is perfectly healthy
-                    Diagnose: Get-SmbClientConfiguration vs the account's SMB
-                              security settings; on the wire, Negotiate succeeds
-                              then the session/tree connect is refused
+                    Diagnose: Get-SmbClientConfiguration | select EncryptionCiphers
+                              (the client tries them IN THAT ORDER) vs the
+                              account's Portal > File shares > Security list;
+                              on the wire, Negotiate succeeds then the
+                              SessionSetup is refused
                     Teach   : this is a REAL Sev case that cost days - the
                               error text blames the identity, the cause is
                               cipher negotiation
-                    Repair  : re-allow AES-128-GCM on the account and restore
-                              the client cipher order
+                    Repair  : fix the CLIENT - reorder its ciphers so an
+                              account-allowed one (AES_256_GCM) comes first.
+                              The account's hardened setting stays as the
+                              customer's security team intended. Keep the
+                              other ciphers in the list for compatibility
+                              (storage-account-KEY mounts need AES-128-CCM).
+                              Weakening the account instead is the fallback
+                              for fleets whose clients can't be changed.
 
   --- advanced (evidence required - the error text alone won't tell you) ---
 
@@ -245,18 +253,21 @@ Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers |
             Write-Host '  client : Get-SmbClientConfiguration | select EncryptionCiphers'
             Write-Host '  storage: Portal > File shares > Security (or Get-AzStorageFileServiceProperty)'
         } else {
-            Show-Cmd -Where 'runs here, against Azure' -Command @"
-Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName ``
-    -StorageAccountName $saName -SmbChannelEncryption 'AES-128-GCM;AES-256-GCM'
-"@
-            Update-AzStorageFileServiceProperty -ResourceGroupName $ResourceGroupName `
-                -StorageAccountName $saName `
-                -SmbChannelEncryption 'AES-128-GCM;AES-256-GCM' | Out-Null
+            # THE FIX IS ON THE CLIENT. The account's AES-256-GCM-only setting
+            # is a deliberate security posture - a support engineer's first
+            # move is to make the client lead with a cipher the account allows,
+            # not to weaken the account. Keep the remaining ciphers for
+            # compatibility: mounting with the storage account KEY needs
+            # AES-128-CCM. (Account-side re-enable is the fallback when the
+            # client fleet can't be changed.)
             Invoke-OnVm $cliName @'
-Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_128_GCM,AES_128_CCM" -Confirm:$false
-Write-Output 'client cipher order restored'
+Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_256_CCM,AES_128_GCM,AES_128_CCM" -Confirm:$false
+Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers |
+    ForEach-Object { Write-Output "client ciphers now: $_" }
 '@ | Write-Host
-            Write-Host 'Both sides can agree on a cipher again.'
+            Write-Host 'Client now leads with AES_256_GCM - the account keeps its hardened setting.'
+            Write-Host '(Fallback for unchangeable clients: re-allow the cipher on the account with'
+            Write-Host " Update-AzStorageFileServiceProperty -SmbChannelEncryption 'AES-128-GCM;AES-256-GCM')"
         }
     }
 

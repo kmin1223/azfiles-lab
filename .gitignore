@@ -7,6 +7,10 @@ source-wikis/
 docs/_archive-old/
 *_flowqa*.png
 
+# Presentation decks are presenter material, not lab material - attendees only
+# need the deploy/lab scripts and workbooks. Decks are distributed separately.
+*.pptx
+
 # The module bundle ships as a GitHub RELEASE ASSET, not in the repo -
 # 64 MB in git history would bloat every clone. Built by tools/New-LabToolsBundle.ps1.
 labtools-modules.zip

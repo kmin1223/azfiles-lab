@@ -1,35 +1,69 @@
 ---
 title: "Participant Workbook — Session 2"
-subtitle: "Azure Files with Microsoft Entra Kerberos for Hybrid Identities (hands-on)"
+subtitle: "Azure Files with Microsoft Entra Kerberos — evidence-based diagnosis (hands-on)"
 ---
 
 # About this lab
 
-This session builds on the Session 1 environment, switching it to **Microsoft
-Entra Kerberos** — where Entra ID issues the Kerberos tickets and clients need
-no line of sight to a domain controller. You'll enable it, confirm a healthy
-mount, then break and fix the common Entra Kerberos issues.
+Session 1 authenticated against an on-prem AD DS domain controller. Session 2
+switches the same storage account to **Microsoft Entra Kerberos**: Entra ID
+becomes the KDC, tickets are fetched over an **HTTPS KDC Proxy**, and the client
+needs no line of sight to a domain controller at all.
 
-This is **Session 2 of 2**. Since you tore down Session 1, you must **redeploy it
-first** (Lab 0) — do this *before* the session starts.
+The goal this time is not "click through the setup." It is to **build the
+evidence chain a support engineer actually walks** — from device state, to the
+cloud TGT, to the service ticket, to the KDC Proxy exchange on the wire — and
+then to break individual links and read which piece of evidence moved. By the
+end you should be able to take a raw `klist` / `dsregcmd` / Fiddler capture and
+say where the failure is, not just that there is one.
+
+This is **Session 2 of 2**. Because you tore Session 1 down, **redeploy it first**
+(Lab 0), before the session.
 
 **Machines** (same as Session 1): **DC VM** `azflab-dc` (`labadmin`),
 **Client VM** `azflab-cli` (`CONTOSO\labuser1`). Replace `<sa>` with your storage
 account name from the redeploy output.
 
-**Handy to keep open:** `diagnostic-flowchart.pdf` — its right-hand lane is this
-session's diagnosis path.
+---
+
+# The access flow (memorise this — every lab maps to one arrow)
+
+```
+ SCP in AD ──▶ device Entra hybrid-joined ──▶ PRT at logon ──▶ cloud TGT
+   (setup)        (dsregcmd: AzureAdJoined)      (SSO State)    (krbtgt @
+                                                                 MICROSOFTONLINE)
+        │                                                              │
+        │                                                              ▼
+        │                                             service ticket (cifs/<sa>)
+        │                                             fetched via KDC Proxy over
+        │                                             HTTPS: login.microsoftonline.com
+        ▼                                                              │
+ hybrid identity                                                       ▼
+ (AD user synced to Entra) ─────────────────────────────────▶  SMB mount
+                                                          then: share RBAC → NTFS ACL
+```
+
+Each fault in this workbook cuts exactly one arrow. Your job is to find which.
 
 ---
 
-# Quick background
+# The evidence chain (your standard sweep)
 
-Entra Kerberos adds a cloud ticket path on top of Session 1's setup. The chain:
-an **SCP** in AD tells the device which tenant to join → the device becomes
-**Entra hybrid joined** → at logon it gets a **PRT** → Windows uses it to fetch a
-**cloud TGT** from Entra → that gets a **service ticket** for the share. The user
-must be a **hybrid identity** (an AD user synced to Entra). Break any link and
-the mount fails.
+Run these on the Client VM, signed in as the lab user, top to bottom. In a
+healthy state every line has a known-good signature — learn those first (Lab A),
+because diagnosis is just spotting which one changed.
+
+| # | Command | What it proves | Healthy signature |
+|---|---|---|---|
+| 1 | `dsregcmd /status` | device is Entra joined + has a PRT | `AzureAdJoined : YES`, `AzureAdPrt : YES` |
+| 2 | `klist cloud_debug` | cloud TGT retrieval is **effectively** on | `Cloud Kerberos ... enabled by policy: true` |
+| 3 | `klist get krbtgt` | a cloud TGT was issued | `krbtgt/KERBEROS.MICROSOFTONLINE.COM`, `Kdc Called: TicketSuppliedAtLogon` |
+| 4 | `klist get cifs/<sa>.file.core.windows.net` | a service ticket was issued | `cifs/<sa>...`, AES-256, `Kdc Called: KdcProxy:login.microsoftonline.com` |
+| 5 | Fiddler + Kerberos.NET | the KDC Proxy request/response itself | request to `login.microsoftonline.com`, response `ErrorCode` = 0 |
+| 6 | `net use Z: \\<sa>...\labshare` | authorization (share RBAC → NTFS) | `command completed successfully` |
+
+The single most useful habit: **where does the chain first break?** A missing
+step 4 with a healthy step 3 is a different problem from a missing step 3.
 
 ---
 
@@ -40,206 +74,307 @@ Beyond your Session 1 subscription:
 - **Global Administrator** on a dev/trial Entra tenant (not corporate prod).
   Least-privilege alternative: **Hybrid Identity Administrator** (Cloud Sync) +
   **Cloud Application Administrator** (admin consent).
-- Where you run the commands:
-  - **Azure Cloud Shell (easiest):** Az and Microsoft.Graph are already
-    installed — nothing to add.
-  - **Local PowerShell 7+:** `Install-Module Az, Microsoft.Graph -Scope CurrentUser`
-    (or just the two used here:
-    `Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Applications`).
-- An **RDP client** on your Azure VPN — still required for the in-VM steps.
+- Where you run the Azure/Graph commands:
+  - **Azure Cloud Shell (easiest):** Az and Microsoft.Graph preinstalled.
+  - **Local PowerShell 7+:** `Install-Module Az, Microsoft.Graph -Scope CurrentUser`.
+- An **RDP client** on your Azure VPN for the in-VM steps.
 - **No restrictive App Management Policy in the tenant.** Enabling Entra Kerberos
-  adds a symmetric key to an auto-created app; a tenant policy that blocks
-  password-credential addition (common in corporate/hardened tenants) will fail
-  it with `AadCredentialDisallowedByAppManagementPolicy`. This is the main reason
-  the lab wants a **dev/trial tenant, not corporate**. If you must use such a
-  tenant, a Global Admin can grant an exception for the **Storage Resource
-  Provider** (app ID `a6aa9161-5291-40bb-8c5c-923b567bee3b`) at
-  <https://aka.ms/app-mgmt-policy-ux>.
+  adds a symmetric key to an auto-created app; a tenant policy blocking
+  password-credential addition fails it with
+  `AadCredentialDisallowedByAppManagementPolicy`. This is the main reason the lab
+  wants a **dev/trial tenant**. A Global Admin can grant an exception for the
+  **Storage Resource Provider** (app ID `a6aa9161-5291-40bb-8c5c-923b567bee3b`)
+  at <https://aka.ms/app-mgmt-policy-ux>.
 
-> **Cloud Shell note:** clone the kit
-> (`git clone https://github.com/kmin1223/azfiles-lab.git`), use forward-slash
-> paths (`./deploy.ps1`, `./setup.ps1`), and skip the Windows-only
-> `Unblock-File` / `Set-ExecutionPolicy` lines.
+> **Scope note — cloud-only identities.** This lab uses **hybrid** identities
+> (AD users synced to Entra), the GA path. Entra Kerberos *also* supports
+> **cloud-only (Entra-only)** identities in **preview** — a separate enablement
+> path with no AD DS at all. Out of scope here, but know it exists: a customer
+> with no on-prem AD is not automatically unsupported. (Azure blog: "Azure Files
+> Entra-Only identities.")
 
 ---
 
 # Lab 0 · Redeploy Session 1 (do this BEFORE the session)
 
 ```powershell
-Get-ChildItem -Path .\ -Recurse | Unblock-File
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+git clone https://github.com/kmin1223/azfiles-lab.git   # if you don't have it
+cd azfiles-lab/session1-adds
 Connect-AzAccount
-cd session1-adds
-.\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
+./deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 ```
 
 **Expected:** the green **DEPLOYMENT COMPLETE** box. Note the new storage account
-name and IPs (they differ from last time). Optionally re-run Session 1's healthy
-mount to confirm AD DS still works.
+name and IPs.
 
 ---
 
-# Lab 1 · Enable Entra Kerberos
+# Lab 1 · Enable Entra Kerberos + sync a hybrid identity
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-Connect-AzAccount
-cd session2-entra-kerberos
-.\setup.ps1 -ResourceGroupName azfiles-lab
+cd ../session2-entra-kerberos
+./setup.ps1 -ResourceGroupName azfiles-lab
 ```
 
-**Expected:** the script flips the storage account to Entra Kerberos (AADKERB),
-grants admin consent to its app, writes the hybrid-join SCP, configures the
-client for cloud tickets, and reboots the client. It ends by printing the
-remaining manual step.
+`setup.ps1` disables the Session 1 AD DS auth (a storage account has **one**
+identity source at a time), enables Entra Kerberos (AADKERB), grants admin
+consent to the storage account's app, writes the hybrid-join SCP, installs
+Fiddler + the Kerberos.NET extension on the client, and reboots it.
 
-**Why:** a storage account can use only **one** identity source at a time, so
-the script first **disables the Session 1 AD DS auth**, then enables Entra
-Kerberos on the same account. Everything else from Session 1 is reused as-is —
-the DC, the domain-joined client, and the `labuser1` account (which Cloud Sync
-turns into a hybrid identity in the next step).
+Then the **one interactive step** (~10 min, Global Admin) — follow
+**MANUAL-STEP-cloud-sync.md**: install the Entra provisioning agent on the DC,
+create a Cloud Sync config scoped to `OU=AzureFilesLab`, and wait until
+`labuser1` shows **On-premises sync enabled = Yes**.
 
----
-
-# Lab 2 · Sync a hybrid identity (Entra Cloud Sync)
-
-Entra Kerberos needs hybrid identities. This is the one interactive step
-(~10 min, Global Admin). Follow **MANUAL-STEP-cloud-sync.md**:
-
-1. On the DC, install the Entra provisioning agent from the Entra portal (Cloud
-   sync blade), signing in as Global Admin.
-2. Create a Cloud Sync configuration for `contoso.local`, scoped to
-   `OU=AzureFilesLab`, with password hash sync enabled.
-3. Wait until `labuser1` shows **On-premises sync enabled = Yes** in the Entra
-   portal (use *Provision on demand* to speed it up).
-
-**Expected:** `labuser1` appears as a synced user in Entra ID.
-
-**Why:** a cloud-only user can't get a cloud Kerberos ticket on this WS2022
-client — the identity has to exist in both AD and Entra.
+**Why the sync matters:** Entra Kerberos issues a ticket only to an identity that
+exists in Entra. `labuser1` lives in AD; Cloud Sync gives it an Entra twin. This
+is the arrow labelled *hybrid identity* in the flow.
 
 ---
 
-# Lab 3 · Confirm a healthy cloud mount
+# Lab A · Build the known-good evidence chain (the baseline)
 
-On the Client VM, sign in fresh as `CONTOSO\labuser1`:
+Sign in fresh on the Client VM as `CONTOSO\labuser1`, then walk the whole chain
+and **record each healthy signature** — this is your reference for every fault
+that follows. Spend real time here; the diagnosis labs are just deltas from it.
 
 ```
 dsregcmd /status
+klist purge
 klist cloud_debug
-net use Y: \\<sa>.file.core.windows.net\labshare
+klist get krbtgt
+klist get cifs/<sa>.file.core.windows.net
+net use Z: \\<sa>.file.core.windows.net\labshare
 klist
 ```
 
-**Expected:** `dsregcmd /status` shows **AzureAdJoined : YES**. `klist` shows
-tickets in **two realms** — `CONTOSO.LOCAL` and `KERBEROS.MICROSOFTONLINE.COM`.
-The share mounts with no DC line of sight.
+Confirm each against the table above. Two details worth pointing out on screen:
 
-**Why:** the second realm is the cloud TGT from Entra — that's the whole
-difference from Session 1. Screenshot this as your "known good."
+- the cloud TGT (`krbtgt/KERBEROS.MICROSOFTONLINE.COM`) shows
+  `Kdc Called: TicketSuppliedAtLogon` and etype `Unknown (-1)` — it was handed to
+  you at logon via the PRT, not fetched on demand.
+- the service ticket shows `Kdc Called: KdcProxy:login.microsoftonline.com` —
+  proof the KDC was reached over HTTPS, not port 88.
+
+**Now see the KDC Proxy exchange itself.** Wireshark/netsh only show encrypted
+TCP here — the whole point of KDC Proxy. Use Fiddler:
+
+1. Run **Fiddler** (elevated). Tools → Options → **Decrypt HTTPS traffic** and
+   **Ignore server certificate errors**; accept the cert prompts; restart if this
+   is the first run.
+2. `klist purge`, then `klist get cifs/<sa>.file.core.windows.net`.
+3. Find the request to **login.microsoftonline.com**; open the **Kerberos** tab
+   to read the request/response. In a healthy run the response `ErrorCode` is 0.
+
+Screenshot the healthy Fiddler response — you'll compare the capstone's failing
+one against it.
 
 ---
 
-# Lab 4 · Fix a missing cloud TGT (error 1327)
+# Lab B · A registry value that reads healthy but isn't (policy precedence)
+
+The most instructive Entra Kerberos trap: the setting *looks* correct in the
+obvious place, yet the effective value is off.
 
 **Break it:**
 
 ```powershell
 cd session2-entra-kerberos
-.\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
 ```
 
-**Reproduce** (Client VM) — sign out and back in first (the policy applies at
-logon), then:
+**Reproduce** — sign out and back in (the policy applies at logon), then run the
+chain from step 2.
+
+**Diagnose — and notice the contradiction:**
 
 ```
-klist cloud_debug
-net use Y: \\<sa>.file.core.windows.net\labshare
-```
-
-**Expected:** no cloud TGT present; mount fails (often `System error 1327`).
-
-**Diagnose:**
-
-```
+# 1) The "obvious" location looks fine:
 reg query "HKLM\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters" /v CloudKerberosTicketRetrievalEnabled
-dsregcmd /status
-```
+    ...CloudKerberosTicketRetrievalEnabled    REG_DWORD    0x1     <- says enabled!
 
-The device is still joined, but the registry value is off, so Windows never
-requests a cloud TGT.
-
-**Fix:** `-Fault NoCloudTgt -Repair`, then sign out and back in.
-
-**Why:** this registry/GPO value is required and is off by default — a classic
-"works on the pilot VM, fails at scale" cause when a policy misses some devices.
-
----
-
-# Lab 5 · Fix revoked admin consent
-
-**Break it:**
-
-```powershell
-.\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault ConsentRevoked
-```
-
-**Reproduce** (Client VM): `klist purge`, then mount — it fails.
-
-**Diagnose:** in the portal, **Entra ID → Enterprise applications → [Storage
-Account] `<sa>`.file.core.windows.net → Permissions** — the grant is gone.
-
-**Fix:** `-Fault ConsentRevoked -Repair`, then remount.
-
-**Why:** enabling Entra Kerberos creates an app for the storage account that
-needs consented `openid` / `profile` / `User.Read`. Removing it (e.g. a security
-"unused app" cleanup) stops ticket issuance.
-
----
-
-# Lab 6 · Fix a device that left Entra
-
-**Break it:**
-
-```powershell
-.\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NotHybridJoined
-```
-
-**Reproduce** (Client VM):
-
-```
-dsregcmd /status
+# 2) But the EFFECTIVE value disagrees:
 klist cloud_debug
+    Cloud Kerberos ticket retrieval enabled by policy: false        <- reality
+
+# 3) Find who wins:
+reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters" /v CloudKerberosTicketRetrievalEnabled
+    ...CloudKerberosTicketRetrievalEnabled    REG_DWORD    0x0     <- the policy path
 ```
 
-**Expected:** `AzureAdJoined : NO` → no PRT → no cloud TGT → mount fails.
+**The rule:** Windows reads the **Policies** path (what an **Intune CSP** writes)
+**first**, and only falls back to the **LSA** path if it's unset. So on an
+Intune-managed device a local `reg add` to the LSA path "does nothing" — the
+policy silently wins. `klist cloud_debug` is the arbiter: it reports the
+*effective* value, so trust it over any single registry read.
 
-**Fix:** `-Fault NotHybridJoined -Repair` (re-joins and reboots; registration
-takes a few minutes — confirm in **Entra → Devices**), then remount.
+**Fix:** `-Fault NoCloudTgt -Repair`, then sign out/in and re-walk the chain.
 
-**Why:** every downstream step depends on the device being joined, so this one
-break takes out the whole chain.
-
-> **Note (discussion, not a lab):** if a Conditional Access policy requires MFA
-> on the storage app, SMB can't satisfy it and mounts fail with a generic access
-> denial. The fix is to exclude the `[Storage Account]` app from that policy —
-> never disable MFA tenant-wide. You'd spot it in the Entra sign-in logs.
+**Field takeaway:** "the registry is set correctly but it still fails" almost
+always means a higher-precedence policy source. Check `klist cloud_debug` and
+both paths before touching anything.
 
 ---
 
-# Tracing tip
+# Lab C · When the diagnostic tool causes the outage (KDC Proxy path)
 
-For AD DS you'd use netsh/Wireshark, but Entra Kerberos rides over HTTPS ("KDC
-Proxy"), so those only show encrypted TCP. To read the ticket exchange, use
-**Fiddler + the Kerberos.NET extension** (enable Decrypt HTTPS, reboot, run
-`klist get cifs/<sa>…`).
+Entra Kerberos rides over HTTPS, which means the machine's **proxy stack is now
+part of the authentication path** — something that never mattered with AD DS
+Kerberos on port 88. Fiddler is notorious for leaving a proxy pointed at
+`127.0.0.1:8888` when it exits uncleanly. This lab reproduces that residue.
+
+**Break it:**
+
+```powershell
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault ProxyMangled
+```
+
+**Reproduce** (Client VM, as the lab user):
+
+```
+klist purge
+klist get cifs/<sa>.file.core.windows.net
+    Error calling API LsaCallAuthenticationPackage (GetTicket substatus): 0x51f
+    klist failed with 0xc000005e/-1073741730
+```
+
+**Diagnose — 30 seconds:**
+
+```
+netsh winhttp show proxy
+    Proxy Server(s) :  127.0.0.1:8888        <- nothing is listening there
+```
+
+**The tell that isolates it:** *only the cloud path breaks.* An AD DS mount (port
+88/445) from the same machine would still work — because it doesn't traverse the
+HTTP proxy. So "Windows auth to on-prem works, Entra Kerberos to Azure Files
+fails, on one machine" points straight at the proxy stack.
+
+**Fix:** `-Fault ProxyMangled -Repair` (runs `netsh winhttp reset proxy`, resets
+autoproxy, and clears the `iphlpsvc\ProxyMgr` `:8888` leftovers per the Fiddler
+TSG), then `klist purge` and retry.
+
+---
+
+# Lab D · Three doors that all say "Access denied" (explicit authorization)
+
+Session 1 used `DefaultSharePermission` so *everyone* who authenticated got
+Contributor. Now that `labuser1` is a real synced Entra identity, we can do
+authorization properly — and see how three different layers produce the *same*
+error text.
+
+**Set the baseline — remove the blanket permission, grant the user explicitly:**
+
+```powershell
+# Remove the "everyone" default so the layers below actually gate access
+Set-AzStorageAccount -ResourceGroupName azfiles-lab -Name <sa> -DefaultSharePermission None
+
+# Grant labuser1 (its Entra object) the share-level RBAC role
+$uid = (Get-MgUser -Filter "startsWith(userPrincipalName,'labuser1')").Id
+New-AzRoleAssignment -ObjectId $uid `
+  -RoleDefinitionName "Storage File Data SMB Share Contributor" `
+  -Scope (Get-AzStorageAccount -ResourceGroupName azfiles-lab -Name <sa>).Id
+```
+
+Remount as `labuser1`. It should now work **through an explicit assignment**, not
+the default — and this is the moment `Debug-AzStorageAccountAuth`'s
+`CheckSidHasAadUser` / `CheckUserRbacAssignment` finally **pass** (they were
+*expected* failures in Session 1 by design). Run Debug now and see them flip to
+Passed — that contrast is the point.
+
+**Now walk the three doors.** Each of these produces "Access is denied," and only
+evidence tells them apart:
+
+| Break | How | Distinguishing evidence |
+|---|---|---|
+| **Storage firewall / network** | portal: Networking → *Enabled from selected networks*, don't add the client | `net use` times out or `System error 53/67`; `Test-NetConnection <sa>.file.core.windows.net -Port 445` fails |
+| **Share-level RBAC** | remove the role assignment above | mount fails immediately; `Debug-AzStorageAccountAuth` → `CheckUserRbacAssignment` FAILED; Kerberos tickets are all healthy |
+| **NTFS ACL** | (on a mounted share) `icacls` deny for the user on a subfolder | mount and share access **succeed**; only the file/folder open is denied — deepest layer |
+
+**Diagnostic order that saves time:** network (can I even reach 445?) → share
+RBAC (am I allowed onto the share?) → NTFS (am I allowed this file?). The error
+text is identical; the layer that's actually blocking is not. Effective access is
+always the **most restrictive** of the three.
+
+Restore afterwards: re-add the RBAC role (or set `DefaultSharePermission` back),
+re-open the firewall, clear the NTFS deny.
+
+---
+
+# Capstone · Root-cause a failure from evidence only
+
+Minimal information, TSG method. Have a partner (or the facilitator) inject
+**one** fault without telling you which:
+
+```powershell
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault ConsentRevoked
+```
+
+You get only: *"labuser1 can't mount the share; it worked an hour ago."* Find the
+cause using the evidence chain, ending in a **Fiddler capture**:
+
+1. Walk steps 1–4. Where does the chain first break? (Here: step 4 fails while
+   1–3 are healthy — the device, PRT and cloud TGT are all fine, so it's **not**
+   a client/device problem.)
+2. Capture step 4 in **Fiddler**. Open the failing request to
+   `login.microsoftonline.com` → **Kerberos** tab → **response**. Read the
+   **ErrorCode**, and note the **Entra Request ID + timestamp** in the response —
+   that's what you'd hand to the Entra ID team to pull the server-side trace.
+3. Confirm your hypothesis in the portal: **Entra ID → Enterprise applications →
+   [Storage Account] `<sa>`… → Permissions** — the grant is gone.
+
+**Fix:** `-Fault ConsentRevoked -Repair`, remount, re-capture — ErrorCode back to
+0.
+
+**Why this is the capstone:** it forces the full method — chain first to localise
+(client vs service), Fiddler to read the actual KDC Proxy error, portal to
+confirm, and the Request ID to hand off. That's the Entra Kerberos support loop
+end to end.
+
+> **Discussion (not scripted): MFA Conditional Access → error 1327/86.** If a CA
+> policy requires MFA on the storage account's app, SMB can't perform an
+> interactive MFA, and `net use` returns **System error 1327** ("Account
+> restrictions are preventing this user from signing in") — or 86. The fix is to
+> **exclude the `[Storage Account] <sa>.file.core.windows.net` app** from that CA
+> policy, never to weaken MFA tenant-wide. You'd confirm it in the Entra sign-in
+> logs (look for the storage app + a blocked MFA requirement). This is documented
+> publicly in *storage-files-identity-auth-hybrid-identities-enable*.
+
+---
+
+# Deeper faults kept for reference
+
+Still available via `Invoke-Fault.ps1`, for self-study or a longer session:
+
+- **NotHybridJoined** — `dsregcmd /leave`; `AzureAdJoined : NO` → no PRT → no
+  cloud TGT. Cuts the earliest arrow in the flow, so the whole chain drops.
+- **NoShareAccess** — `DefaultSharePermission None` with no explicit grant; the
+  simplest of the three "Access denied" doors.
+
+---
+
+# Advanced tracing reference
+
+For the rare escalation, the hybrid-flow TSG's Kerberos ETW capture (survives a
+disconnect; run for a few minutes around ticket expiry, ~1 hour after issue):
+
+```
+logman start auth_kerberos -ow -o kerberos.etl -nb 16 16 -bs 1024 -max 8192 -ets
+logman update trace auth_kerberos -p "{6B510852-3583-4e2d-AFFE-A67F9F223438}" 0x7ffffff 0xff -ets
+# ... (see the TSG for the full provider list) ...
+# reproduce the issue
+logman stop auth_kerberos -ets
+```
+
+Always record a **UTC timestamp** with any capture — Fiddler, Wireshark, or ETW —
+so it can be correlated with Entra server-side logs by Request ID.
 
 ---
 
 # Clean up
 
 ```powershell
-.\cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra
+./cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra
 ```
 
 Then delete the Cloud Sync configuration and provisioning agent in the Entra
@@ -252,16 +387,21 @@ portal (the script reminds you).
 ```
 dsregcmd /status                    device & PRT / join state
 dsregcmd /refreshprt                refresh the Primary Refresh Token
-klist cloud_debug                   cloud TGT diagnostics
+klist cloud_debug                   EFFECTIVE cloud-TGT policy value (trust this)
+klist get krbtgt                    force a cloud TGT
+klist get cifs/<sa>...              force a service ticket (shows KdcProxy)
 klist                               cached tickets (note the two realms)
+netsh winhttp show proxy            proxy stack (part of the Entra path)
 ```
 
-# Error → cause quick map
+# Error → first move quick map
 
-| You see | Likely cause |
+| You see | First move |
 |---|---|
-| System error 1327 / no cloud TGT | CloudKerberosTicketRetrievalEnabled not set |
-| AzureAdJoined: NO | device not hybrid joined / registration |
-| Generic access denied | admin consent missing, or CA/MFA on the app |
-| Works for some users only | user is cloud-only (not a hybrid identity) |
-| System error 53 / 67 / timeout | port 445 blocked or DNS |
+| No cloud TGT, but reg looks set | `klist cloud_debug` + check the **Policies** path (Lab B) |
+| `LsaCallAuthenticationPackage 0x51f` / `0xc000005e` | `netsh winhttp show proxy` (Lab C) |
+| `System error 1327` / 86 | CA/MFA on the storage app — check sign-in logs (capstone note) |
+| `AzureAdJoined : NO` | device registration (NotHybridJoined) |
+| Access denied, tickets all healthy | authorization layers: network → RBAC → NTFS (Lab D) |
+| Works for some users only | those users are cloud-only, not synced hybrid |
+| Chain breaks at step 4 only | service-side: admin consent / app — capture in Fiddler |

@@ -5,9 +5,15 @@ Administrator sign-in in a browser, which cannot (and should not) be scripted.
 Budget **~10 minutes**; run it right after `setup.ps1` while the presenter is
 on slides.
 
-Why it's needed: Entra Kerberos only works for **hybrid identities** — AD
-users synced to Entra ID. Cloud-only users are not supported. `labuser1` and
+Why it's needed: **this lab uses the hybrid identity scenario** — AD users
+synced to Entra ID, which is the GA path for Entra Kerberos. `labuser1` and
 `labuser2` exist only in the on-prem AD until you sync them.
+
+> Cloud-only (Entra-only) identities are **also supported, in preview** — a
+> separate enablement path (feature flag + admin consent) that needs no AD DS
+> at all. It's out of scope for this lab but worth knowing when a customer has
+> no on-prem footprint. See the Azure blog post "Azure Files Entra-Only
+> identities" and the internal Entra-Only Kerberos TSG.
 
 ## 1. Install the provisioning agent on the DC
 

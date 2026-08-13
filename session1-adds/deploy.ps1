@@ -265,7 +265,13 @@ function Start-VmScriptJob {
         # since that can legitimately take much longer than a transient error.
         $busy = 0
         for ($i = 1; $i -le $retries; ) {
-            try { return Invoke-AzVMRunCommand @rc }
+            try {
+                $res = Invoke-AzVMRunCommand @rc
+                # Return the PLAIN STRING, not the result object: job output is
+                # serialized on the way back, which mangles the nested Value
+                # collection and made successful runs look like empty output.
+                return (($res.Value | Where-Object Code -like '*StdOut*').Message)
+            }
             catch {
                 if ($_.Exception.Message -match 'execution is in progress|Conflict') {
                     $busy++
@@ -306,7 +312,8 @@ function Receive-VmScriptJob {
     }
     $r = Receive-Job $Job
     Remove-Job $Job -Force -ErrorAction SilentlyContinue
-    return ($r.Value | Where-Object Code -like '*StdOut*').Message
+    # The job already extracted the StdOut message as a plain string.
+    return (($r | Where-Object { $_ }) -join "`n")
 }
 
 # ------------------------------------------------------- 2. Promote the DC
@@ -483,8 +490,8 @@ $summary = @"
  Storage account : $saName
  File share      : \\$saName.file.core.windows.net\labshare
  Domain          : $DomainName
- DC (RDP)        : $dcIpPub  ($AdminUsername)
- Client (RDP)    : $cliIpPub ($($ad.NetBiosDomainName)\labuser1)
+ DC (RDP)        : $dcIpPub  ($($ad.NetBiosDomainName)\$AdminUsername ONLY - plain users can't log on to a DC)
+ Client (RDP)    : $cliIpPub ($($ad.NetBiosDomainName)\labuser1 - this is where the labs run)
  Transcript      : $logFile
 
  Lab quick start (on the CLIENT VM as $($ad.NetBiosDomainName)\labuser1):

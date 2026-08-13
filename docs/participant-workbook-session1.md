@@ -176,8 +176,21 @@ flips to a failure.
 > <https://microsoft.com/devicelogin> from your own browser:
 >
 > ```powershell
-> Connect-AzAccount -UseDeviceAuthentication
+> Connect-AzAccount -DeviceCode
 > ```
+>
+> **If that "succeeds" but lists no subscriptions** (per-tenant MFA warnings,
+> empty table at the end): your account spans several tenants and each one
+> demands its own MFA pass. Target the right tenant from the start — look up
+> the GUID where you deployed (`Get-AzSubscription | Select Name, TenantId`
+> in Cloud Shell), then:
+>
+> ```powershell
+> Connect-AzAccount -DeviceCode -TenantId <tenant-guid>
+> ```
+>
+> If it is still blocked (e.g. conditional access requires a compliant device),
+> skip the VM sign-in entirely — only `Debug-AzStorageAccountAuth` needs it.
 >
 > Everything else in these labs (`klist`, `net use`, the evidence collector,
 > `setspn`, event 4769) needs **no** Azure sign-in on the VM.
@@ -361,21 +374,40 @@ authentication worked — the failure is after it.
 Now compare the two sides of the cipher negotiation:
 
 ```powershell
-# client
+# client - the list is tried IN THIS ORDER, top first
 Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers
 # storage: Azure portal -> storage account -> File shares -> Security
+#          ("SMB channel encryption" - anything unchecked is refused)
 ```
 
 They have no cipher in common. SMB negotiates the cipher **before** the client
 even names the storage account, so the service can't pick one per account — if
-there's no overlap, the session is refused and the error surfaces as an access
-denial.
+the negotiated cipher isn't on the account's allowed list, the session setup is
+refused and the error surfaces as an access denial.
 
-## Fix
+## Fix — on the client, not the account
 
 ```powershell
 ./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault CipherMismatch -Repair
 ```
+
+The repair changes the **client's** cipher order so an account-allowed cipher
+leads:
+
+```powershell
+Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_256_CCM,AES_128_GCM,AES_128_CCM"
+```
+
+Two deliberate choices in that line, both straight from real support practice:
+
+- **The account keeps its hardened setting.** "Maximum security" on the storage
+  account is usually a decision someone made on purpose; the first move is to
+  bring the client up to it, not to weaken the account. (Re-allowing the cipher
+  on the account is the fallback when a fleet of unmanageable clients is
+  involved.)
+- **The weaker ciphers stay in the client list, just lower.** Removing them
+  entirely breaks compatibility elsewhere — notably, mounting with the
+  **storage account key** needs AES-128-CCM. Order, not removal, is the tool.
 
 **Why this matters:** the error text points straight at credentials, so the
 natural reaction is to audit RBAC, then NTFS, then the domain join — and find
