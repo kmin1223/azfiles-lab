@@ -90,8 +90,11 @@ Connect-AzAccount
 .\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 ```
 
-Enter a lab admin password when prompted (12+ chars; avoid spaces, quotes,
-backticks, `$`). The script runs unattended for ~15–30 minutes.
+No password prompt: the script **auto-generates the lab password** and prints
+it in the summary and the `~/azfiles-lab-logs/lab-info-*.txt` file — you'll
+need it for RDP (labadmin and labuser1 share it). To choose your own instead,
+pass `-AdminPassword` (12+ chars; avoid spaces, quotes,
+backticks, `$`). The script runs unattended for ~15 minutes.
 
 **Expected:** a green **DEPLOYMENT COMPLETE** box listing your storage account
 name and the DC/Client public IPs. Note them down; keep this PowerShell window

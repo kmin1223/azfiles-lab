@@ -1,11 +1,12 @@
 # Azure Files Identity-Based Auth — Hands-On Lab Kit
 
 > **Publishing this repo?** It's safe to make public — no secrets, keys,
-> subscription/tenant IDs, or real IPs are stored here (passwords are prompted
-> at runtime; kerb keys are fetched at runtime). Two rules: **do not add the
-> source Microsoft support-wiki PDFs** (they're Microsoft Confidential / NDA and
-> live outside this folder), and don't commit `docs/_archive-old/`. A
-> `.gitignore` already covers both.
+> subscription/tenant IDs, or real IPs are stored here (a lab password is
+> auto-generated at runtime; kerb keys are fetched at runtime). The repo
+> deliberately carries **only the deploy/lab automation**: decks (`*.pptx`) and
+> all documents (`docs/`) are distributed separately and may reference
+> Microsoft-internal tooling — the `.gitignore` keeps them out. Never add the
+> source Microsoft support-wiki PDFs (Microsoft Confidential / NDA).
 
 Two 60-minute sessions. Each session: attendees kick off an automation script
 in **their own subscription** at minute 0, the presenter covers concepts on
@@ -13,13 +14,14 @@ slides while it deploys, then everyone does guided break/fix labs together.
 
 | Session | Topic | Deploy time | Automation |
 |---|---|---|---|
-| 1 | On-prem AD DS auth (simulated with an Azure DC) | ~25–35 min | `session1-adds/deploy.ps1` — fully unattended |
+| 1 | On-prem AD DS auth (simulated with an Azure DC) | ~15 min | `session1-adds/deploy.ps1` — fully unattended |
 | 2 | Microsoft Entra Kerberos (hybrid identities) | ~10 min + 10 min manual | `session2-entra-kerberos/setup.ps1` + one interactive Cloud Sync step |
 
 Session 2 builds on the Session 1 environment. If the two sessions are days
 apart, have attendees **tear down after Session 1** (avoid idle VM costs) and
-**redeploy Session 1 shortly before Session 2** — send the reminder in
-`docs/pre-session-announcements.md`. If the sessions are back-to-back, they can
+**redeploy Session 1 shortly before Session 2** — send the reminder from the
+pre-session announcement doc (distributed with the other session materials).
+If the sessions are back-to-back, they can
 instead leave the environment running.
 
 ## Contents
@@ -28,13 +30,6 @@ instead leave the environment running.
 azfiles-lab/
 ├── README.md                        <- you are here
 ├── cleanup.ps1                      <- full teardown (both sessions)
-├── docs/
-│   ├── facilitator-guide.docx              <- presenter: run-of-show, timings, issue catalog
-│   ├── cuesheet-session1.docx              <- presenter: slide-by-slide Korean cue sheet (Session 1)
-│   ├── participant-workbook-session1.docx  <- attendees: Session 1 learn-by-diagnosing labs
-│   ├── participant-workbook-session2.docx  <- attendees: Session 2 incl. redeploy step
-│   ├── diagnostic-flowchart.pdf            <- printable one-page triage tree (both sessions)
-│   └── pre-session-announcements.docx      <- copy/paste reminders (esp. "redeploy before Session 2")
 ├── session1-adds/
 │   ├── deploy.ps1                   <- attendees run THIS at session start
 │   ├── template/azuredeploy.json     <- ARM template (no Bicep needed)
@@ -48,6 +43,10 @@ azfiles-lab/
 └── tools/
     └── New-LabToolsBundle.ps1       <- PRESENTER ONLY: build the module bundle
 ```
+
+> Decks, workbooks, the cue sheet, the facilitator guide and the diagnostic
+> flowchart are **not in this repo** — the presenter distributes them directly
+> (mail/Teams) before the session.
 
 ## Presenter prerequisite: publish the module bundle (one time)
 
@@ -158,7 +157,7 @@ same `-ResourceGroupName` — the steps are re-runnable and skip completed work.
 ## Session 2 quick start (attendees)
 
 Session 2 reuses the Session 1 environment, so **redeploy Session 1 first** if
-you tore it down (see `docs/pre-session-announcements.md`).
+you tore it down (see the pre-session announcement you received).
 
 ### Option A — Azure Cloud Shell
 

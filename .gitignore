@@ -7,9 +7,11 @@ source-wikis/
 docs/_archive-old/
 *_flowqa*.png
 
-# Presentation decks are presenter material, not lab material - attendees only
-# need the deploy/lab scripts and workbooks. Decks are distributed separately.
+# The public repo carries ONLY the deploy/lab automation. Presenter and
+# attendee documents (decks, cuesheet, workbooks, guides) are distributed
+# separately - this also lets them reference Microsoft-internal tooling.
 *.pptx
+docs/
 
 # The module bundle ships as a GitHub RELEASE ASSET, not in the repo -
 # 64 MB in git history would bloat every clone. Built by tools/New-LabToolsBundle.ps1.

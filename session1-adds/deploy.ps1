@@ -3,7 +3,8 @@
   Session 1 one-shot deployer: simulated on-prem AD DS + Azure Files AD DS auth.
 
 .DESCRIPTION
-  Single command, no interaction after the password prompt:
+  Single command, zero interaction - a lab password is auto-generated and
+  recorded in the lab-info file (override with -AdminPassword if you must):
     1. Resource group + ARM template deployment (VNet/DC/client/storage/share)
     2. Promote DC to a new AD forest (contoso.local)
     3. Create lab users (labuser1/labuser2) + Kerberos auditing on the DC
@@ -115,15 +116,42 @@ foreach ($m in 'Az.Accounts', 'Az.Resources', 'Az.Compute', 'Az.Storage', 'Az.Ne
 }
 if (-not (Get-AzContext)) { throw 'Not logged in. Run Connect-AzAccount first.' }
 
+$pwGenerated = $false
 if (-not $AdminPassword) {
-    $AdminPassword = Read-Host -AsSecureString -Prompt 'Lab admin password (12+ chars, complex)'
+    # Auto-generate rather than prompt: removes the #1 kickoff friction (people
+    # tripping over the complexity rules), keeps the deploy zero-interaction,
+    # and the value is recorded in the lab-info file anyway - attendees need it
+    # for RDP as labadmin AND labuser1. Charset notes:
+    #   - no  $ ` ' " or spaces (Run Command passes params as CLI args)
+    #   - no  0/O, 1/l/I  (people TYPE this into an RDP prompt)
+    #   - guaranteed one of each class, so Azure's 3-of-4 rule always passes
+    $upper = 'ABCDEFGHJKMNPQRSTUVWXYZ'
+    $lower = 'abcdefghjkmnpqrstuvwxyz'
+    $digit = '23456789'
+    $symb  = '!@#%*-+?'
+    $all   = ($upper + $lower + $digit + $symb).ToCharArray()
+    $chars = @(
+        $upper[(Get-Random -Maximum $upper.Length)]
+        $lower[(Get-Random -Maximum $lower.Length)]
+        $digit[(Get-Random -Maximum $digit.Length)]
+        $symb[(Get-Random -Maximum $symb.Length)]
+    ) + (1..12 | ForEach-Object { $all[(Get-Random -Maximum $all.Count)] })
+    $plainPw = -join ($chars | Sort-Object { Get-Random })
+    $AdminPassword = ConvertTo-SecureString $plainPw -AsPlainText -Force
+    $pwGenerated = $true
+    Write-Host "Auto-generated lab password: $plainPw" -ForegroundColor Yellow
+    Write-Host '(also saved in the lab-info file - you need it for RDP)' -ForegroundColor Yellow
+} else {
+    $plainPw = [System.Net.NetworkCredential]::new('', $AdminPassword).Password
+    if ($plainPw.Length -lt 12) { throw 'Password must be at least 12 characters.' }
+    # Run Command passes params as CLI args - avoid characters that break quoting
+    if ($plainPw -match '[\s"''`$]') {
+        throw 'For this lab, avoid spaces, quotes, backticks and $ in the password.'
+    }
 }
-$plainPw = [System.Net.NetworkCredential]::new('', $AdminPassword).Password
-if ($plainPw.Length -lt 12) { throw 'Password must be at least 12 characters.' }
-# Run Command passes params as CLI args - avoid characters that break quoting
-if ($plainPw -match '[\s"''`$]') {
-    throw 'For this lab, avoid spaces, quotes, backticks and $ in the password.'
-}
+# Shown in the console + lab-info only when we invented it; a user-supplied
+# password is theirs and stays out of the files.
+$pwLine = if ($pwGenerated) { " Password        : $plainPw  (all lab accounts: $AdminUsername, labuser1, labuser2)`n" } else { '' }
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -174,7 +202,7 @@ Write-LabInfo @"
  Domain          : $DomainName
  DC (RDP)        : $dcIpPub   ($AdminUsername)
  Client (RDP)    : $cliIpPub  ($AdminUsername, later CONTOSO\labuser1)
- Transcript      : $logFile
+$pwLine Transcript      : $logFile
 
  This file is rewritten with the final result when the deployment finishes.
  If it still says IN PROGRESS, the run did not complete - check the transcript
@@ -492,7 +520,7 @@ $summary = @"
  Domain          : $DomainName
  DC (RDP)        : $dcIpPub  ($($ad.NetBiosDomainName)\$AdminUsername ONLY - plain users can't log on to a DC)
  Client (RDP)    : $cliIpPub ($($ad.NetBiosDomainName)\labuser1 - this is where the labs run)
- Transcript      : $logFile
+$pwLine Transcript      : $logFile
 
  Lab quick start (on the CLIENT VM as $($ad.NetBiosDomainName)\labuser1):
    klist purge
