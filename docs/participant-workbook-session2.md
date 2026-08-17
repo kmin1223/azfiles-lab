@@ -12,7 +12,7 @@ needs no line of sight to a domain controller at all.
 
 The goal this time is not "click through the setup." It is to **build the
 evidence chain a support engineer actually walks** — from device state, to the
-cloud TGT, to the service ticket, to the KDC Proxy exchange on the wire — and
+cloud TGT, to the service ticket, to the KDC Proxy exchange in the network trace — and
 then to break individual links and read which piece of evidence moved. By the
 end you should be able to take a raw `klist` / `dsregcmd` / Fiddler capture and
 say where the failure is, not just that there is one.

@@ -631,7 +631,7 @@ Wireshark filter:  kerberos || smb2
 
 # Error → cause quick map
 
-| You see (error, or on the wire) | Likely cause |
+| You see (error, or in the trace) | Likely cause |
 |---|---|
 | `KRB_AP_ERR_SKEW` | Clock skew > ~5 min between client and DC |
 | duplicate SPN in `setspn -X` | Two AD objects claim the same SPN |

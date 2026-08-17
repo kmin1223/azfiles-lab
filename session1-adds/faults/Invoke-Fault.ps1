@@ -42,7 +42,7 @@
                     Diagnose: Get-SmbClientConfiguration | select EncryptionCiphers
                               (the client tries them IN THAT ORDER) vs the
                               account's Portal > File shares > Security list;
-                              on the wire, Negotiate succeeds then the
+                              in the trace, Negotiate succeeds then the
                               SessionSetup is refused
                     Teach   : this is a REAL Sev case that cost days - the
                               error text blames the identity, the cause is
@@ -59,7 +59,7 @@
   --- advanced (evidence required - the error text alone won't tell you) ---
 
   ClockSkew         Push the CLIENT clock ~10 minutes off the DC.
-                    Symptom : mount fails; the error is generic, but the wire
+                    Symptom : mount fails; the error is generic, but the trace
                               shows KRB_AP_ERR_SKEW / KRB_ERR_TIME_SKEW and
                               event 4769 may not even appear
                     Teach   : Kerberos tolerates only ~5 min skew; in the field
