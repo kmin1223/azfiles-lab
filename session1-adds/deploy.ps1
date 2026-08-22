@@ -141,7 +141,13 @@ if (-not $AdminPassword) {
     $upper = 'ABCDEFGHJKMNPQRSTUVWXYZ'
     $lower = 'abcdefghjkmnpqrstuvwxyz'
     $digit = '23456789'
-    $symb  = '!@#%*-+?'
+    #   - no  %  or  !  : the Run Command extension passes parameters through a
+    #     command-line/cmd layer, where %VAR% expansion (and delayed-expansion !)
+    #     silently mangles the value. The VM's real password comes from the ARM
+    #     template and keeps the character, so the two stop matching and the
+    #     domain join fails with "The user name or password is incorrect".
+    #     Cost us a deployment; it only bit ~1 run in 4, which made it worse.
+    $symb  = '@#*-+?'
     $all   = ($upper + $lower + $digit + $symb).ToCharArray()
     $chars = @(
         $upper[(Get-Random -Maximum $upper.Length)]
@@ -158,8 +164,11 @@ if (-not $AdminPassword) {
     $plainPw = [System.Net.NetworkCredential]::new('', $AdminPassword).Password
     if ($plainPw.Length -lt 12) { throw 'Password must be at least 12 characters.' }
     # Run Command passes params as CLI args - avoid characters that break quoting
-    if ($plainPw -match '[\s"''`$]') {
-        throw 'For this lab, avoid spaces, quotes, backticks and $ in the password.'
+    # or get eaten by cmd-style expansion (% and !). The ARM template sets the
+    # real password faithfully, so any mangling here shows up later as a domain
+    # join failing with "The user name or password is incorrect".
+    if ($plainPw -match '[\s"''`$%!]') {
+        throw 'For this lab, avoid spaces, quotes, backticks, $, % and ! in the password.'
     }
 }
 # Shown in the console + lab-info only when we invented it; a user-supplied
