@@ -3,25 +3,36 @@
   The AES-256 migration lab - modelled on a real Sev A incident.
 
 .DESCRIPTION
-  The lab deploys a "2023 vintage" storage account: RC4 Kerberos encryption and
-  an ActiveDirectoryDomainName holding the NetBIOS name instead of the DNS root.
-  RC4 doesn't salt its keys, so that misconfiguration is invisible - the share
-  mounts perfectly. The moment you comply with the 2026 mandate and move to
-  AES-256, authentication breaks with error 1396, because the AES key is derived
-  from a salt built out of DomainName + SamAccountName + AccountType.
+  deploy.ps1 leaves the storage account in the SUPPORTED configuration: AES-256
+  and an ActiveDirectoryDomainName holding the DNS root. This lab walks the
+  account backwards into a "2023 vintage" state and then forwards again, which
+  is the shape of the real Sev A it is modelled on.
 
-  Steps:
+  Legacy plants the defect: RC4 encryption and the NETBIOS name in
+  ActiveDirectoryDomainName. RC4 doesn't salt its keys, so that misconfiguration
+  is invisible - the share mounts perfectly, for years. The moment you comply
+  with the 2026 mandate and move to AES-256, authentication breaks with error
+  1396, because the AES key is derived from a salt built out of
+  DomainName + SamAccountName + AccountType.
+
+  Steps, in lab order:
     Status   Show the current state: encryption type, DomainName, kerb key age.
+    Legacy   Regress to the 2023-vintage state (RC4 + NetBIOS DomainName), then
+             prove it still mounts - the defect is planted and invisible.
+             Takes ~3 min; run it while the RC4-retirement slides are up.
     Enforce  The naive migration - flip the AD object to AES-256 only.
              Expected result: mounts start failing with 1396.
     Repair   The correct fix, in the order that actually matters:
                1. correct ActiveDirectoryDomainName (full parameter set!)
                2. regenerate the kerb key   <- the new salt is baked in HERE
                3. reset the AD object password to that key
-    Rollback Return to the legacy RC4 state (to re-run the lab).
+             Also the way back to a healthy account, to re-run the lab.
+
+  'Rollback' is accepted as an alias for Legacy (its former name).
 
 .EXAMPLE
   ./Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Status
+  ./Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Legacy
   ./Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Enforce
   ./Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Repair
 
@@ -43,10 +54,13 @@
 param(
     [Parameter(Mandatory)] [string]$ResourceGroupName,
     [Parameter(Mandatory)]
-    [ValidateSet('Status', 'Enforce', 'Repair', 'Rollback')]
+    [ValidateSet('Status', 'Legacy', 'Enforce', 'Repair', 'Rollback')]
     [string]$Step,
     [string]$Prefix = 'azflab'
 )
+# 'Rollback' was this step's original name, back when the deployment shipped the
+# legacy state and this only existed to re-run the lab. Same action either way.
+if ($Step -eq 'Rollback') { $Step = 'Legacy' }
 $ErrorActionPreference = 'Stop'
 
 $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName |
@@ -207,16 +221,64 @@ property alone changes nothing until the key is regenerated and pushed to AD.
 "@ -ForegroundColor Cyan
     }
 
-    'Rollback' {
-        Write-Host 'Restoring the legacy RC4 + NetBIOS-DomainName state...' -ForegroundColor Yellow
+    'Legacy' {
+        Write-Host @"
+Building the '2023 vintage' state - this is what a customer hands you:
+  * AD object drops to RC4
+  * ActiveDirectoryDomainName gets the NETBIOS name instead of the DNS root
+  * kerb key regenerated and pushed to AD
+RC4 is unsalted, so the wrong DomainName is completely invisible - the share
+mounts perfectly. That is exactly why the defect can sit there for years.
+"@ -ForegroundColor Yellow
         Set-AdProperties -DomainNameValue $adProps.NetBiosDomainName
         Invoke-OnDc @"
 Import-Module ActiveDirectory
 `$pdc = (Get-ADDomain).PDCEmulator
 Set-ADComputer -Identity '$saName' -Server `$pdc -KerberosEncryptionType RC4
-Write-Output 'AD object back to RC4'
+Write-Output 'AD object now advertises RC4'
 "@ | Write-Host
         Sync-KerbKeyToAd
-        Write-Host 'Legacy state restored - the lab can be run again.' -ForegroundColor Green
+
+        # Prove RC4 still works in this environment before the lab depends on it.
+        # Recent Windows builds and hardening baselines disable RC4 outright; if
+        # that is the case here, better to find out now than mid-Enforce.
+        Write-Host "`nVerifying the legacy state actually mounts (RC4)..." -ForegroundColor Yellow
+        $cliName = "$Prefix-cli"
+        $verifyScript = @"
+net use * /delete /y 2>&1 | Out-Null
+net use \\$saName.file.core.windows.net\labshare /delete /y 2>&1 | Out-Null
+klist purge 2>&1 | Out-Null
+`$r = net use Z: \\$saName.file.core.windows.net\labshare 2>&1
+if (`$LASTEXITCODE -eq 0) {
+    Write-Output 'LEGACY_MOUNT_OK'
+    klist | Select-String 'cifs/|Encryption Type' | ForEach-Object { Write-Output `$_.ToString().Trim() }
+} else {
+    Write-Output "LEGACY_MOUNT_FAILED: `$r"
+}
+"@
+        Show-Cmd -Where "runs on the client, $cliName" -Command $verifyScript
+        $tmp = New-TemporaryFile
+        Set-Content -Path $tmp -Value $verifyScript
+        try {
+            $res = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $cliName `
+                -CommandId 'RunPowerShellScript' -ScriptPath $tmp
+            $out = ($res.Value | Where-Object Code -like '*StdOut*').Message
+        } finally { Remove-Item $tmp -Force }
+        $out | Write-Host
+
+        if ($out -match 'LEGACY_MOUNT_OK') {
+            Write-Host @"
+
+Legacy state is live and mounting on RC4 - the defect is planted and invisible.
+Next: -Step Enforce (the 2026 mandate) and watch it break with 1396.
+"@ -ForegroundColor Green
+        } else {
+            Write-Warning @"
+RC4 did not mount in this environment - it is probably disabled by the OS build
+or a hardening baseline. The 'invisible defect' half of the lab cannot run here.
+Fall back to: -Step Enforce (to see the AES-256 failure) or -Step Repair (to
+return to the supported configuration and demo the correct order of operations).
+"@
+        }
     }
 }

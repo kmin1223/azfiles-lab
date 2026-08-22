@@ -37,11 +37,12 @@ presents it to the file service over SMB (port 445). Access then passes through
 three layers: network (445) → share-level RBAC → NTFS permissions. Each fault in
 this lab breaks one of those pieces.
 
-> **Your lab starts as a "2023 vintage" environment**, on purpose: RC4 Kerberos
-> encryption, and a storage account whose `ActiveDirectoryDomainName` holds the
-> **NetBIOS** name instead of the DNS root. It mounts perfectly — RC4 keys aren't
-> salted, so that wrong value is never used. Lab 3 is the AES-256 migration,
-> where the salt suddenly matters. This mirrors a real Sev A incident.
+> **Your lab deploys in the supported configuration** — AES-256 Kerberos
+> encryption and an `ActiveDirectoryDomainName` holding the DNS root. In the
+> AES-256 migration lab you will **regress it yourself** to a "2023 vintage"
+> state (RC4 + the **NetBIOS** name in that field), watch it mount perfectly
+> anyway — RC4 keys aren't salted, so the wrong value is never used — and then
+> migrate forward and find out why it breaks. This mirrors a real Sev A incident.
 
 ---
 
@@ -116,7 +117,8 @@ klist
 
 **Expected:** the share maps with no password prompt. `klist` shows a ticket
 with **Server = cifs/<sa>.file.core.windows.net** and encryption type
-**RSADSI RC4-HMAC(NT)** — this is the legacy environment you inherited. Open
+**AES-256-CTS-HMAC-SHA1-96** — the supported configuration. Remember this line:
+in the AES-256 migration lab you will regress it to RC4 and back. Open
 `Z:\` — you'll see `hello-from-setup.txt`, and you can create a file:
 
 ```
@@ -236,28 +238,50 @@ Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 5 |
 ```
 
 Note three fields in event 4769: the **Service Name** (the SPN as the client
-asked for it), the **Ticket Encryption Type** (`0x17` = RC4 in this legacy
-baseline; `0x12` = AES-256 after the migration), and the **Failure Code**
-(`0x0` on success).
+asked for it), the **Ticket Encryption Type** (`0x12` = AES-256, what you have
+now; `0x17` = RC4, which is what you'll see after regressing to the legacy state
+in the migration lab), and the **Failure Code** (`0x0` on success).
 
 ---
 
 # Lab 3 · The AES-256 migration ★
 
-You're the admin who has to comply with the 2026 mandate: move this share off
-RC4. Do it, and deal with what happens.
+Your account is currently configured correctly. To play out the real incident,
+you first have to become the customer who inherited a 2023-era environment —
+then comply with the 2026 mandate and deal with what happens.
 
-## Step 1 — look before you leap
+## Step 1 — build the "2023 vintage" state
 
 ```powershell
 cd session1-adds
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Legacy
+```
+
+This does what an admin did three years ago: drops the AD object to **RC4** and
+writes the **NetBIOS** name into `ActiveDirectoryDomainName` instead of the DNS
+root. It then mounts the share to prove the state is healthy.
+
+Takes about 3 minutes. **Read the output**: the mount succeeds and the ticket is
+RC4. That is the whole point — the wrong `ActiveDirectoryDomainName` is sitting
+right there and nothing complains, because RC4 keys are unsalted and never
+consume that value. A defect like this survives for years precisely because it
+has no symptom.
+
+> If the script warns that RC4 **did not** mount, this environment has RC4
+> disabled at the OS level. Skip to Step 3 (`-Step Enforce`) — you'll still see
+> the AES-256 failure and the repair, just without the "invisible for years"
+> setup.
+
+## Step 2 — look before you leap
+
+```powershell
 ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Status
 ```
 
 Note what it reports — especially `ActiveDirectoryDomainName`. Keep it in mind;
 don't act on it yet.
 
-## Step 2 — perform the migration
+## Step 3 — perform the migration
 
 ```powershell
 ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Enforce
@@ -265,7 +289,7 @@ don't act on it yet.
 
 This flips the AD object to AES-256 only — the change most people would make.
 
-## Step 3 — retest (drop the SMB *session* first!)
+## Step 4 — retest (drop the SMB *session* first!)
 
 On the **Client VM**:
 
@@ -292,7 +316,7 @@ net use Z: \\<sa>.file.core.windows.net\labshare
 > trap shows up in real support cases as *"we changed the auth config and
 > nothing happened"*.
 
-## Step 4 — diagnose from evidence
+## Step 5 — diagnose from evidence
 
 ```powershell
 C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
@@ -315,7 +339,7 @@ Because the AES key is derived with a **salt** built from
 at `ActiveDirectoryDomainName`: it holds the **NetBIOS** name, not the DNS root.
 Under RC4 (unsalted) that never mattered. Under AES-256 it's fatal.
 
-## Step 5 — repair, in the right order
+## Step 6 — repair, in the right order
 
 ```powershell
 ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Repair
@@ -335,7 +359,9 @@ should now show **AES-256-CTS-HMAC-SHA1-96**.
 generation time. Change the property and stop there, and nothing happens — the
 existing key still carries the old salt.
 
-*Want to run it again?* `-Step Rollback` restores the legacy state.
+*Want to run it again?* `-Step Legacy` puts the defect back. (`-Step Rollback`
+still works as its old name.) Leave the account **repaired** at the end of the
+session so it's in the supported state for Session 2.
 
 ---
 
@@ -582,9 +608,20 @@ trace or event 4769. That's the point.
   error is vague; the trace shows `KRB_AP_ERR_SKEW`. Confirm with
   `w32tm /stripchart /computer:azflab-dc /samples:3`. (Kerberos tolerates about
   5 minutes.)
-- **`-Fault DuplicateSpn`** — registers the storage SPN on a second AD object.
-  On the DC, `setspn -X` reveals the duplicate; the KDC can end up encrypting the
-  ticket for the wrong account. A classic, hard-to-spot production issue.
+- **`-Fault DuplicateSpn`** — the "ghost object": registers the storage SPN on a
+  second AD object. A share that worked yesterday breaks with no config change
+  on the storage account at all — the KDC matches the ghost and encrypts the
+  ticket with the *wrong account's* key (→ 1396 at the service), or, if the
+  ghost has no usable key, returns `ETYPE_NOSUPP`. Diagnosis order:
+  1. `setspn -X` (or `-F -Q cifs/<sa>...`) to look for duplicates — but know its
+     limit: these query the **GC**, so a ghost that exists only in one DC's local
+     domain partition (lingering object) or in another domain of the forest can
+     hide from it.
+  2. The decisive evidence is **event 4769 on the DC that failed the request**:
+     its Service Name / Service ID show *which account the KDC actually
+     matched*. One 4769 line beats hours of theorising. (Straight from a real
+     Sev A: `setspn -F` swore the SPN was unique while one DC kept answering
+     error 14 — the winning move was pulling 4769 from that specific DC.)
 
 Repair each with `-Repair`, as usual.
 
@@ -620,7 +657,7 @@ setspn -X                                    find DUPLICATE SPNs (on the DC)
 Debug-AzStorageAccountAuth -StorageAccountName <sa> -ResourceGroupName azfiles-lab -Verbose
 
 --- migration lab ---
-./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Status|Enforce|Repair|Rollback
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Status|Legacy|Enforce|Repair
 
 --- evidence ---
 C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>    trace + logs for one attempt

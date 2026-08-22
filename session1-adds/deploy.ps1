@@ -39,11 +39,16 @@ param(
     [string]$DomainName = 'contoso.local',
     [string]$AdminUsername = 'labadmin',
     [SecureString]$AdminPassword,
-    # Default: build the "2023 vintage" state - RC4 encryption and a storage
-    # account whose ActiveDirectoryDomainName holds the NetBIOS name instead of
-    # the DNS root. It mounts fine on RC4; the latent salt defect only surfaces
-    # when you migrate to AES-256 (Lab: Invoke-Aes256Migration.ps1).
-    # Use -Modern to deploy the correct AES-256 configuration instead.
+    # Default: deploy the CORRECT, supported configuration - AES-256 encryption
+    # and ActiveDirectoryDomainName holding the DNS root. Attendees regress it to
+    # the "2023 vintage" state themselves in Lab 2, with
+    #   Invoke-Aes256Migration.ps1 -Step Legacy
+    # which is where the NetBIOS/salt defect gets planted (and explained).
+    # Use -Legacy here to deploy straight into that legacy state instead - handy
+    # for a dry run, or if you want Lab 2 to skip its regression step.
+    [switch]$Legacy,
+    # Back-compat: -Modern was the old opt-in for the AES-256 state, which is now
+    # the default. Accepted and ignored so old command lines keep working.
     [switch]$Modern,
     # Override the prebuilt module bundle location (see tools\New-LabToolsBundle.ps1).
     # Leave empty to use the default baked into scripts\07-install-tools.ps1.
@@ -54,6 +59,14 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $scriptRoot = $PSScriptRoot
+
+# One switch decides the whole shape of the deployment. AES-256 (the supported
+# configuration) is the default; -Legacy plants the 2023-vintage defect here
+# instead of leaving it to Lab 2.
+$legacyMode = [bool]$Legacy
+if ($Modern) {
+    Write-Host "-Modern is now the default and is ignored. Use -Legacy for the RC4 state." -ForegroundColor DarkGray
+}
 
 # Stamped so the transcript shows where the time actually went - useful both for
 # tuning the deployment and for telling a hung step from a slow one.
@@ -194,7 +207,7 @@ Write-LabInfo @"
  AZURE FILES LAB - SESSION 1  (deployment IN PROGRESS)
 ==============================================================
  Started         : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
- Lab mode        : $(if ($Modern) { 'MODERN (AES-256)' } else { 'LEGACY (RC4)' })
+ Lab mode        : $(if ($legacyMode) { 'LEGACY (RC4) - defect pre-planted' } else { 'AES-256 (supported config) - Lab 2 plants the defect' })
  Subscription    : $((Get-AzContext).Subscription.Name)
  Resource group  : $ResourceGroupName  ($Location)
  Storage account : $saName
@@ -397,7 +410,7 @@ New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -Key
 $kerbKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
     Where-Object KeyName -eq 'kerb1').Value
 
-$encType = if ($Modern) { 'AES256' } else { 'RC4' }
+$encType = if ($legacyMode) { 'RC4' } else { 'AES256' }
 $joinOut = Invoke-VmScript -VmName $dcName -ScriptFile '04-domain-join-storage.ps1' `
     -Params @{ StorageAccountName = $saName; KerbKey = $kerbKey; KerberosEncryptionType = $encType } `
     -Retries 3 -RetryDelaySec 30
@@ -409,8 +422,8 @@ Step '6/9 Enabling AD DS authentication on the storage account'
 # LEGACY MODE (default): ActiveDirectoryDomainName gets the NetBIOS name rather
 # than the DNS root. Harmless under RC4 (no salt), fatal under AES-256 - the
 # exact latent defect behind a real Sev A incident.
-$adDomainNameValue = if ($Modern) { $ad.DomainName } else { $ad.NetBiosDomainName }
-if (-not $Modern) {
+$adDomainNameValue = if ($legacyMode) { $ad.NetBiosDomainName } else { $ad.DomainName }
+if ($legacyMode) {
     Write-Host "Legacy mode: ActiveDirectoryDomainName = '$adDomainNameValue' (NetBIOS, not the DNS root)"
 }
 Show-Cmd @"
@@ -470,13 +483,13 @@ if (-not $joinOutput) {
 # Legacy mode depends on RC4 still being usable in this environment. If it
 # isn't, fall back to the correct AES-256 config so the rest of the lab runs.
 Step 'Verifying the environment (mount test from the client)'
-$labMode = if ($Modern) { 'MODERN (AES-256)' } else { 'LEGACY (RC4)' }
+$labMode = if ($legacyMode) { 'LEGACY (RC4)' } else { 'AES-256 (supported config)' }
 $verify = Invoke-VmScript -VmName $cliName -ScriptFile '08-verify-mount.ps1' `
     -Params @{ StorageAccountName = $saName } -Retries 3 -RetryDelaySec 30
 $verify | Write-Host
 
 if ($verify -notmatch 'MOUNT_OK') {
-    if (-not $Modern) {
+    if ($legacyMode) {
         Write-Warning 'Legacy RC4 mount did not work here - falling back to AES-256 so the lab still runs.'
         Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
             -EnableActiveDirectoryDomainServicesForFile $true `
@@ -498,7 +511,7 @@ if ($verify -notmatch 'MOUNT_OK') {
         $verify = Invoke-VmScript -VmName $cliName -ScriptFile '08-verify-mount.ps1' `
             -Params @{ StorageAccountName = $saName } -Retries 2 -RetryDelaySec 30
         $verify | Write-Host
-        $labMode = 'MODERN (AES-256) - RC4 unavailable, AES-256 migration lab not applicable'
+        $labMode = 'AES-256 - RC4 unavailable here, so the -Legacy state could not be built'
     }
     if ($verify -notmatch 'MOUNT_OK') {
         Write-Warning 'Mount still failing - check Test-NetConnection 445 and Debug-AzStorageAccountAuth on the client.'
@@ -525,7 +538,12 @@ $pwLine Transcript      : $logFile
  Lab quick start (on the CLIENT VM as $($ad.NetBiosDomainName)\labuser1):
    klist purge
    net use Z: \\$saName.file.core.windows.net\labshare
-   klist   # look for the cifs/ ticket
+   klist   # look for the cifs/ ticket - AES-256 in this build
+
+ The account is deployed in the SUPPORTED configuration (AES-256, DNS-root
+ domain name). Lab 2 starts by regressing it to the 2023-vintage state:
+   ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Legacy
+ (takes ~3 min - kick it off while the RC4-retirement slides are running)
 
  Diagnostics are preinstalled on the CLIENT VM (Az + AzFilesHybrid).
  The DC deliberately has no Azure tooling - only Kerberos auditing (4768/4769):

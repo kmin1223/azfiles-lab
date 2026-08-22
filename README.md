@@ -131,7 +131,10 @@ cd session1-adds
 The deploy is fully automated from here: forest promotion, lab users
 (`labuser1`/`labuser2`), client domain join, storage account domain join
 (computer account + SPN + kerb1 key), AD DS auth enablement, default share
-permission, and NTFS ACLs. A verified environment takes about 13–16 minutes;
+permission, and NTFS ACLs. It lands in the **supported configuration** —
+AES-256 with the DNS root in `ActiveDirectoryDomainName`. The AES-256 migration
+lab regresses it to the legacy RC4 state on demand (`-Step Legacy`), so the
+deployment itself is never left in a broken shape. A verified environment takes about 13–16 minutes;
 the diagnostic tooling (Az + AzFilesHybrid) installs on the client **after**
 that, off the critical path, so a slow download can't hold up the lab.
 
@@ -186,6 +189,12 @@ Cloud Shell uses `./faults/...`; local Windows uses `.\faults\...`.
 ./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch
 ./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault PasswordMismatch -Repair
 # Faults: PasswordMismatch | SpnBroken | EtypeMismatch | Block445 | NoShareAccess
+#         CipherMismatch | ClockSkew | DuplicateSpn
+
+# The AES-256 migration lab is a separate, staged script (the centerpiece):
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Legacy   # plant the 2023 defect (~3 min)
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Enforce  # comply -> error 1396
+./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Repair   # fix, in the order that matters
 
 # Session 2  (from the session2-entra-kerberos folder)
 ./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt

@@ -216,6 +216,91 @@ both paths before touching anything.
 
 ---
 
+# Concept · Cloud or on-prem? — flags vs ground truth
+
+This is the trap that costs the most hours on a real Sev A. A hybrid-joined
+machine is covered in **cloud-looking flags** — and none of them tell you
+whether a given SPN request actually went to Entra. Here is a real impacted
+machine whose `cifs/…file.core.windows.net` mount failed:
+
+**Flags that look "cloud" but do NOT decide routing:**
+
+| Signal | Impacted machine | What it actually means |
+|---|---|---|
+| `AzureAdPrt : YES` | YES | the device holds an Entra PRT — for web/app SSO. Normal on any hybrid-joined box. |
+| `CloudTgt : YES` (SSO State) | YES | a cloud-assisted **on-prem** TGT at logon (Windows Hello / cloud trust). It's about *getting an on-prem TGT*, not routing SPNs to Entra. |
+| `KerbTopLevelNames` has `.windows.net` | YES | the suffix list the client *would* use **if** cloud Kerberos were enabled. Necessary, not sufficient. |
+
+**The two signals that actually decide it — both point on-prem here:**
+
+| Signal | Impacted machine | Meaning |
+|---|---|---|
+| `klist cloud_debug` → `enabled by policy` | **0** | the master switch (`CloudKerberosTicketRetrievalEnabled`) is off — confirmed by the registry having no such value |
+| ticket cache realms | **all on-prem** | 12 tickets, every `Kdc Called` is an on-prem DC; **not one** `krbtgt @ KERBEROS.MICROSOFTONLINE.COM`, no `KdcProxy`, `Cloud Referral TGT present: 0` |
+
+So despite `.windows.net` being in the list, the switch is `0` → the SPN was
+**never routed to Entra**. The failure (`0xc00002fd` / KDC_ERR_ETYPE_NOSUPP) came
+from an **on-prem DC**. Chasing Entra here is hours down the drain.
+
+> **Two different "cloud TGTs" — do not conflate them.** `CloudTgt : YES` in SSO
+> State is the Windows-Hello / cloud-trust TGT for **on-prem** realms. The Azure
+> Files "cloud TGT" is a ticket in the **`KERBEROS.MICROSOFTONLINE.COM`** realm,
+> which only appears when the master switch is on. Same words, different realms.
+
+**The rule of thumb:**
+
+> Flags describe **capability**; the ticket cache describes **what happened**.
+> PRT + CloudTgt + KerbTopLevelNames = "the car has cloud features installed."
+> `CloudKerberosTicketRetrievalEnabled` = "is the ignition on." The ticket
+> cache = "where it actually drove." **Trust the cache.**
+
+---
+
+# Lab B+ · Prove the flags don't move (routing vs flags)
+
+You already toggled the master switch in Lab B. Now watch what the *cloud flags*
+do while you do it — the answer is **nothing**, and that's the whole lesson.
+
+**With the switch ON** (healthy state), record:
+
+```
+klist cloud_debug        | note "enabled by policy: true"
+klist get cifs/<sa>.file.core.windows.net
+klist                    | a KERBEROS.MICROSOFTONLINE.COM ticket via KdcProxy
+dsregcmd /status         | AzureAdPrt: YES · CloudTgt: YES · KerbTopLevelNames has .windows.net
+```
+
+**Now break it** (Lab B's fault), sign out/in, and re-run the SAME four:
+
+```
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
+```
+
+**What changed vs what didn't:**
+
+| Command | After the fault |
+|---|---|
+| `klist cloud_debug` | `enabled by policy: false` — **changed** |
+| `klist get cifs/<sa>` + `klist` | no cloud-realm ticket; the request no longer goes to Entra — **changed** |
+| `dsregcmd /status` | `AzureAdPrt`, `CloudTgt`, `KerbTopLevelNames` — **all identical** |
+
+That is the trap in one screen: **the routing changed, the flags did not.** If
+you had diagnosed from `dsregcmd` alone you'd have concluded "still cloud" and
+looked in the wrong place. Only `cloud_debug` and the cache told the truth.
+
+**Fix:** `-Fault NoCloudTgt -Repair`, sign out/in, confirm the cloud-realm ticket
+returns.
+
+> **Real-case corollary (AD DS side).** On an AD DS-joined storage account, the
+> opposite bug also exists: with the switch **ON**, `.windows.net` matches
+> `KerbTopLevelNames` and the client wrongly routes `cifs/<sa>` to the **cloud**
+> realm — which can't issue for an AD DS account → `0xc000018b`. The fix there is
+> a `HostToRealm`/`SpnMappings` entry (LSA path) that pins the suffix back to the
+> on-prem realm. Same root skill: confirm the realm from the cache before
+> theorising.
+
+---
+
 # Lab C · When the diagnostic tool causes the outage (KDC Proxy path)
 
 Entra Kerberos rides over HTTPS, which means the machine's **proxy stack is now
@@ -399,6 +484,7 @@ netsh winhttp show proxy            proxy stack (part of the Entra path)
 | You see | First move |
 |---|---|
 | No cloud TGT, but reg looks set | `klist cloud_debug` + check the **Policies** path (Lab B) |
+| PRT/CloudTgt YES → "must be cloud" | don't infer routing from flags — `cloud_debug enabled by policy` + cache realm decide it (Lab B+) |
 | `LsaCallAuthenticationPackage 0x51f` / `0xc000005e` | `netsh winhttp show proxy` (Lab C) |
 | `System error 1327` / 86 | CA/MFA on the storage app — check sign-in logs (capstone note) |
 | `AzureAdJoined : NO` | device registration (NotHybridJoined) |
