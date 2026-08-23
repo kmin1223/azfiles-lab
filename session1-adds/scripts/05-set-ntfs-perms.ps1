@@ -10,7 +10,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $uncPath = "\\$StorageAccountName.file.core.windows.net\labshare"
-net use Z: $uncPath /user:"localhost\$StorageAccountName" $StorageKey | Out-Null
+# /persistent:no - this runs as SYSTEM; a remembered mapping would survive in
+# SYSTEM's profile and keep the drive letter reserved for every other user.
+net use Z: $uncPath /user:"localhost\$StorageAccountName" $StorageKey /persistent:no | Out-Null
 try {
     icacls Z: /grant "$NetBios\Domain Users:(OI)(CI)M" | Out-Null
     icacls Z: /grant "$NetBios\Domain Admins:(OI)(CI)F" | Out-Null

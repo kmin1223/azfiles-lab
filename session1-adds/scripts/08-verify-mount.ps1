@@ -15,7 +15,9 @@ $fqdn = "$StorageAccountName.file.core.windows.net"
 cmd /c "net use * /delete /y" 2>&1 | Out-Null
 klist purge | Out-Null
 
-$mount = cmd /c "net use T: \\$fqdn\$Share 2>&1"
+# /persistent:no - runs as SYSTEM, and a remembered mapping would reserve the
+# letter for everyone after the deployment finishes.
+$mount = cmd /c "net use T: \\$fqdn\$Share /persistent:no 2>&1"
 $ok = $LASTEXITCODE -eq 0
 
 $etype = 'none'

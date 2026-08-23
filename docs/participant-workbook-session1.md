@@ -50,20 +50,18 @@ this lab breaks one of those pieces.
 
 - Azure subscription with the **Owner** role and quota for two `Standard_B2ms`
   VMs.
-- Where you'll run the deploy/fault commands — pick one:
-  - **Azure Cloud Shell (easiest):** nothing to install — Az and Microsoft.Graph
-    are already there, and there's no execution-policy / "unblock" friction.
-  - **Local PowerShell 7+:** `Install-Module Az -Scope CurrentUser`.
+- **Azure Cloud Shell** — where every deploy and fault command runs. Nothing to
+  install (Az and Microsoft.Graph are already there), you are already signed in,
+  and there is no execution-policy or "unblock" friction.
 - An **RDP client**, connected to your Azure VPN (RDP is allowed from the
-  AzureCloud service tag). *Required either way* — the klist / net use / mount
-  steps happen inside the VMs, which Cloud Shell can't do.
+  AzureCloud service tag). *Also required* — the klist / net use / mount steps
+  happen inside the VMs, which Cloud Shell can't do.
 
 The deployment uses a plain ARM template — nothing extra to install.
 
-> **Running in Cloud Shell?** Get the kit with
-> `git clone https://github.com/kmin1223/azfiles-lab.git`, `cd` into it, and
-> skip the `Unblock-File` /
-> `Set-ExecutionPolicy` lines below — they're Windows-only. Type paths with
+> **Everything outside the VMs runs in Azure Cloud Shell.** Open it from the
+> portal (`>_` icon), pick PowerShell, and `git clone` the kit there. You are
+> already signed in, so there is no `Connect-AzAccount` step, and paths use
 > forward slashes (`./deploy.ps1`, `./faults/Invoke-Fault.ps1`). One caveat:
 > Cloud Shell disconnects after ~20 min idle; the deploy prints output the
 > whole time so it stays alive, and if it ever drops just re-run the same
@@ -73,22 +71,12 @@ The deployment uses a plain ARM template — nothing extra to install.
 
 # Lab 1 · Deploy the environment
 
-**Azure Cloud Shell (recommended)** — open Cloud Shell (PowerShell) from the
-Azure portal (`>_` icon):
+In **Azure Cloud Shell** (PowerShell) — the `>_` icon in the Azure portal:
 
 ```powershell
 git clone https://github.com/kmin1223/azfiles-lab.git
 cd azfiles-lab/session1-adds
 ./deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
-```
-
-**Local Windows PowerShell** — from the `session1-adds` folder:
-
-```powershell
-Get-ChildItem -Path .\ -Recurse | Unblock-File
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-Connect-AzAccount
-.\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 ```
 
 No password prompt: the script **auto-generates the lab password** and prints
@@ -134,7 +122,10 @@ fault labs.
 **AzFilesHybrid** modules installed, so you can run the official diagnostic
 right there. Run it on the **client, not the DC** — that is where these cmdlets
 belong in a real environment too, and the DC in this lab has no Azure tooling on
-purpose:
+purpose.
+
+This is **the one place you sign in to Azure by hand**: it runs inside the VM,
+not in Cloud Shell, so the VM has no session of its own.
 
 ```powershell
 Connect-AzAccount
@@ -209,18 +200,34 @@ flips to a failure.
 ## Capture your known-good reference
 
 Before you break anything, capture what a **working** mount looks like on the
-wire. Every later capture is a diff against this one. In an **elevated**
-PowerShell on the Client VM — `labuser1` is a local admin here, so elevation is
-a single **Yes** on the UAC prompt:
+wire. Every later capture is a diff against this one.
 
-> **If UAC asks for a password, close it and start again.** Elevating with
-> `labadmin` runs the collector in a *different logon session*, which has its own
-> Kerberos ticket cache — it would purge and capture the wrong user's tickets.
-> Elevation must stay `labuser1`.
+Do it the way you would on a real case: **the trace needs admin rights, but the
+mount must happen in the affected user's own, non-elevated session** — that is
+the session whose ticket cache and drive letters you are diagnosing. So you use
+two windows.
 
 ```powershell
-C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
+# 1) ELEVATED PowerShell  (labuser1 is a local admin here: just click Yes on UAC)
+C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
+
+# 2) NORMAL PowerShell - reproduce as the user
+C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount <sa>
+
+# 3) back in the ELEVATED window
+C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace
 ```
+
+> **If UAC asks for a password, close it and start again.** Elevating with
+> `labadmin` would run the trace as a different user entirely. Elevation must
+> stay `labuser1`.
+>
+> In a hurry? `Get-KerberosEvidence.ps1 -StorageAccount <sa>` in the elevated
+> window does all three in one go. The identity is still `labuser1`, so the
+> Kerberos evidence is faithful — but the mount lands in the elevated logon
+> session, with its own ticket cache and drive letters. This is exactly the
+> split you ask customers to respect when you request a trace: *you* start the
+> capture, *the affected user* reproduces.
 
 It purges tickets, starts a network trace, performs the mount, stops the trace,
 converts it to `.pcapng`, and collects the Kerberos/SMBClient logs into
@@ -309,15 +316,29 @@ This flips the AD object to AES-256 only — the change most people would make.
 
 On the **Client VM**:
 
-```
+```powershell
+# in your NORMAL window
 net use * /delete /y
 net use \\<sa>.file.core.windows.net\labshare /delete /y
+net use Z: /delete /y
 klist purge
-Get-SmbConnection
+
+# in the ELEVATED window - Get-SmbConnection requires it.
+# Filter: an unfiltered list also shows the machine's own IPC$ connection to
+# the DC, which is normal and has nothing to do with the share.
+Get-SmbConnection | Where-Object ServerName -like '*file.core.windows.net'
+
+# back in the normal window
 net use Z: \\<sa>.file.core.windows.net\labshare
 ```
 
 **Expected:** `System error 1396`.
+
+> Two things that will bite you here. **`Get-SmbConnection` needs an elevated
+> window** — a standard token gets *"Access is denied"*, even for a local admin.
+> And **`System error 85` ("the local device name is already in use")** while
+> `net use` lists nothing means a dead mapping still owns the letter: clear it
+> with `net use Z: /delete /y` or `Remove-SmbMapping -LocalPath Z: -Force`.
 
 > Deleting mappings and purging tickets is **not enough** — neither kills the
 > SMB *session*, and a TreeConnect on a live session performs no new

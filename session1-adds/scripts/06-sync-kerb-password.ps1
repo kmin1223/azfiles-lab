@@ -26,7 +26,8 @@ if ($StorageKey -and $NetBios) {
     # NTFS layer: mount once with the STORAGE KEY (superuser path, no Kerberos
     # involved) and grant the lab users their permissions.
     $uncPath = "\\$StorageAccountName.file.core.windows.net\labshare"
-    net use Z: $uncPath /user:"localhost\$StorageAccountName" $StorageKey | Out-Null
+    # /persistent:no - runs as SYSTEM; see 05-set-ntfs-perms.ps1.
+    net use Z: $uncPath /user:"localhost\$StorageAccountName" $StorageKey /persistent:no | Out-Null
     try {
         icacls Z: /grant "$NetBios\Domain Users:(OI)(CI)M" | Out-Null
         icacls Z: /grant "$NetBios\Domain Admins:(OI)(CI)F" | Out-Null

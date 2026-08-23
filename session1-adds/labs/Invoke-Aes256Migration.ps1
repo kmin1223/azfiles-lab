@@ -179,8 +179,9 @@ Now retest on the CLIENT VM. Drop the SMB SESSION first - this matters, and
 deleting mappings or purging tickets is NOT enough:
     net use * /delete /y
     net use \\$saName.file.core.windows.net\labshare /delete /y
+    net use Z: /delete /y            <- a stale letter causes System error 85
     klist purge
-    Get-SmbConnection    <- must show NO entry for $saName before you retest
+    Get-SmbConnection                <- ELEVATED window; no entry for $saName
     net use Z: \\$saName.file.core.windows.net\labshare
 
 If the mount 'succeeds' but klist shows ZERO tickets, you reused the old
@@ -212,6 +213,7 @@ Expect: System error 1396. Then prove where it broke:
 
 Retest on the CLIENT VM:
     net use * /delete /y
+    net use Z: /delete /y
     klist purge
     net use Z: \\$saName.file.core.windows.net\labshare
     klist          <- KerbTicket Encryption Type should now be AES-256
@@ -244,17 +246,26 @@ Write-Output 'AD object now advertises RC4'
         # that is the case here, better to find out now than mid-Enforce.
         Write-Host "`nVerifying the legacy state actually mounts (RC4)..." -ForegroundColor Yellow
         $cliName = "$Prefix-cli"
+        # Run Command executes as SYSTEM, so this probe authenticates as the
+        # MACHINE account - fine for "does RC4 still work here", but it is not
+        # the lab user's evidence.
+        # It mounts by UNC with NO drive letter, and disconnects afterwards: a
+        # letter mapped by SYSTEM lives in session 0 and would block the lab
+        # user from using that letter for the rest of the session (System error
+        # 85, with nothing in their own 'net use' to explain it).
         $verifyScript = @"
+`$unc = '\\$saName.file.core.windows.net\labshare'
 net use * /delete /y 2>&1 | Out-Null
-net use \\$saName.file.core.windows.net\labshare /delete /y 2>&1 | Out-Null
+net use `$unc /delete /y 2>&1 | Out-Null
 klist purge 2>&1 | Out-Null
-`$r = net use Z: \\$saName.file.core.windows.net\labshare 2>&1
+`$r = net use `$unc /persistent:no 2>&1
 if (`$LASTEXITCODE -eq 0) {
-    Write-Output 'LEGACY_MOUNT_OK'
+    Write-Output 'LEGACY_MOUNT_OK (probed as the machine account)'
     klist | Select-String 'cifs/|Encryption Type' | ForEach-Object { Write-Output `$_.ToString().Trim() }
 } else {
     Write-Output "LEGACY_MOUNT_FAILED: `$r"
 }
+net use `$unc /delete /y 2>&1 | Out-Null
 "@
         Show-Cmd -Where "runs on the client, $cliName" -Command $verifyScript
         $tmp = New-TemporaryFile

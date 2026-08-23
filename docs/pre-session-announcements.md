@@ -48,14 +48,13 @@ minutes and we won't have time to wait for it during the session.
 
 **Do this the day before (or morning of) Session 2:**
 
-1. Open PowerShell in your lab kit's `session1-adds` folder.
+1. Open **Azure Cloud Shell** (PowerShell) from the portal — the `>_` icon.
+   You are already signed in there, so there is no `Connect-AzAccount` step.
 2. Run:
 
    ```powershell
-   Get-ChildItem -Path .\ -Recurse | Unblock-File
-   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-   Connect-AzAccount
-   .\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
+   cd azfiles-lab/session1-adds     # or git clone the kit again
+   ./deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
    ```
 
 3. Wait for the green **DEPLOYMENT COMPLETE** box. Note the new storage account

@@ -249,124 +249,255 @@ if ($isDC) {
 $helper = @'
 <#
   Get-KerberosEvidence.ps1 - capture the raw evidence for one mount attempt.
-  Usage (elevated, on the CLIENT VM):
-      C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
-  Produces C:\LabTools\evidence\<timestamp>\ with:
-      trace.etl / trace.pcapng   network capture of the whole attempt
-      klist-before/after.txt     ticket cache either side of the mount
-      mount-result.txt           the actual net use output/error
-      kerberos-log.txt           Microsoft-Windows-Kerberos/Operational
-      smbclient-log.txt          SMBClient/Operational
-      smbclient-connectivity.txt SMBClient/Connectivity
-      smb-connection.txt         negotiated dialect / encryption / signing
-      smb-client-config.txt      client SMB settings (cipher order, etc.)
+
+  TWO WAYS TO RUN IT
+  ------------------
+  1) Split (what you do on a real case). The trace needs admin rights, but the
+     MOUNT must happen in the affected user's own, non-elevated session - that
+     is the session whose ticket cache and drive mappings you are diagnosing.
+
+        ELEVATED window :  Get-KerberosEvidence.ps1 -StartTrace
+        NORMAL window   :  Get-KerberosEvidence.ps1 -Reproduce -StorageAccount <sa>
+        ELEVATED window :  Get-KerberosEvidence.ps1 -StopTrace
+
+  2) All-in-one (quick, everything in the elevated window):
+
+        Get-KerberosEvidence.ps1 -StorageAccount <sa>
+
+     The identity is still the same domain user, so the Kerberos evidence is
+     faithful - but the mount lands in the elevated logon session, which has its
+     own ticket cache and drive letters.
+
+  OUTPUT  ->  C:\LabTools\evidence\<timestamp>\
+      trace.etl / trace.pcapng    network capture of the whole attempt
+      klist-before/after.txt      ticket cache either side of the mount
+      mount-result.txt            the actual net use output/error
+      kerberos-log.txt            Microsoft-Windows-Kerberos/Operational
+      smbclient-log.txt           SMBClient/Operational
+      smbclient-connectivity.txt  SMBClient/Connectivity
+      smb-connection.txt          negotiated dialect / encryption / signing
+      smb-client-config.txt       client SMB settings (cipher order, etc.)
 
   The two event-log files are EMPTY when the mount succeeds - those channels
   record problems, not successes. Run this again while a fault is injected and
-  they fill up. Must be run ELEVATED (netsh trace).
+  they fill up.
 #>
+[CmdletBinding(DefaultParameterSetName = 'All')]
 param(
-    [Parameter(Mandatory)][string]$StorageAccount,
+    [Parameter(ParameterSetName = 'All', Mandatory)]
+    [Parameter(ParameterSetName = 'Reproduce', Mandatory)]
+    [string]$StorageAccount,
+
+    [Parameter(ParameterSetName = 'Start', Mandatory)][switch]$StartTrace,
+    [Parameter(ParameterSetName = 'Reproduce', Mandatory)][switch]$Reproduce,
+    [Parameter(ParameterSetName = 'Stop', Mandatory)][switch]$StopTrace,
+
     [string]$Share = 'labshare',
     [string]$DriveLetter = 'Z'
 )
-# netsh trace needs elevation. Without this check the trace silently does
-# nothing, the script still prints "pcapng ready", and you find out only when
-# Wireshark opens an empty file - during the lab, with no time to redo it.
-$isAdmin = ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()
+
+$root    = 'C:\LabTools\evidence'
+$pointer = Join-Path $root '.current-run.txt'
+
+function Test-Admin {
+    ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
+}
+
+function Assert-Admin([string]$Why) {
+    if (Test-Admin) { return }
     Write-Host ''
-    Write-Warning 'This must run ELEVATED - netsh trace cannot capture otherwise.'
-    Write-Host 'Close this window, right-click PowerShell -> Run as administrator,' -ForegroundColor Yellow
-    Write-Host 'and answer YES on the UAC prompt (do NOT enter labadmin credentials:' -ForegroundColor Yellow
-    Write-Host ' that starts a different logon session with a different ticket cache).' -ForegroundColor Yellow
+    Write-Warning "$Why needs an ELEVATED window."
+    Write-Host 'Right-click PowerShell -> Run as administrator, then answer YES on' -ForegroundColor Yellow
+    Write-Host 'the UAC prompt. Do NOT type labadmin credentials: that starts a'    -ForegroundColor Yellow
+    Write-Host 'different logon session with a different ticket cache.'             -ForegroundColor Yellow
     exit 1
 }
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$out = "C:\LabTools\evidence\$stamp"
-New-Item -ItemType Directory -Path $out -Force | Out-Null
-$fqdn = "$StorageAccount.file.core.windows.net"
 
-Write-Host "Collecting evidence -> $out" -ForegroundColor Cyan
+function Get-CurrentRun {
+    if (-not (Test-Path $pointer)) {
+        Write-Warning 'No capture in progress. Start one first:  Get-KerberosEvidence.ps1 -StartTrace'
+        exit 1
+    }
+    $p = (Get-Content $pointer -Raw).Trim()
+    if (-not (Test-Path $p)) {
+        Write-Warning "Recorded folder is gone: $p"
+        exit 1
+    }
+    $p
+}
 
-net use "${DriveLetter}:" /delete /y 2>$null | Out-Null
-klist purge | Out-Null
-klist > "$out\klist-before.txt"
+function Start-Capture([string]$Out) {
+    # Clear a trace left running by an earlier attempt, then start and VERIFY.
+    netsh trace stop 2>&1 | Out-Null
+    $started = netsh trace start capture=yes overwrite=yes maxsize=512 tracefile="$Out\trace.etl" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'netsh trace failed to start:'
+        Write-Host ($started -join "`n") -ForegroundColor DarkYellow
+        return $false
+    }
+    $true
+}
 
-Write-Host 'Starting network trace...'
-# Stop a trace left running by an earlier attempt, then start ours and CHECK it.
-netsh trace stop 2>&1 | Out-Null
-$startOut = netsh trace start capture=yes overwrite=yes maxsize=512 tracefile="$out\trace.etl" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "netsh trace failed to start - continuing without a capture:"
-    Write-Host ($startOut -join "`n") -ForegroundColor DarkYellow
-    $traceOk = $false
-} else { $traceOk = $true }
-
-Write-Host 'Attempting the mount...'
-$mount = cmd /c "net use ${DriveLetter}: \\$fqdn\$Share 2>&1"
-$mount | Out-File "$out\mount-result.txt" -Encoding utf8
-Write-Host ($mount -join "`n")
-
-Start-Sleep -Seconds 2
-if ($traceOk) {
+function Stop-Capture([string]$Out) {
     Write-Host 'Stopping trace (takes ~30s)...'
     netsh trace stop | Out-Null
-}
-
-klist > "$out\klist-after.txt"
-
-# Convert for Wireshark - and only claim success if there is really a file.
-if ($traceOk -and (Test-Path "$out\trace.etl") -and (Test-Path 'C:\LabTools\etl2pcapng.exe')) {
-    & 'C:\LabTools\etl2pcapng.exe' "$out\trace.etl" "$out\trace.pcapng" | Out-Null
-    $pcap = Get-Item "$out\trace.pcapng" -ErrorAction SilentlyContinue
-    if ($pcap -and $pcap.Length -gt 0) {
-        Write-Host ("pcapng ready: {0} ({1:N0} KB)" -f $pcap.FullName, ($pcap.Length / 1KB)) -ForegroundColor Green
+    if ((Test-Path "$Out\trace.etl") -and (Test-Path 'C:\LabTools\etl2pcapng.exe')) {
+        & 'C:\LabTools\etl2pcapng.exe' "$Out\trace.etl" "$Out\trace.pcapng" | Out-Null
+        $pcap = Get-Item "$Out\trace.pcapng" -ErrorAction SilentlyContinue
+        if ($pcap -and $pcap.Length -gt 0) {
+            Write-Host ("pcapng ready: {0} ({1:N0} KB)" -f $pcap.FullName, ($pcap.Length / 1KB)) -ForegroundColor Green
+        } else {
+            Write-Warning "Conversion produced an empty file - check $Out\trace.etl."
+        }
     } else {
-        Write-Warning "Conversion produced an empty file - check that $out\trace.etl has data."
+        Write-Warning "No trace.etl in $Out - the capture did not run."
     }
-} elseif ($traceOk) {
-    Write-Warning "No trace.etl was written - the capture did not run."
 }
 
-# Event logs around the attempt.
-# These channels record PROBLEMS, not successes - on a healthy mount they are
-# legitimately empty. Say so in the file, so an empty result reads as a finding
-# instead of a broken script.
-$since = (Get-Date).AddMinutes(-5)
-function Save-Log([string]$LogName, [string]$File, [string[]]$Props) {
-    $ev = Get-WinEvent -FilterHashtable @{LogName=$LogName; StartTime=$since} -ErrorAction SilentlyContinue
-    $path = Join-Path $out $File
+function Save-Log([string]$Out, [string]$LogName, [string]$File, [string[]]$Props) {
+    $since = (Get-Date).AddMinutes(-15)
+    $ev = Get-WinEvent -FilterHashtable @{LogName = $LogName; StartTime = $since} -ErrorAction SilentlyContinue
+    $path = Join-Path $Out $File
     if ($ev) {
         $ev | Format-List $Props | Out-File $path -Encoding utf8
         Write-Host ("  {0,-46} {1} event(s)" -f $LogName, @($ev).Count)
     } else {
-        "No events in $LogName between $since and $(Get-Date)." | Out-File $path -Encoding utf8
-        "" | Out-File $path -Encoding utf8 -Append
-        "This is EXPECTED for a healthy mount: these channels log failures and" |
-            Out-File $path -Encoding utf8 -Append
-        "notable conditions, not successful operations. Compare against a run" |
-            Out-File $path -Encoding utf8 -Append
-        "captured while the mount is FAILING - that is where the entries appear." |
-            Out-File $path -Encoding utf8 -Append
+        @(
+            "No events in $LogName in the last 15 minutes."
+            ''
+            'This is EXPECTED for a healthy mount: these channels log failures and'
+            'notable conditions, not successful operations. Capture again while the'
+            'mount is FAILING - that is where the entries appear.'
+        ) | Out-File $path -Encoding utf8
         Write-Host ("  {0,-46} (no events - normal when healthy)" -f $LogName)
     }
 }
-Write-Host 'Event logs:'
-Save-Log 'Microsoft-Windows-Kerberos/Operational'   'kerberos-log.txt'   @('TimeCreated','Id','LevelDisplayName','Message')
-Save-Log 'Microsoft-Windows-SMBClient/Operational'  'smbclient-log.txt'  @('TimeCreated','Id','Message')
-Save-Log 'Microsoft-Windows-SMBClient/Connectivity' 'smbclient-connectivity.txt' @('TimeCreated','Id','Message')
 
-# Always-useful state that does NOT depend on anything having gone wrong:
-# negotiated dialect, encryption and signing for the live connection.
-Get-SmbConnection | Format-List * | Out-File "$out\smb-connection.txt" -Encoding utf8
-Get-SmbClientConfiguration | Format-List * | Out-File "$out\smb-client-config.txt" -Encoding utf8
+function Save-EventLogs([string]$Out) {
+    Write-Host 'Event logs:'
+    Save-Log $Out 'Microsoft-Windows-Kerberos/Operational'   'kerberos-log.txt'   @('TimeCreated','Id','LevelDisplayName','Message')
+    Save-Log $Out 'Microsoft-Windows-SMBClient/Operational'  'smbclient-log.txt'  @('TimeCreated','Id','Message')
+    Save-Log $Out 'Microsoft-Windows-SMBClient/Connectivity' 'smbclient-connectivity.txt' @('TimeCreated','Id','Message')
+}
 
-Write-Host ''
-Write-Host "Done. Open $out" -ForegroundColor Green
-Write-Host 'Wireshark filter to start with:  kerberos || smb2'
+# The mount itself, plus the state that only exists in THIS logon session.
+function Invoke-MountAttempt([string]$Out) {
+    $fqdn = "$StorageAccount.file.core.windows.net"
+    # A dead mapping can hold the drive letter while 'net use' lists nothing,
+    # which surfaces as "System error 85 - the local device name is already in
+    # use". Clear both the letter and the UNC path before trying.
+    net use "${DriveLetter}:" /delete /y 2>$null | Out-Null
+    net use "\\$fqdn\$Share" /delete /y 2>$null | Out-Null
+    Remove-SmbMapping -LocalPath "${DriveLetter}:" -Force -ErrorAction SilentlyContinue
+    klist purge | Out-Null
+    klist > "$Out\klist-before.txt"
+
+    Write-Host 'Attempting the mount...'
+    # /persistent:no - a remembered mapping outlives the lab and keeps the
+    # drive letter reserved, which later shows up as "System error 85".
+    $mount = cmd /c "net use ${DriveLetter}: \\$fqdn\$Share /persistent:no 2>&1"
+    $mount | Out-File "$Out\mount-result.txt" -Encoding utf8
+    Write-Host ($mount -join "`n")
+
+    Start-Sleep -Seconds 2
+    klist > "$Out\klist-after.txt"
+    Save-SmbState $Out
+}
+
+# Get-SmbConnection needs an ELEVATED token - a standard user (even one who is a
+# local admin) gets "Access is denied". Rather than fail the whole reproduce
+# step, note it and let -StopTrace pick it up from the elevated window.
+function Save-SmbState([string]$Out) {
+    try {
+        Get-SmbConnection -ErrorAction Stop | Format-List * |
+            Out-File "$Out\smb-connection.txt" -Encoding utf8
+    } catch {
+        @(
+            'Get-SmbConnection was not available in this session:'
+            "  $($_.Exception.Message)"
+            ''
+            'This cmdlet requires an ELEVATED window. -StopTrace collects it.'
+        ) | Out-File "$Out\smb-connection.txt" -Encoding utf8
+    }
+    try {
+        Get-SmbClientConfiguration -ErrorAction Stop | Format-List * |
+            Out-File "$Out\smb-client-config.txt" -Encoding utf8
+    } catch {
+        "Get-SmbClientConfiguration failed: $($_.Exception.Message)" |
+            Out-File "$Out\smb-client-config.txt" -Encoding utf8
+    }
+}
+
+switch ($PSCmdlet.ParameterSetName) {
+
+    'Start' {
+        Assert-Admin 'Starting a network trace'
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $out = Join-Path $root $stamp
+        New-Item -ItemType Directory -Path $out -Force | Out-Null
+        # Let the non-elevated session write its half of the evidence here.
+        icacls $out /grant "*S-1-5-32-545:(OI)(CI)M" 2>&1 | Out-Null
+        Set-Content -Path $pointer -Value $out -Encoding ascii
+
+        if (-not (Start-Capture $out)) { exit 1 }
+        Write-Host ''
+        Write-Host "Trace running. Evidence folder: $out" -ForegroundColor Cyan
+        Write-Host ''
+        Write-Host 'NOW, in your NORMAL (non-elevated) PowerShell window:' -ForegroundColor Yellow
+        Write-Host "    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $StorageAccount" -ForegroundColor White
+        Write-Host ''
+        Write-Host 'Then come back here and run:' -ForegroundColor Yellow
+        Write-Host '    C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace' -ForegroundColor White
+    }
+
+    'Reproduce' {
+        if (Test-Admin) {
+            Write-Warning 'You are in an ELEVATED window - that is the wrong one for this step.'
+            Write-Host 'The point of -Reproduce is to mount in the affected user''s own session,' -ForegroundColor Yellow
+            Write-Host 'which has its own ticket cache and drive letters. Use a normal window.'   -ForegroundColor Yellow
+            Write-Host ''
+        }
+        $out = Get-CurrentRun
+        Write-Host "Reproducing as $env:USERDOMAIN\$env:USERNAME -> $out" -ForegroundColor Cyan
+        Invoke-MountAttempt $out
+        Write-Host ''
+        Write-Host 'Done. Back in the ELEVATED window run:' -ForegroundColor Yellow
+        Write-Host '    C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace' -ForegroundColor White
+    }
+
+    'Stop' {
+        Assert-Admin 'Stopping the network trace'
+        $out = Get-CurrentRun
+        Stop-Capture $out
+        Save-EventLogs $out
+        # Elevated here, so this succeeds even if -Reproduce could not run it.
+        Save-SmbState $out
+        Remove-Item $pointer -ErrorAction SilentlyContinue
+        Write-Host ''
+        Write-Host "Done. Open $out" -ForegroundColor Green
+        Write-Host 'Wireshark filter to start with:  kerberos || smb2'
+    }
+
+    'All' {
+        Assert-Admin 'Capturing a network trace'
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $out = Join-Path $root $stamp
+        New-Item -ItemType Directory -Path $out -Force | Out-Null
+        Write-Host "Collecting evidence -> $out" -ForegroundColor Cyan
+        Write-Host 'Note: the mount happens in THIS elevated session. To capture the' -ForegroundColor DarkGray
+        Write-Host 'user session instead, use -StartTrace / -Reproduce / -StopTrace.'  -ForegroundColor DarkGray
+
+        $ok = Start-Capture $out
+        Invoke-MountAttempt $out
+        if ($ok) { Stop-Capture $out }
+        Save-EventLogs $out
+        Write-Host ''
+        Write-Host "Done. Open $out" -ForegroundColor Green
+        Write-Host 'Wireshark filter to start with:  kerberos || smb2'
+    }
+}
 '@
 Set-Content -Path "$toolDir\Get-KerberosEvidence.ps1" -Value $helper -Encoding UTF8
 Write-Output 'Get-KerberosEvidence.ps1 placed in C:\LabTools'

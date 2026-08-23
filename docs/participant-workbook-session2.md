@@ -74,9 +74,8 @@ Beyond your Session 1 subscription:
 - **Global Administrator** on a dev/trial Entra tenant (not corporate prod).
   Least-privilege alternative: **Hybrid Identity Administrator** (Cloud Sync) +
   **Cloud Application Administrator** (admin consent).
-- Where you run the Azure/Graph commands:
-  - **Azure Cloud Shell (easiest):** Az and Microsoft.Graph preinstalled.
-  - **Local PowerShell 7+:** `Install-Module Az, Microsoft.Graph -Scope CurrentUser`.
+- **Azure Cloud Shell** for every Azure/Graph command — Az and Microsoft.Graph
+  are preinstalled and you are already signed in (no `Connect-AzAccount`).
 - An **RDP client** on your Azure VPN for the in-VM steps.
 - **No restrictive App Management Policy in the tenant.** Enabling Entra Kerberos
   adds a symmetric key to an auto-created app; a tenant policy blocking
@@ -100,7 +99,6 @@ Beyond your Session 1 subscription:
 ```powershell
 git clone https://github.com/kmin1223/azfiles-lab.git   # if you don't have it
 cd azfiles-lab/session1-adds
-Connect-AzAccount
 ./deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 ```
 

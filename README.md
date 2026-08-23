@@ -78,30 +78,21 @@ so refreshing later is just `gh release upload tools-v1 labtools-modules.zip --c
   needed for admin consent and Cloud Sync. A personal dev tenant
   (e.g., via the M365 developer program or a new trial) is strongly
   recommended over a corporate tenant.
-- Where to run the deploy/fault commands — two options (quick-start below has
-  a section for each):
-  - **Azure Cloud Shell (recommended):** nothing to install (Az + Microsoft.Graph
-    preinstalled), already signed in, no execution-policy / unblock friction.
-    Commands use forward slashes (`./deploy.ps1`).
-  - **Local Windows PowerShell:** run `Install-Module Az, Microsoft.Graph -Scope CurrentUser`
-    once; commands use back slashes (`.\deploy.ps1`).
-- RDP client (required either way — the in-VM klist/mount steps aren't a shell
-  task).
+- **Azure Cloud Shell** — the one supported place to run the deploy and fault
+  commands. Nothing to install (Az + Microsoft.Graph preinstalled), already
+  signed in, no execution-policy or unblock friction.
+- RDP client — the in-VM klist/mount steps aren't a shell task.
 - **Plain ARM template** — nothing extra to install.
 
-> The scripts themselves are cross-platform (nested `Join-Path`), so they run
-> unchanged on Windows PowerShell 5.1 and on Cloud Shell (PowerShell 7 / Linux).
-> The only difference is the path separator you type: `./` vs `.\`.
+> Run everything from Cloud Shell. The scripts are cross-platform, but the docs
+> assume Cloud Shell throughout: forward-slash paths (`./deploy.ps1`) and no
+> `Connect-AzAccount` (you are already signed in).
 
 ## Session 1 quick start (attendees)
 
-Pick the row that matches where you're running. Everything after the deploy
-command is identical.
-
-### Option A — Azure Cloud Shell (recommended)
-
 Open Cloud Shell (PowerShell) at <https://portal.azure.com> → the `>_` icon.
-You're already signed in, and Az/Microsoft.Graph are preinstalled — no setup.
+You're already signed in, and Az/Microsoft.Graph are preinstalled — no setup,
+no `Connect-AzAccount`.
 
 ```powershell
 git clone https://github.com/kmin1223/azfiles-lab.git
@@ -111,22 +102,6 @@ cd azfiles-lab/session1-adds
 
 *(Multiple subscriptions? Run `Set-AzContext -Subscription "<name-or-id>"`
 before deploy.)*
-
-### Option B — Local Windows PowerShell
-
-```powershell
-# one-time per window: clear the internet "block" flag and allow unsigned scripts
-Get-ChildItem -Path .\ -Recurse | Unblock-File
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-
-Connect-AzAccount
-cd session1-adds
-.\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
-```
-
-> Local-Windows-only snags: a **"file cannot be opened / SmartScreen"** block is
-> fixed by the `Unblock-File` line; **"running scripts is disabled"** by the
-> `Set-ExecutionPolicy` line. Keep the same window open for the fault labs.
 
 The deploy is fully automated from here: forest promotion, lab users
 (`labuser1`/`labuser2`), client domain join, storage account domain join
@@ -162,27 +137,13 @@ same `-ResourceGroupName` — the steps are re-runnable and skip completed work.
 Session 2 reuses the Session 1 environment, so **redeploy Session 1 first** if
 you tore it down (see the pre-session announcement you received).
 
-### Option A — Azure Cloud Shell
-
 ```powershell
 cd azfiles-lab/session2-entra-kerberos
 ./setup.ps1 -ResourceGroupName azfiles-lab
 # then follow MANUAL-STEP-cloud-sync.md (~10 min, Global Admin in browser)
 ```
 
-### Option B — Local Windows PowerShell
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-Connect-AzAccount
-cd session2-entra-kerberos
-.\setup.ps1 -ResourceGroupName azfiles-lab
-# then follow MANUAL-STEP-cloud-sync.md (~10 min, Global Admin in browser)
-```
-
 ## Break/fix (presenter-driven, everyone follows along)
-
-Cloud Shell uses `./faults/...`; local Windows uses `.\faults\...`.
 
 ```powershell
 # Session 1  (from the session1-adds folder)
@@ -209,7 +170,7 @@ symptom → diagnosis → fix catalog.
 ## Cleanup (after Session 2)
 
 ```powershell
-.\cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra
+./cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra
 ```
 
 Then delete the Cloud Sync configuration + provisioning agent in the Entra
