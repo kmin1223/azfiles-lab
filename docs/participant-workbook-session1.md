@@ -122,7 +122,7 @@ in the AES-256 migration lab you will regress it to RC4 and back. Open
 `Z:\` — you'll see `hello-from-setup.txt`, and you can create a file:
 
 ```
-echo hello > Z:\%username%.txt
+echo hello > "Z:\$($env:USERNAME).txt"
 ```
 
 **Why:** your logon already got you a Kerberos TGT; mounting the share just adds
@@ -210,7 +210,13 @@ flips to a failure.
 
 Before you break anything, capture what a **working** mount looks like on the
 wire. Every later capture is a diff against this one. In an **elevated**
-PowerShell on the Client VM:
+PowerShell on the Client VM — `labuser1` is a local admin here, so elevation is
+a single **Yes** on the UAC prompt:
+
+> **If UAC asks for a password, close it and start again.** Elevating with
+> `labadmin` runs the collector in a *different logon session*, which has its own
+> Kerberos ticket cache — it would purge and capture the wrong user's tickets.
+> Elevation must stay `labuser1`.
 
 ```powershell
 C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
@@ -219,6 +225,16 @@ C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
 It purges tickets, starts a network trace, performs the mount, stops the trace,
 converts it to `.pcapng`, and collects the Kerberos/SMBClient logs into
 `C:\LabTools\evidence\<timestamp>\`.
+
+> **`kerberos-log.txt` and `smbclient-log.txt` will be empty right now — that is
+> correct.** Those channels record *problems*, not successful operations. Keep
+> the empty baseline: when you run the collector again during a failure, the
+> contrast is the evidence. (The files say so in plain text rather than being
+> zero bytes, so you can tell "nothing happened" from "the script broke".)
+>
+> `smb-connection.txt` and `smb-client-config.txt`, on the other hand, are always
+> populated — negotiated dialect, encryption cipher and signing for the live
+> connection. `smb-client-config.txt` is what you'll compare in Lab 3.
 
 Open `trace.pcapng` in Wireshark (or copy it off the VM) and filter:
 

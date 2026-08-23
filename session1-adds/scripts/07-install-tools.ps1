@@ -256,13 +256,34 @@ $helper = @'
       klist-before/after.txt     ticket cache either side of the mount
       mount-result.txt           the actual net use output/error
       kerberos-log.txt           Microsoft-Windows-Kerberos/Operational
-      smbclient-log.txt          SMBClient Operational + Connectivity
+      smbclient-log.txt          SMBClient/Operational
+      smbclient-connectivity.txt SMBClient/Connectivity
+      smb-connection.txt         negotiated dialect / encryption / signing
+      smb-client-config.txt      client SMB settings (cipher order, etc.)
+
+  The two event-log files are EMPTY when the mount succeeds - those channels
+  record problems, not successes. Run this again while a fault is injected and
+  they fill up. Must be run ELEVATED (netsh trace).
 #>
 param(
     [Parameter(Mandatory)][string]$StorageAccount,
     [string]$Share = 'labshare',
     [string]$DriveLetter = 'Z'
 )
+# netsh trace needs elevation. Without this check the trace silently does
+# nothing, the script still prints "pcapng ready", and you find out only when
+# Wireshark opens an empty file - during the lab, with no time to redo it.
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host ''
+    Write-Warning 'This must run ELEVATED - netsh trace cannot capture otherwise.'
+    Write-Host 'Close this window, right-click PowerShell -> Run as administrator,' -ForegroundColor Yellow
+    Write-Host 'and answer YES on the UAC prompt (do NOT enter labadmin credentials:' -ForegroundColor Yellow
+    Write-Host ' that starts a different logon session with a different ticket cache).' -ForegroundColor Yellow
+    exit 1
+}
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = "C:\LabTools\evidence\$stamp"
 New-Item -ItemType Directory -Path $out -Force | Out-Null
@@ -275,7 +296,14 @@ klist purge | Out-Null
 klist > "$out\klist-before.txt"
 
 Write-Host 'Starting network trace...'
-netsh trace start capture=yes overwrite=yes maxsize=512 tracefile="$out\trace.etl" | Out-Null
+# Stop a trace left running by an earlier attempt, then start ours and CHECK it.
+netsh trace stop 2>&1 | Out-Null
+$startOut = netsh trace start capture=yes overwrite=yes maxsize=512 tracefile="$out\trace.etl" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "netsh trace failed to start - continuing without a capture:"
+    Write-Host ($startOut -join "`n") -ForegroundColor DarkYellow
+    $traceOk = $false
+} else { $traceOk = $true }
 
 Write-Host 'Attempting the mount...'
 $mount = cmd /c "net use ${DriveLetter}: \\$fqdn\$Share 2>&1"
@@ -283,23 +311,58 @@ $mount | Out-File "$out\mount-result.txt" -Encoding utf8
 Write-Host ($mount -join "`n")
 
 Start-Sleep -Seconds 2
-Write-Host 'Stopping trace (takes ~30s)...'
-netsh trace stop | Out-Null
+if ($traceOk) {
+    Write-Host 'Stopping trace (takes ~30s)...'
+    netsh trace stop | Out-Null
+}
 
 klist > "$out\klist-after.txt"
 
-# Convert for Wireshark if the tool is present
-if (Test-Path 'C:\LabTools\etl2pcapng.exe') {
+# Convert for Wireshark - and only claim success if there is really a file.
+if ($traceOk -and (Test-Path "$out\trace.etl") -and (Test-Path 'C:\LabTools\etl2pcapng.exe')) {
     & 'C:\LabTools\etl2pcapng.exe' "$out\trace.etl" "$out\trace.pcapng" | Out-Null
-    Write-Host "pcapng ready: $out\trace.pcapng"
+    $pcap = Get-Item "$out\trace.pcapng" -ErrorAction SilentlyContinue
+    if ($pcap -and $pcap.Length -gt 0) {
+        Write-Host ("pcapng ready: {0} ({1:N0} KB)" -f $pcap.FullName, ($pcap.Length / 1KB)) -ForegroundColor Green
+    } else {
+        Write-Warning "Conversion produced an empty file - check that $out\trace.etl has data."
+    }
+} elseif ($traceOk) {
+    Write-Warning "No trace.etl was written - the capture did not run."
 }
 
-# Event logs around the attempt
+# Event logs around the attempt.
+# These channels record PROBLEMS, not successes - on a healthy mount they are
+# legitimately empty. Say so in the file, so an empty result reads as a finding
+# instead of a broken script.
 $since = (Get-Date).AddMinutes(-5)
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Kerberos/Operational'; StartTime=$since} -ErrorAction SilentlyContinue |
-    Format-List TimeCreated, Id, LevelDisplayName, Message | Out-File "$out\kerberos-log.txt" -Encoding utf8
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-SMBClient/Operational'; StartTime=$since} -ErrorAction SilentlyContinue |
-    Format-List TimeCreated, Id, Message | Out-File "$out\smbclient-log.txt" -Encoding utf8
+function Save-Log([string]$LogName, [string]$File, [string[]]$Props) {
+    $ev = Get-WinEvent -FilterHashtable @{LogName=$LogName; StartTime=$since} -ErrorAction SilentlyContinue
+    $path = Join-Path $out $File
+    if ($ev) {
+        $ev | Format-List $Props | Out-File $path -Encoding utf8
+        Write-Host ("  {0,-46} {1} event(s)" -f $LogName, @($ev).Count)
+    } else {
+        "No events in $LogName between $since and $(Get-Date)." | Out-File $path -Encoding utf8
+        "" | Out-File $path -Encoding utf8 -Append
+        "This is EXPECTED for a healthy mount: these channels log failures and" |
+            Out-File $path -Encoding utf8 -Append
+        "notable conditions, not successful operations. Compare against a run" |
+            Out-File $path -Encoding utf8 -Append
+        "captured while the mount is FAILING - that is where the entries appear." |
+            Out-File $path -Encoding utf8 -Append
+        Write-Host ("  {0,-46} (no events - normal when healthy)" -f $LogName)
+    }
+}
+Write-Host 'Event logs:'
+Save-Log 'Microsoft-Windows-Kerberos/Operational'   'kerberos-log.txt'   @('TimeCreated','Id','LevelDisplayName','Message')
+Save-Log 'Microsoft-Windows-SMBClient/Operational'  'smbclient-log.txt'  @('TimeCreated','Id','Message')
+Save-Log 'Microsoft-Windows-SMBClient/Connectivity' 'smbclient-connectivity.txt' @('TimeCreated','Id','Message')
+
+# Always-useful state that does NOT depend on anything having gone wrong:
+# negotiated dialect, encryption and signing for the live connection.
+Get-SmbConnection | Format-List * | Out-File "$out\smb-connection.txt" -Encoding utf8
+Get-SmbClientConfiguration | Format-List * | Out-File "$out\smb-client-config.txt" -Encoding utf8
 
 Write-Host ''
 Write-Host "Done. Open $out" -ForegroundColor Green
