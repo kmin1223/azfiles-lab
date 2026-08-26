@@ -9,7 +9,7 @@ Why it's needed: **this lab uses the hybrid identity scenario** — AD users
 synced to Entra ID, which is the GA path for Entra Kerberos. `labuser1` and
 `labuser2` exist only in the on-prem AD until you sync them.
 
-> Cloud-only (Entra-only) identities are **also supported, in preview** — a
+> Cloud-only (Entra-only) identities are **also supported, GA since May 2026** — a
 > separate enablement path (feature flag + admin consent) that needs no AD DS
 > at all. It's out of scope for this lab but worth knowing when a customer has
 > no on-prem footprint. See the Azure blog post "Azure Files Entra-Only

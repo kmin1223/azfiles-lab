@@ -86,11 +86,20 @@ Beyond your Session 1 subscription:
   at <https://aka.ms/app-mgmt-policy-ux>.
 
 > **Scope note — cloud-only identities.** This lab uses **hybrid** identities
-> (AD users synced to Entra), the GA path. Entra Kerberos *also* supports
-> **cloud-only (Entra-only)** identities in **preview** — a separate enablement
-> path with no AD DS at all. Out of scope here, but know it exists: a customer
-> with no on-prem AD is not automatically unsupported. (Azure blog: "Azure Files
-> Entra-Only identities.")
+> (AD users synced to Entra), because that is what our lab environment has.
+> **Cloud-only (Entra-only) identities went GA in May 2026** — a separate
+> enablement path with no AD DS anywhere, and no domain controller needed for
+> authentication *or* authorization. Two things to carry out of here:
+>
+> - a customer with no on-prem AD is **fully supported**, not a workaround case;
+> - the client OS bar is **higher** there — Windows 11 Enterprise/Pro or
+>   **Windows Server 2025**. Windows 10 and Windows Server 2022 are fine for
+>   hybrid identities but **not** for cloud-only ones.
+>
+> Share-level RBAC for cloud-only identities was still rolling out by region at
+> GA, so confirm the customer's region against the current enablement doc rather
+> than assuming. Our internal hybrid-flow TSG has not caught up and still reads
+> "cloud-only identities are not currently supported" — do not quote it.
 
 ---
 
