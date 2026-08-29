@@ -568,6 +568,22 @@ $summary | Out-File -FilePath $infoFile -Encoding utf8
 Write-Host "`n$summary" -ForegroundColor Green
 Write-Host "Saved to: $infoFile" -ForegroundColor Yellow
 
+# Every lab command, with THIS deployment's storage account, IPs and domain
+# already substituted - so nobody has to hand-replace <sa> during the session.
+# Written to disk as well, because Cloud Shell drops idle sessions.
+$cmdFile = Join-Path $LogPath "lab-commands-$stamp.txt"
+try {
+    & (Join-Path $scriptRoot 'Get-LabCommands.ps1') -ResourceGroupName $ResourceGroupName `
+        -Prefix $Prefix -OutFile $cmdFile | Out-Null
+    Write-Host ''
+    Write-Host " Lab commands (real account name filled in): $cmdFile" -ForegroundColor Cyan
+    Write-Host "   view:  Get-Content $cmdFile" -ForegroundColor DarkGray
+    Write-Host "   again: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor DarkGray
+} catch {
+    Write-Warning "Could not generate the lab-command sheet: $($_.Exception.Message)"
+    Write-Host "  Run it yourself: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor DarkGray
+}
+
 # --------------- POST-DEPLOY: diagnostic tooling (off the critical path)
 # This step burned two deployments by sitting in the middle of the run: the
 # PowerShell Gallery fallback can take 20-30+ minutes on a B-series VM, and a
