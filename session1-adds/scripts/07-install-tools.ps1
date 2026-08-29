@@ -264,23 +264,31 @@ $helper = @'
 
         Get-KerberosEvidence.ps1 -StorageAccount <sa>
 
+  3) Re-read a capture you already have (no admin, any machine):
+
+        Get-KerberosEvidence.ps1 -Analyze                 newest run
+        Get-KerberosEvidence.ps1 -Analyze -Path <folder>  a specific one
+
      The identity is still the same domain user, so the Kerberos evidence is
      faithful - but the mount lands in the elevated logon session, which has its
      own ticket cache and drive letters.
 
   OUTPUT  ->  C:\LabTools\evidence\<timestamp>\
       trace.etl / trace.pcapng    network capture of the whole attempt
+      trace-summary.txt           the capture as readable text (needs tshark)
       klist-before/after.txt      ticket cache either side of the mount
       mount-result.txt            the actual net use output/error
       kerberos-log.txt            Microsoft-Windows-Kerberos/Operational
       smbclient-log.txt           SMBClient/Operational
       smbclient-connectivity.txt  SMBClient/Connectivity
+      smbclient-security.txt      SMBClient/Security
       smb-connection.txt          negotiated dialect / encryption / signing
       smb-client-config.txt       client SMB settings (cipher order, etc.)
 
-  The two event-log files are EMPTY when the mount succeeds - those channels
-  record problems, not successes. Run this again while a fault is injected and
-  they fill up.
+  Do not expect the event logs to explain everything. They record what the
+  CLIENT noticed, and a service-side rejection (error 1396) is invisible to it:
+  the client's Kerberos stack did nothing wrong. When they are quiet, read
+  klist, the DC's 4769 and the trace instead. Each file says so at the top.
 #>
 [CmdletBinding(DefaultParameterSetName = 'All')]
 param(
@@ -291,6 +299,8 @@ param(
     [Parameter(ParameterSetName = 'Start', Mandatory)][switch]$StartTrace,
     [Parameter(ParameterSetName = 'Reproduce', Mandatory)][switch]$Reproduce,
     [Parameter(ParameterSetName = 'Stop', Mandatory)][switch]$StopTrace,
+    [Parameter(ParameterSetName = 'Analyze', Mandatory)][switch]$Analyze,
+    [Parameter(ParameterSetName = 'Analyze')][string]$Path,
 
     [string]$Share = 'labshare',
     [string]$DriveLetter = 'Z'
@@ -298,6 +308,15 @@ param(
 
 $root    = 'C:\LabTools\evidence'
 $pointer = Join-Path $root '.current-run.txt'
+
+# Every command this collector runs is echoed BEFORE it runs, so you can see
+# exactly what produced each file - and reuse the commands by hand on a case.
+function Show-Cmd([string]$Command) {
+    Write-Host ''
+    Write-Host '  .-- running' -ForegroundColor DarkCyan
+    $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  | $_" -ForegroundColor Gray }
+    Write-Host "  '--" -ForegroundColor DarkCyan
+}
 
 function Test-Admin {
     ([Security.Principal.WindowsPrincipal] `
@@ -330,6 +349,11 @@ function Get-CurrentRun {
 
 function Start-Capture([string]$Out) {
     # Clear a trace left running by an earlier attempt, then start and VERIFY.
+    Show-Cmd @"
+netsh trace stop                                    # clear anything left running
+netsh trace start capture=yes overwrite=yes maxsize=512 ``
+      tracefile="$Out\trace.etl"
+"@
     netsh trace stop 2>&1 | Out-Null
     $started = netsh trace start capture=yes overwrite=yes maxsize=512 tracefile="$Out\trace.etl" 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -342,6 +366,10 @@ function Start-Capture([string]$Out) {
 
 function Stop-Capture([string]$Out) {
     Write-Host 'Stopping trace (takes ~30s)...'
+    Show-Cmd @"
+netsh trace stop
+etl2pcapng.exe "$Out\trace.etl" "$Out\trace.pcapng"   # for Wireshark
+"@
     netsh trace stop | Out-Null
     if ((Test-Path "$Out\trace.etl") -and (Test-Path 'C:\LabTools\etl2pcapng.exe')) {
         & 'C:\LabTools\etl2pcapng.exe' "$Out\trace.etl" "$Out\trace.pcapng" | Out-Null
@@ -356,30 +384,178 @@ function Stop-Capture([string]$Out) {
     }
 }
 
+# Events that are routine against Azure Files and say nothing about a failure.
+# Without this note a screenful of them looks like a lead.
+$benign = @{
+    30904 = 'SMB Multichannel not offered by the server - normal for Azure Files'
+    30800 = 'share reconnected - routine'
+}
+
 function Save-Log([string]$Out, [string]$LogName, [string]$File, [string[]]$Props) {
     $since = (Get-Date).AddMinutes(-15)
     $ev = Get-WinEvent -FilterHashtable @{LogName = $LogName; StartTime = $since} -ErrorAction SilentlyContinue
     $path = Join-Path $Out $File
     if ($ev) {
-        $ev | Format-List $Props | Out-File $path -Encoding utf8
-        Write-Host ("  {0,-46} {1} event(s)" -f $LogName, @($ev).Count)
+        $ids = $ev | Group-Object Id | Sort-Object Count -Descending
+        $summary = ($ids | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
+        $interesting = @($ev | Where-Object { -not $benign.ContainsKey([int]$_.Id) })
+
+        $head = @("$LogName - $(@($ev).Count) event(s) since $since", "Event IDs: $summary", '')
+        foreach ($g in $ids) {
+            if ($benign.ContainsKey([int]$g.Name)) {
+                $head += "  $($g.Name) x$($g.Count)   BENIGN - $($benign[[int]$g.Name])"
+            }
+        }
+        if (-not $interesting.Count) {
+            $head += @('', 'NOTHING HERE IS ABOUT YOUR FAILURE - every event above is routine noise.')
+        }
+        $head += @('', ('-' * 70), '')
+        $head | Out-File $path -Encoding utf8
+        $ev | Format-List $Props | Out-File $path -Encoding utf8 -Append
+
+        $note = if ($interesting.Count) { "$($interesting.Count) worth reading" } else { 'all routine noise' }
+        Write-Host ("  {0,-44} {1,3} event(s)  {2,-16} {3}" -f $LogName, @($ev).Count, $summary, $note)
     } else {
         @(
             "No events in $LogName in the last 15 minutes."
             ''
-            'This is EXPECTED for a healthy mount: these channels log failures and'
-            'notable conditions, not successful operations. Capture again while the'
-            'mount is FAILING - that is where the entries appear.'
+            'Empty does NOT mean the mount was healthy. These channels record what the'
+            'CLIENT stack noticed, and some failures are invisible to it. Error 1396 is'
+            'the clearest example: the DC issued a perfectly good ticket and the client'
+            'sent a perfectly good AP-REQ, so the client Kerberos stack saw no error at'
+            'all. The rejection came back inside the SMB Session Setup, from the service.'
+            ''
+            'When these logs are quiet, the evidence is elsewhere:'
+            '  klist          was a ticket issued, and with which etype?'
+            '  DC event 4769  did the KDC succeed?'
+            '  trace.pcapng   the Session Setup failure and the real KRB error'
         ) | Out-File $path -Encoding utf8
-        Write-Host ("  {0,-46} (no events - normal when healthy)" -f $LogName)
+        Write-Host ("  {0,-44} (no events)" -f $LogName)
+    }
+}
+
+# Turn the capture into something readable without opening Wireshark. We ask
+# tshark for PROTOCOL FIELDS rather than its Info column: the column text drifts
+# between versions, the field names do not.
+$krbMsg = @{ 10 = 'AS-REQ'; 11 = 'AS-REP'; 12 = 'TGS-REQ'; 13 = 'TGS-REP'
+             14 = 'AP-REQ'; 15 = 'AP-REP'; 30 = 'KRB-ERROR' }
+$krbErr = @{ 6 = 'C_PRINCIPAL_UNKNOWN'; 7 = 'S_PRINCIPAL_UNKNOWN'; 14 = 'ETYPE_NOSUPP'
+             25 = 'PREAUTH_REQUIRED'; 37 = 'AP_ERR_SKEW'; 41 = 'AP_ERR_MODIFIED' }
+$smbCmd = @{ 0 = 'Negotiate'; 1 = 'Session Setup'; 2 = 'Logoff'; 3 = 'Tree Connect'
+             4 = 'Tree Disconnect'; 5 = 'Create'; 8 = 'Read'; 9 = 'Write'; 14 = 'Query Directory' }
+
+function Get-Tshark {
+    $c = Get-Command tshark -ErrorAction SilentlyContinue
+    if ($c) { return $c.Source }
+    foreach ($p in @("$env:ProgramFiles\Wireshark\tshark.exe",
+                     "${env:ProgramFiles(x86)}\Wireshark\tshark.exe")) {
+        if (Test-Path $p) { return $p }
+    }
+    $null
+}
+
+function Show-TraceSummary([string]$Out) {
+    $pcap = Join-Path $Out 'trace.pcapng'
+    $path = Join-Path $Out 'trace-summary.txt'
+    if (-not (Test-Path $pcap)) { return }
+
+    $tshark = Get-Tshark
+    if (-not $tshark) {
+        @(
+            'tshark was not found, so the capture was not summarised here.'
+            ''
+            'trace.pcapng is complete - open it on any machine that has Wireshark,'
+            'or install Wireshark (tshark ships with it) and run:'
+            '    C:\LabTools\Get-KerberosEvidence.ps1 -Analyze'
+            ''
+            'Wireshark display filter to start with:   kerberos || smb2'
+        ) | Out-File $path -Encoding utf8
+        Write-Host '  trace summary : skipped (tshark not installed - see trace-summary.txt)' -ForegroundColor DarkYellow
+        return
+    }
+
+    Show-Cmd @"
+tshark -r trace.pcapng -Y "kerberos || smb2" -T fields ``
+    -e frame.number -e frame.time_relative -e ip.dst ``
+    -e kerberos.msg_type -e kerberos.error_code ``
+    -e smb2.cmd -e smb2.flags.response -e smb2.nt_status
+"@
+    $raw = & $tshark -r $pcap -Y 'kerberos || smb2' -T fields `
+        -e frame.number -e frame.time_relative -e ip.dst `
+        -e kerberos.msg_type -e kerberos.error_code `
+        -e smb2.cmd -e smb2.flags.response -e smb2.nt_status `
+        -E 'separator=|' 2>$null
+
+    $lines = @(); $sawTgsRep = $false; $ssFailure = $null; $krbError = $null
+    foreach ($r in $raw) {
+        $f = $r -split '\|'
+        if ($f.Count -lt 8) { continue }
+        $num, $t, $dst, $kmsg, $kerr, $scmd, $sresp, $sstat = $f[0..7]
+        # a frame can carry several messages; take the first of each field
+        $kmsg = ($kmsg -split ',')[0]; $kerr = ($kerr -split ',')[0]
+        $scmd = ($scmd -split ',')[0]; $sresp = ($sresp -split ',')[0]; $sstat = ($sstat -split ',')[0]
+
+        if ($kmsg) {
+            $name = if ($krbMsg.ContainsKey([int]$kmsg)) { $krbMsg[[int]$kmsg] } else { "krb($kmsg)" }
+            $detail = ''
+            if ($kerr) {
+                $en = if ($krbErr.ContainsKey([int]$kerr)) { $krbErr[[int]$kerr] } else { "code $kerr" }
+                $detail = "  <-- $en"; $krbError = $en
+            }
+            if ($name -eq 'TGS-REP') { $sawTgsRep = $true }
+            $lines += ('{0,6}  {1,8:N3}s  {2,-15} KRB   {3}{4}' -f $num, [double]$t, $dst, $name, $detail)
+        } elseif ($scmd) {
+            $name = if ($smbCmd.ContainsKey([int]$scmd)) { $smbCmd[[int]$scmd] } else { "cmd $scmd" }
+            $dir = if ($sresp -eq '1') { 'resp' } else { 'req ' }
+            $st = ''
+            if ($sresp -eq '1' -and $sstat -and $sstat -ne '0' -and $sstat -ne '0x00000000') {
+                $st = "  <-- STATUS $sstat"
+                if (-not $ssFailure) { $ssFailure = "$name $sstat" }
+            }
+            $lines += ('{0,6}  {1,8:N3}s  {2,-15} SMB2  {3} {4}{5}' -f $num, [double]$t, $dst, $name, $dir, $st)
+        }
+    }
+
+    $verdict = @()
+    if ($sawTgsRep -and $ssFailure) {
+        $verdict += 'READING: a TGS-REP came back (the KDC issued a ticket) and then SMB2'
+        $verdict += "         failed at: $ssFailure"
+        $verdict += '         => the KDC did its job; the SERVICE refused the ticket.'
+        $verdict += '         That is the error-1396 shape. Look at the salt inputs next.'
+    } elseif ($krbError) {
+        $verdict += "READING: the KDC itself returned an error ($krbError)."
+        $verdict += '         No ticket was ever issued - stop looking at the service.'
+    } elseif ($sawTgsRep) {
+        $verdict += 'READING: ticket issued and no SMB2 failure in this capture.'
+    } else {
+        $verdict += 'READING: no TGS-REP in this capture. Either the client never asked'
+        $verdict += '         (cached session / wrong SPN / no path to the DC), or the'
+        $verdict += '         exchange happened outside the capture window.'
+    }
+
+    $out = @("Trace summary - $pcap", ('=' * 78), '',
+             ('{0,6}  {1,9}  {2,-15} {3}' -f 'frame', 'time', 'dest', 'message'),
+             ('-' * 78)) + $lines + @('', ('=' * 78)) + $verdict
+    $out | Out-File $path -Encoding utf8
+    Write-Host ''
+    $out | ForEach-Object {
+        $c = if ($_ -match 'STATUS|<--|READING|=>') { 'Yellow' } else { 'Gray' }
+        Write-Host $_ -ForegroundColor $c
     }
 }
 
 function Save-EventLogs([string]$Out) {
     Write-Host 'Event logs:'
+    Show-Cmd @"
+Get-WinEvent -FilterHashtable @{LogName='<channel>'; StartTime=(Get-Date).AddMinutes(-15)}
+  Microsoft-Windows-Kerberos/Operational
+  Microsoft-Windows-SMBClient/Operational
+  Microsoft-Windows-SMBClient/Connectivity
+"@
     Save-Log $Out 'Microsoft-Windows-Kerberos/Operational'   'kerberos-log.txt'   @('TimeCreated','Id','LevelDisplayName','Message')
     Save-Log $Out 'Microsoft-Windows-SMBClient/Operational'  'smbclient-log.txt'  @('TimeCreated','Id','Message')
     Save-Log $Out 'Microsoft-Windows-SMBClient/Connectivity' 'smbclient-connectivity.txt' @('TimeCreated','Id','Message')
+    Save-Log $Out 'Microsoft-Windows-SMBClient/Security'     'smbclient-security.txt'     @('TimeCreated','Id','Message')
 }
 
 # The mount itself, plus the state that only exists in THIS logon session.
@@ -388,6 +564,15 @@ function Invoke-MountAttempt([string]$Out) {
     # A dead mapping can hold the drive letter while 'net use' lists nothing,
     # which surfaces as "System error 85 - the local device name is already in
     # use". Clear both the letter and the UNC path before trying.
+    Show-Cmd @"
+net use ${DriveLetter}: /delete /y                  # clear the drive letter
+net use \\$fqdn\$Share /delete /y                   # and the UNC connection
+Remove-SmbMapping -LocalPath ${DriveLetter}: -Force  # dead mapping -> System error 85
+klist purge                                         # tickets only; NOT the SMB session
+klist > klist-before.txt
+net use ${DriveLetter}: \\$fqdn\$Share /persistent:no
+klist > klist-after.txt
+"@
     net use "${DriveLetter}:" /delete /y 2>$null | Out-Null
     net use "\\$fqdn\$Share" /delete /y 2>$null | Out-Null
     Remove-SmbMapping -LocalPath "${DriveLetter}:" -Force -ErrorAction SilentlyContinue
@@ -410,6 +595,10 @@ function Invoke-MountAttempt([string]$Out) {
 # local admin) gets "Access is denied". Rather than fail the whole reproduce
 # step, note it and let -StopTrace pick it up from the elevated window.
 function Save-SmbState([string]$Out) {
+    Show-Cmd @"
+Get-SmbConnection          # needs an ELEVATED window
+Get-SmbClientConfiguration # negotiated dialect / encryption / signing
+"@
     try {
         Get-SmbConnection -ErrorAction Stop | Format-List * |
             Out-File "$Out\smb-connection.txt" -Encoding utf8
@@ -467,10 +656,24 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Host '    C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace' -ForegroundColor White
     }
 
+    'Analyze' {
+        # Re-read an existing capture. No admin needed, and it can run on any
+        # machine you copied the folder to.
+        $out = if ($Path) { $Path } else {
+            $d = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+                 Sort-Object Name -Descending | Select-Object -First 1
+            if (-not $d) { Write-Warning "No evidence folders under $root."; exit 1 }
+            $d.FullName
+        }
+        Write-Host "Analysing $out" -ForegroundColor Cyan
+        Show-TraceSummary $out
+    }
+
     'Stop' {
         Assert-Admin 'Stopping the network trace'
         $out = Get-CurrentRun
         Stop-Capture $out
+        Show-TraceSummary $out
         Save-EventLogs $out
         # Elevated here, so this succeeds even if -Reproduce could not run it.
         Save-SmbState $out
@@ -491,7 +694,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
         $ok = Start-Capture $out
         Invoke-MountAttempt $out
-        if ($ok) { Stop-Capture $out }
+        if ($ok) { Stop-Capture $out; Show-TraceSummary $out }
         Save-EventLogs $out
         Write-Host ''
         Write-Host "Done. Open $out" -ForegroundColor Green

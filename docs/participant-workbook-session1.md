@@ -233,15 +233,23 @@ It purges tickets, starts a network trace, performs the mount, stops the trace,
 converts it to `.pcapng`, and collects the Kerberos/SMBClient logs into
 `C:\LabTools\evidence\<timestamp>\`.
 
-> **`kerberos-log.txt` and `smbclient-log.txt` will be empty right now — that is
-> correct.** Those channels record *problems*, not successful operations. Keep
-> the empty baseline: when you run the collector again during a failure, the
-> contrast is the evidence. (The files say so in plain text rather than being
-> zero bytes, so you can tell "nothing happened" from "the script broke".)
+> **The event logs will be quiet — and they stay quiet even when the mount
+> fails.** That surprises people, so learn it here rather than on a case.
+> `Microsoft-Windows-Kerberos/Operational` records what the *client* stack
+> noticed; error 1396 is a **service-side** rejection, so the client saw nothing
+> wrong (it got a good ticket from the DC and sent a good AP-REQ). The refusal
+> arrives inside the SMB Session Setup.
 >
-> `smb-connection.txt` and `smb-client-config.txt`, on the other hand, are always
-> populated — negotiated dialect, encryption cipher and signing for the live
-> connection. `smb-client-config.txt` is what you'll compare in Lab 3.
+> `SMBClient/Operational` will show a pile of event **30904 "server does not
+> support multichannel"** — routine against Azure Files and unrelated to any
+> failure. The collector labels it as benign and tells you how many events are
+> actually worth reading, so a full-looking log doesn't send you chasing it.
+>
+> When the logs are quiet, the evidence is `klist` (was a ticket issued, which
+> etype), the DC's **4769** (did the KDC succeed) and **trace.pcapng** (the
+> Session Setup failure). `smb-connection.txt` and `smb-client-config.txt` are
+> always populated — dialect, cipher, signing — and the latter is what you
+> compare in Lab 3.
 
 Open `trace.pcapng` in Wireshark (or copy it off the VM) and filter:
 
@@ -291,20 +299,11 @@ consume that value. A defect like this survives for years precisely because it
 has no symptom.
 
 > If the script warns that RC4 **did not** mount, this environment has RC4
-> disabled at the OS level. Skip to Step 3 (`-Step Enforce`) — you'll still see
+> disabled at the OS level. Skip to Step 2 (`-Step Enforce`) — you'll still see
 > the AES-256 failure and the repair, just without the "invisible for years"
 > setup.
 
-## Step 2 — look before you leap
-
-```powershell
-./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Status
-```
-
-Note what it reports — especially `ActiveDirectoryDomainName`. Keep it in mind;
-don't act on it yet.
-
-## Step 3 — perform the migration
+## Step 2 — perform the migration
 
 ```powershell
 ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Enforce
@@ -312,7 +311,7 @@ don't act on it yet.
 
 This flips the AD object to AES-256 only — the change most people would make.
 
-## Step 4 — retest (drop the SMB *session* first!)
+## Step 3 — retest (drop the SMB *session* first!)
 
 On the **Client VM**:
 
@@ -353,7 +352,7 @@ net use Z: \\<sa>.file.core.windows.net\labshare
 > trap shows up in real support cases as *"we changed the auth config and
 > nothing happened"*.
 
-## Step 5 — diagnose from evidence
+## Step 4 — diagnose from evidence
 
 ```powershell
 C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
@@ -372,11 +371,11 @@ all fine — the only thing left is the key the **service** uses to decrypt. Why
 would that be wrong when nothing about the password changed?
 
 Because the AES key is derived with a **salt** built from
-`DomainName + SamAccountName + AccountType`. Run `-Step Status` again and look
+`DomainName + SamAccountName + AccountType`. Now run `-Step Status` and look
 at `ActiveDirectoryDomainName`: it holds the **NetBIOS** name, not the DNS root.
 Under RC4 (unsalted) that never mattered. Under AES-256 it's fatal.
 
-## Step 6 — repair, in the right order
+## Step 5 — repair, in the right order
 
 ```powershell
 ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Repair
