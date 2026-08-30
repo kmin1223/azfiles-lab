@@ -28,7 +28,7 @@
   while it cooks.
 
 .EXAMPLE
-  Connect-AzAccount
+  # Azure Cloud Shell (PowerShell) - already signed in, Az preinstalled
   .\deploy.ps1 -ResourceGroupName azfiles-lab -Location koreacentral
 #>
 [CmdletBinding()]
@@ -127,7 +127,9 @@ foreach ($m in 'Az.Accounts', 'Az.Resources', 'Az.Compute', 'Az.Storage', 'Az.Ne
         throw "Missing module '$m'. Run: Install-Module Az -Scope CurrentUser"
     }
 }
-if (-not (Get-AzContext)) { throw 'Not logged in. Run Connect-AzAccount first.' }
+if (-not (Get-AzContext)) {
+    throw 'No Azure context. Run this in Azure Cloud Shell (PowerShell), where you are already signed in.'
+}
 
 $pwGenerated = $false
 if (-not $AdminPassword) {

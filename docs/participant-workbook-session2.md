@@ -215,7 +215,8 @@ Intune-managed device a local `reg add` to the LSA path "does nothing" — the
 policy silently wins. `klist cloud_debug` is the arbiter: it reports the
 *effective* value, so trust it over any single registry read.
 
-**Fix:** `-Fault NoCloudTgt -Repair`, then sign out/in and re-walk the chain.
+> **Do not repair yet.** Lab B+ (two sections down) reads this same broken state.
+> Repairing now costs you a second sign-out/sign-in cycle for nothing.
 
 **Field takeaway:** "the registry is set correctly but it still fails" almost
 always means a higher-precedence policy source. Check `klist cloud_debug` and
@@ -265,10 +266,11 @@ from an **on-prem DC**. Chasing Entra here is hours down the drain.
 
 # Lab B+ · Prove the flags don't move (routing vs flags)
 
-You already toggled the master switch in Lab B. Now watch what the *cloud flags*
-do while you do it — the answer is **nothing**, and that's the whole lesson.
+You already toggled the master switch in Lab B, and you are **still in the broken
+state** — that's deliberate. Now look at what the *cloud flags* did while the
+routing changed. The answer is **nothing**, and that's the whole lesson.
 
-**With the switch ON** (healthy state), record:
+**With the switch ON** (the healthy state you recorded in Lab A):
 
 ```
 klist cloud_debug        | note "enabled by policy: true"
@@ -277,11 +279,8 @@ klist                    | a KERBEROS.MICROSOFTONLINE.COM ticket via KdcProxy
 dsregcmd /status         | AzureAdPrt: YES · CloudTgt: YES · KerbTopLevelNames has .windows.net
 ```
 
-**Now break it** (Lab B's fault), sign out/in, and re-run the SAME four:
-
-```
-./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
-```
+**Now, in the state Lab B left you in** — no new injection, no second sign-out —
+re-run the SAME four commands and compare:
 
 **What changed vs what didn't:**
 

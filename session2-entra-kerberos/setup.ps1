@@ -17,7 +17,7 @@
     identities. See MANUAL-STEP-cloud-sync.md. Do it while slides run.
 
 .EXAMPLE
-  Connect-AzAccount
+  # Azure Cloud Shell (PowerShell) - already signed in, Az + Graph preinstalled
   .\setup.ps1 -ResourceGroupName azfiles-lab
 #>
 [CmdletBinding()]
@@ -33,7 +33,9 @@ foreach ($m in 'Az.Accounts', 'Az.Storage', 'Az.Compute', 'Microsoft.Graph.Appli
         throw "Missing module '$m'. Install-Module Az,Microsoft.Graph -Scope CurrentUser"
     }
 }
-if (-not (Get-AzContext)) { throw 'Run Connect-AzAccount first.' }
+if (-not (Get-AzContext)) {
+    throw 'No Azure context. Run this in Azure Cloud Shell (PowerShell), where you are already signed in.'
+}
 
 $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName |
     Where-Object StorageAccountName -like "$Prefix*" | Select-Object -First 1
