@@ -110,7 +110,58 @@ tenant has no such policy (a personal/dev tenant).
 
 # --------------------------------------------------- 2. Grant admin consent
 Step '2/4 Granting admin consent to the storage account app (Graph)'
-Connect-MgGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All' -NoWelcome
+
+# Cloud Shell signs you in to Azure, but NOT to Microsoft Graph - they are
+# separate token audiences. Left alone, Connect-MgGraph falls back to the device
+# code flow (Cloud Shell has no browser) and gives you 120 seconds to open
+# microsoft.com/devicelogin before it aborts. In a timed lab that is a reliable
+# way to lose people.
+#
+# So: mint a Graph token from the Azure context you ALREADY have. No browser, no
+# code, no timeout. Device code stays as the fallback for the case where the
+# Azure PowerShell client app has not been consented the directory scopes this
+# step needs.
+function Connect-GraphFromAzContext {
+    try {
+        $p = @{ ResourceUrl = 'https://graph.microsoft.com'; ErrorAction = 'Stop' }
+        # Az 14+ returns a SecureString and warns unless you ask for it explicitly.
+        if ((Get-Command Get-AzAccessToken).Parameters.ContainsKey('AsSecureString')) {
+            $p['AsSecureString'] = $true
+        }
+        $tok = Get-AzAccessToken @p
+        $secure = if ($tok.Token -is [System.Security.SecureString]) {
+            $tok.Token
+        } else {
+            ConvertTo-SecureString $tok.Token -AsPlainText -Force
+        }
+        # Graph SDK v2 wants a SecureString; v1 wants a plain string.
+        if ((Get-Command Connect-MgGraph).Parameters['AccessToken'].ParameterType -eq [System.Security.SecureString]) {
+            Connect-MgGraph -AccessToken $secure -NoWelcome -ErrorAction Stop
+        } else {
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            Connect-MgGraph -AccessToken $plain -NoWelcome -ErrorAction Stop
+        }
+        # Prove the token actually carries the directory scopes we need, rather
+        # than discovering it three cmdlets later with a confusing 403.
+        Get-MgOrganization -ErrorAction Stop | Out-Null
+        Write-Host '  Graph: reused your Cloud Shell sign-in (no device code needed).' -ForegroundColor DarkGray
+        return $true
+    } catch {
+        Write-Host "  Graph: could not reuse the Azure token ($($_.Exception.Message.Split("`n")[0]))." -ForegroundColor DarkYellow
+        return $false
+    }
+}
+
+if (-not (Connect-GraphFromAzContext)) {
+    Write-Host ''
+    Write-Host '  Falling back to device code sign-in.' -ForegroundColor Yellow
+    Write-Host '  Open https://microsoft.com/devicelogin in a browser NOW and enter the code below.' -ForegroundColor Yellow
+    Write-Host '  You have about 2 minutes; if it times out just re-run this script - steps' -ForegroundColor Yellow
+    Write-Host '  already completed are skipped.' -ForegroundColor Yellow
+    Write-Host ''
+    Connect-MgGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All' -NoWelcome
+}
 $spn = Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $saName.file.core.windows.net'"
 if (-not $spn) {
     Start-Sleep 30  # app creation can lag the storage config
