@@ -260,8 +260,14 @@ Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers |
             # compatibility: mounting with the storage account KEY needs
             # AES-128-CCM. (Account-side re-enable is the fallback when the
             # client fleet can't be changed.)
+            #
+            # AES_256_CCM goes LAST on purpose. Azure Files does not expose it on
+            # the account at all - the allowed set is only AES-128-CCM /
+            # AES-128-GCM / AES-256-GCM - so a client that leads with AES_256_CCM
+            # negotiates a cipher the account can never accept and is denied no
+            # matter how the account is configured. Verified on the wire.
             Invoke-OnVm $cliName @'
-Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_256_CCM,AES_128_GCM,AES_128_CCM" -Confirm:$false
+Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_128_GCM,AES_128_CCM,AES_256_CCM" -Confirm:$false
 Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers |
     ForEach-Object { Write-Output "client ciphers now: $_" }
 '@ | Write-Host

@@ -177,16 +177,37 @@ assign share-level permission and/or NTFS rights.
 
 **System error 5 / "the user name or password is incorrect" — SMB cipher mismatch**
 *(Lab 3, from a real support case that took days to resolve.)*
-Cause: cipher is negotiated in the SMB Negotiate, before the client names the
-storage account, so Azure Files can't choose a per-account cipher. If the
-account's SMB security allows only AES-256-GCM and the client offers only
-AES-128-GCM, there is no overlap and the session is refused — surfacing as an
-access denial that **accuses the identity**. In the real case, Kerberos was
-verified healthy (tickets issued, both SPNs present) and the investigation still
-went RBAC → NTFS → NTLMv2 before the traces pointed at cipher negotiation.
-Diagnose: Portal → Storage account → File shares → Security (allowed ciphers) vs
-`Get-SmbClientConfiguration | select EncryptionCiphers` on the client. Fix:
-allow AES-128-GCM on the account, or set the client to offer AES-256-GCM first.
+Cause: at SMB Negotiate the server picks the client's **first** offered cipher and
+returns `STATUS_SUCCESS`. It does **not** filter that list against the storage
+account's `channelEncryption` — that check happens one step later, at Session
+Setup, which then returns `STATUS_ACCESS_DENIED` with a **zero-length security
+blob**. So the error **accuses the identity** while the ticket was never opened.
+In the real case, Kerberos was verified healthy (tickets issued, both SPNs
+present) and the investigation still went RBAC → NTFS → NTLMv2 before the traces
+pointed at cipher negotiation.
+
+Verified on the wire in this lab (Aug 2026), twice:
+
+| Client offers (in order) | Account allows | Server chose | Result |
+|---|---|---|---|
+| 128-GCM, 128-CCM, 256-GCM, 256-CCM | 256-GCM only | 128-GCM | denied |
+| 256-CCM, 128-GCM, 128-CCM, 256-GCM | 128-CCM, 128-GCM | 256-CCM | denied |
+
+The second run is the decisive one: the client's list held **two** account-allowed
+ciphers and the server still took the disallowed head. **The rule is that the HEAD
+of the client list must be account-allowed** — presence further down does nothing.
+Note also that AES-256-CCM is not even selectable on the account (the surface
+offers AES-128-CCM / AES-128-GCM / AES-256-GCM only), so a client leading with it
+can never connect to Azure Files at all. Correct the common misstatement if it
+comes up:
+the client *does* name the account at Negotiate (`SMB2_NETNAME_NEGOTIATE_CONTEXT_ID`);
+the server simply doesn't use it to choose the cipher.
+
+Diagnose: the CIPHER block at the bottom of `trace-summary.txt`, or Portal →
+Storage account → File shares → Security (allowed ciphers) vs
+`Get-SmbClientConfiguration | select EncryptionCiphers` on the client.
+Fix (client first): `Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_256_CCM,AES_128_GCM,AES_128_CCM" -Force`.
+Fallback for unmanageable fleets: also allow AES-128-GCM on the account.
 AES-256-GCM requires Win 11 / WS2022+.
 
 **Reading `Debug-AzStorageAccountAuth` output critically**

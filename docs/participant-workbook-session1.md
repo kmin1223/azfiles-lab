@@ -233,23 +233,26 @@ It purges tickets, starts a network trace, performs the mount, stops the trace,
 converts it to `.pcapng`, and collects the Kerberos/SMBClient logs into
 `C:\LabTools\evidence\<timestamp>\`.
 
-> **The event logs will be quiet — and they stay quiet even when the mount
-> fails.** That surprises people, so learn it here rather than on a case.
-> `Microsoft-Windows-Kerberos/Operational` records what the *client* stack
-> noticed; error 1396 is a **service-side** rejection, so the client saw nothing
-> wrong (it got a good ticket from the DC and sent a good AP-REQ). The refusal
-> arrives inside the SMB Session Setup.
+> **Which channel sees what.** The three event logs behave very differently, and
+> knowing which one to open is half the skill:
 >
-> `SMBClient/Operational` will show a pile of event **30904 "server does not
-> support multichannel"** — routine against Azure Files and unrelated to any
-> failure. The collector labels it as benign and tells you how many events are
-> actually worth reading, so a full-looking log doesn't send you chasing it.
+> | Channel | On a healthy mount | On the 1396 failure |
+> |---|---|---|
+> | `Kerberos/Operational` | empty | **still empty** — the client's Kerberos stack did nothing wrong |
+> | `SMBClient/Operational` | routine 30904 noise | the same routine noise |
+> | `SMBClient/Security` | empty | **event 31001, the real record** |
 >
-> When the logs are quiet, the evidence is `klist` (was a ticket issued, which
-> etype), the DC's **4769** (did the KDC succeed) and **trace.pcapng** (the
-> Session Setup failure). `smb-connection.txt` and `smb-client-config.txt` are
-> always populated — dialect, cipher, signing — and the latter is what you
-> compare in Lab 3.
+> `Kerberos/Operational` stays quiet because the client behaved perfectly: it got
+> a good ticket from the DC and sent a good AP-REQ. The refusal came from the
+> **service**, inside the SMB Session Setup — so it lands in `SMBClient/Security`.
+>
+> The 30904 events ("server does not support multichannel") are routine against
+> Azure Files — the Negotiate response simply doesn't advertise multichannel. The
+> collector labels them benign and tells you how many events are actually worth
+> reading, so a full-looking log doesn't send you chasing it.
+>
+> `smb-connection.txt` and `smb-client-config.txt` are always populated —
+> dialect, cipher, signing — and the latter is what you compare in Lab 3.
 
 Open `trace.pcapng` in Wireshark (or copy it off the VM) and filter:
 
@@ -257,9 +260,39 @@ Open `trace.pcapng` in Wireshark (or copy it off the VM) and filter:
 kerberos || smb2
 ```
 
-**What a healthy attempt looks like:** `TGS-REQ` naming `cifs/<sa>…`, a `TGS-REP`
-back, then SMB2 `Negotiate` → `Session Setup` (success) → `Tree Connect`
-(success).
+**What a healthy attempt looks like** — the whole thing takes about 13 ms:
+
+```
+  SMB2  Negotiate Protocol Request / Response      <- BEFORE any Kerberos
+  KRB5  AS-REQ
+  KRB5  KRB Error: KRB5KDC_ERR_PREAUTH_REQUIRED    <- normal, see below
+  KRB5  AS-REQ        (retried, now with pre-auth)
+  KRB5  AS-REP                                     <- TGT issued
+  KRB5  TGS-REQ
+  KRB5  TGS-REP                                    <- service ticket issued
+  SMB2  Session Setup Request   (large - it carries the ticket)
+  SMB2  Session Setup Response  (success)
+  SMB2  Encrypted SMB3 ...
+```
+
+Three things in that list surprise people:
+
+- **`KRB5KDC_ERR_PREAUTH_REQUIRED` is not a problem.** The first AS-REQ carries no
+  pre-authentication data, so the KDC asks for it and the client immediately
+  retries. Wireshark paints it red; it is the most misread frame in any Kerberos
+  capture. A healthy exchange contains it.
+- **`Negotiate` happens before Kerberos.** That is exactly why the SMB cipher
+  cannot be chosen per storage account — the dialect and cipher are agreed
+  before the client has even named the account. Lab 3 lives on this fact.
+- **You never see `Tree Connect`.** Once Session Setup succeeds, SMB3 encryption
+  is on and everything after it shows as `Encrypted SMB3`. **The wire shows you
+  authentication, not authorization** — which is why the "Access denied" labs
+  need different evidence.
+
+> **Why your capture has more in it than a customer's.** The collector runs
+> `klist purge` first, so even the TGT has to be re-acquired and you get the AS
+> exchange too. On a real case the user already holds a TGT and you will usually
+> see only `TGS-REQ` / `TGS-REP`. Don't treat a missing AS exchange as a finding.
 
 And on the **DC**, the KDC's own record of that ticket:
 
@@ -370,6 +403,21 @@ Event 4769 says **success**. So the KDC, the SPN, and the encryption type are
 all fine — the only thing left is the key the **service** uses to decrypt. Why
 would that be wrong when nothing about the password changed?
 
+Before answering, notice that **the same failure has three different names**
+depending on which layer you look at — and all three point at the *name*, which
+is the misleading part:
+
+| Layer | What it says |
+|---|---|
+| Kerberos, on the wire | `KRB_AP_ERR_MODIFIED` (error 41) |
+| SSPI, in `SMBClient/Security` event 31001 | `0x80090322` = `SEC_E_WRONG_PRINCIPAL` |
+| Win32, from `net use` | `1396` "The target account name is incorrect" |
+
+All three say *wrong principal / wrong target name*. **The name is fine.** The
+key derived from it is wrong. (The event log shows `0x80090322` as "Unknown
+NTSTATUS Error code" because it is a SECURITY_STATUS, not an NTSTATUS — don't
+let that stop you.)
+
 Because the AES key is derived with a **salt** built from
 `DomainName + SamAccountName + AccountType`. Now run `-Step Status` and look
 at `ActiveDirectoryDomainName`: it holds the **NetBIOS** name, not the DNS root.
@@ -445,10 +493,54 @@ Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers
 #          ("SMB channel encryption" - anything unchecked is refused)
 ```
 
-They have no cipher in common. SMB negotiates the cipher **before** the client
-even names the storage account, so the service can't pick one per account — if
-the negotiated cipher isn't on the account's allowed list, the session setup is
-refused and the error surfaces as an access denial.
+## On the wire — where the decision was actually made
+
+Open `trace-summary.txt` and read the **CIPHER** block at the bottom, or open the
+capture in Wireshark with filter `smb2 || kerberos` and look at two frames:
+
+| Frame | What to read | This lab |
+|---|---|---|
+| Negotiate Protocol **Request** | `SMB2_ENCRYPTION_CAPABILITIES` → CipherId list | what the client offered, in order |
+| Negotiate Protocol **Response** | `SMB2_ENCRYPTION_CAPABILITIES` → CipherId | the one the server picked |
+| Session Setup **Response** | NT Status, **Blob Length** | `0xc0000022`, blob length **0** |
+
+Three things that capture proves, and they are not what most people assume:
+
+1. **The server takes the client's first offer, full stop.** Two runs prove it:
+
+   | Client offers (in order) | Account allows | Server chose | Result |
+   |---|---|---|---|
+   | 128-GCM, 128-CCM, 256-GCM, 256-CCM | 256-GCM only | **128-GCM** | denied |
+   | **256-CCM**, 128-GCM, 128-CCM, 256-GCM | 128-CCM, 128-GCM | **256-CCM** | denied |
+
+   Look hard at the second row. The client's list contained **two** ciphers the
+   account allows — and the server still picked the disallowed one, because it
+   was first. If the server filtered by account policy it would have chosen
+   128-GCM and the mount would have worked.
+
+   **The rule: the HEAD of the client's list must be a cipher the account allows.**
+   Anything further down is decoration. This is why the repair reorders rather
+   than appends.
+
+   Row 2 has a sharper edge too: **AES-256-CCM isn't even an option on the
+   account.** Azure Files exposes only AES-128-CCM, AES-128-GCM and AES-256-GCM.
+   So the server negotiated a cipher the account could never allow, no matter how
+   it is configured — proof that the two layers don't talk to each other.
+2. **Negotiate does not consult the account policy.** It returns
+   `STATUS_SUCCESS`. The account's `channelEncryption` is enforced one step later,
+   at Session Setup. (The client *does* name the account at Negotiate — it is
+   right there in `SMB2_NETNAME_NEGOTIATE_CONTEXT_ID` — the server just doesn't
+   use it to filter the cipher list.)
+3. **The rejection carries no Kerberos error at all.** `Blob Length: 0`, no GSS
+   token, response in ~3 ms. The ticket was never opened. Compare with Lab 5,
+   where the same-looking denial *does* carry a Kerberos error (`AP_ERR_MODIFIED`)
+   inside the blob. **Empty blob ⇒ not identity. Populated blob ⇒ identity.**
+   That one distinction is the fastest triage in this whole session.
+
+This also matches the documented requirement: if you set an account to
+AES-256-GCM only, Microsoft's own guidance is to run
+`Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM"` on every connecting
+client. The capture shows *why* that instruction exists.
 
 ## Fix — on the client, not the account
 
@@ -460,7 +552,7 @@ The repair changes the **client's** cipher order so an account-allowed cipher
 leads:
 
 ```powershell
-Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_256_CCM,AES_128_GCM,AES_128_CCM"
+Set-SmbClientConfiguration -EncryptionCiphers "AES_256_GCM,AES_128_GCM,AES_128_CCM,AES_256_CCM"
 ```
 
 Two deliberate choices in that line, both straight from real support practice:
@@ -473,6 +565,9 @@ Two deliberate choices in that line, both straight from real support practice:
 - **The weaker ciphers stay in the client list, just lower.** Removing them
   entirely breaks compatibility elsewhere — notably, mounting with the
   **storage account key** needs AES-128-CCM. Order, not removal, is the tool.
+- **`AES_256_CCM` goes last on purpose.** Azure Files doesn't expose it on the
+  account at all, so a client that leads with it can never connect — whatever the
+  account is set to. It is kept in the list only for non-Azure SMB servers.
 
 **Why this matters:** the error text points straight at credentials, so the
 natural reaction is to audit RBAC, then NTFS, then the domain join — and find
@@ -508,12 +603,54 @@ C:\LabTools\Get-KerberosEvidence.ps1 -StorageAccount <sa>
 ```
 
 Open the new `trace.pcapng` with filter `kerberos || smb2` and compare it to
-your known-good capture:
+your known-good capture. **Everything is identical until one frame:**
 
-| Stage | Healthy capture | This capture |
-|---|---|---|
-| TGS-REQ / REP | ticket issued | **still issued** — the KDC is fine |
-| SMB2 Session Setup | success | **fails** — `KRB_AP_ERR_MODIFIED` |
+```
+ healthy   ... TGS-REP -> Session Setup Request -> Session Setup Response (ok) -> Encrypted SMB3
+ this one  ... TGS-REP -> Session Setup Request -> KRB Error: KRB5KRB_AP_ERR_MODIFIED
+```
+
+Two details in that error frame are worth more than the rest of the capture:
+
+- **Its Protocol column says `SMB2`, and it comes from the storage account, not
+  the DC.** The Kerberos error is carried *inside* the Session Setup response,
+  on port 445. That is the service saying "I could not decrypt your ticket" —
+  and it is exactly why `Kerberos/Operational` on the client stays empty.
+- **Right after it, the client asks the DC for the ticket again** (TGS-REQ /
+  TGS-REP), tries once more, and fails the same way. The whole cycle repeats
+  every 5–6 seconds.
+
+That second point produces the most counter-intuitive fact in this lab: **during
+a total outage, the DC's 4769 log fills up with SUCCESS.** The client keeps
+asking, and the KDC keeps correctly issuing. If you were looking only at the DC
+you would conclude everything is fine.
+
+## Open that error frame — the failure is three layers down
+
+Click the `KRB Error` frame and expand it. Every layer above the Kerberos
+payload reports something that looks *fine*:
+
+```
+SMB2 header    NT Status: STATUS_MORE_PROCESSING_REQUIRED (0xc0000016)   normal
+ └ SPNEGO      negResult: accept-incomplete                              normal
+    └ Kerberos krb5_tok_id: KRB5_ERROR
+                error-code: eRR-MODIFIED (41)                            ← the failure
+                sname:      <sa>
+```
+
+`STATUS_MORE_PROCESSING_REQUIRED` is the ordinary status for an intermediate
+Session Setup response, and `accept-incomplete` just means the handshake has more
+legs to go. The service even allocated a Session Id and set `Encrypt: True`.
+
+**So a filter on SMB2 status codes finds nothing here.** The rejection only
+exists inside the security blob. Wireshark digs it out for you and puts it in the
+Info column — that convenience is the only reason it looked obvious. On a case
+where someone hands you "no SMB errors in the trace", this is the frame they
+missed.
+
+The `sname` field is worth a look too: it is the principal the **service** tried
+to be — your storage account name. The service is telling you *"I am who you
+asked for, and I still could not decrypt this."*
 
 Then confirm from the KDC's side, on the **DC**:
 

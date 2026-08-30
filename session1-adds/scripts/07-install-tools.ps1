@@ -285,10 +285,11 @@ $helper = @'
       smb-connection.txt          negotiated dialect / encryption / signing
       smb-client-config.txt       client SMB settings (cipher order, etc.)
 
-  Do not expect the event logs to explain everything. They record what the
-  CLIENT noticed, and a service-side rejection (error 1396) is invisible to it:
-  the client's Kerberos stack did nothing wrong. When they are quiet, read
-  klist, the DC's 4769 and the trace instead. Each file says so at the top.
+  Which channel sees what matters. For error 1396, Kerberos/Operational stays
+  quiet (the client's Kerberos stack did nothing wrong) but SMBClient/Security
+  logs event 31001 with SSPI status 0x80090322 = SEC_E_WRONG_PRINCIPAL - the
+  service could not decrypt the ticket. Each file explains itself at the top,
+  including the status codes Windows leaves as "Unknown".
 #>
 [CmdletBinding(DefaultParameterSetName = 'All')]
 param(
@@ -390,6 +391,18 @@ $benign = @{
     30904 = 'SMB Multichannel not offered by the server - normal for Azure Files'
     30800 = 'share reconnected - routine'
 }
+# The opposite list: events that ARE about your failure, and what to read in them.
+$meaningful = @{
+    31001 = 'SSPI failed while building the Session Setup token - read Security status'
+}
+# Status codes that Windows fails to name in the event text. 0x80090322 is
+# logged as "Unknown NTSTATUS Error code" because it is a SECURITY_STATUS, not
+# an NTSTATUS - so the event tells you nothing unless you know this table.
+$statusNotes = @{
+    '0x80090322' = 'SEC_E_WRONG_PRINCIPAL - mapped from Kerberos KRB_AP_ERR_MODIFIED (41). The service could NOT decrypt the ticket. Surfaces to net use as 1396. The name is fine; the KEY is wrong.'
+    '0xc000006d' = 'STATUS_LOGON_FAILURE - the service refused the identity (see the 1326 / computer-account case).'
+    '0xc0000022' = 'STATUS_ACCESS_DENIED at Session Setup. If Kerberos on the wire is CLEAN (AS-REP and TGS-REP both succeeded) and the Session Setup Response carries a ZERO-LENGTH security blob, this is not an identity problem at all - it is the channel-cipher check. Read the CIPHER line in trace-summary.txt and compare it with the account channelEncryption setting.'
+}
 
 function Save-Log([string]$Out, [string]$LogName, [string]$File, [string[]]$Props) {
     $since = (Get-Date).AddMinutes(-15)
@@ -404,14 +417,47 @@ function Save-Log([string]$Out, [string]$LogName, [string]$File, [string[]]$Prop
         foreach ($g in $ids) {
             if ($benign.ContainsKey([int]$g.Name)) {
                 $head += "  $($g.Name) x$($g.Count)   BENIGN - $($benign[[int]$g.Name])"
+            } elseif ($meaningful.ContainsKey([int]$g.Name)) {
+                $head += "  $($g.Name) x$($g.Count)   READ THIS - $($meaningful[[int]$g.Name])"
             }
         }
-        if (-not $interesting.Count) {
-            $head += @('', 'NOTHING HERE IS ABOUT YOUR FAILURE - every event above is routine noise.')
+        # Decode the status codes Windows leaves as 'Unknown'.
+        foreach ($code in $statusNotes.Keys) {
+            if ($ev | Where-Object { $_.Message -like "*$code*" }) {
+                $head += @('', "  $code = $($statusNotes[$code])")
+            }
         }
-        $head += @('', ('-' * 70), '')
-        $head | Out-File $path -Encoding utf8
-        $ev | Format-List $Props | Out-File $path -Encoding utf8 -Append
+        # A wall of identical events is one fact, not N facts - say the cadence
+        # instead. For 1396 that cadence IS information: the client retrying.
+        foreach ($g in $ids) {
+            if ([int]$g.Count -gt 2 -and -not $benign.ContainsKey([int]$g.Name)) {
+                $texts = @($g.Group | ForEach-Object { $_.Message })
+                if (($texts | Select-Object -Unique).Count -eq 1) {
+                    $ts = @($g.Group | Sort-Object TimeCreated | Select-Object -ExpandProperty TimeCreated)
+                    $gap = [math]::Round((($ts[-1] - $ts[0]).TotalSeconds / [math]::Max(1, $ts.Count - 1)), 1)
+                    $head += "  $($g.Name): all $($g.Count) messages identical, about every ${gap}s - a retry loop, not $($g.Count) problems."
+                }
+            }
+        }
+
+        $dropped = @($ev.Count - $interesting.Count)[0]
+        if ($interesting.Count) {
+            if ($dropped -gt 0) {
+                $full = $path -replace '\.txt$', '-full.txt'
+                $head += @('', "$dropped routine event(s) are NOT listed below. Full set: $(Split-Path $full -Leaf)")
+                $ev | Format-List $Props | Out-File $full -Encoding utf8
+            }
+            $head += @('', ('-' * 70), '')
+            $head | Out-File $path -Encoding utf8
+            $interesting | Format-List $Props | Out-File $path -Encoding utf8 -Append
+        } else {
+            $head += @('', 'NOTHING HERE IS ABOUT YOUR FAILURE - every event above is routine noise.',
+                       'The events themselves are not repeated here; nothing in them varies.',
+                       '', ('-' * 70), '')
+            $head | Out-File $path -Encoding utf8
+            $ev | Select-Object -First 1 | Format-List $Props | Out-File $path -Encoding utf8 -Append
+            "... and $($ev.Count - 1) more, identical." | Out-File $path -Encoding utf8 -Append
+        }
 
         $note = if ($interesting.Count) { "$($interesting.Count) worth reading" } else { 'all routine noise' }
         Write-Host ("  {0,-44} {1,3} event(s)  {2,-16} {3}" -f $LogName, @($ev).Count, $summary, $note)
@@ -419,13 +465,17 @@ function Save-Log([string]$Out, [string]$LogName, [string]$File, [string[]]$Prop
         @(
             "No events in $LogName in the last 15 minutes."
             ''
-            'Empty does NOT mean the mount was healthy. These channels record what the'
-            'CLIENT stack noticed, and some failures are invisible to it. Error 1396 is'
-            'the clearest example: the DC issued a perfectly good ticket and the client'
-            'sent a perfectly good AP-REQ, so the client Kerberos stack saw no error at'
-            'all. The rejection came back inside the SMB Session Setup, from the service.'
+            'Empty does NOT mean the mount was healthy - it means THIS channel had'
+            'nothing to say. Different failures land in different channels:'
             ''
-            'When these logs are quiet, the evidence is elsewhere:'
+            '  Kerberos/Operational    quiet for error 1396 - the client Kerberos'
+            '                          stack did nothing wrong (it got a good ticket'
+            '                          and sent a good AP-REQ)'
+            '  SMBClient/Operational   mostly routine chatter (multichannel etc.)'
+            '  SMBClient/Security      THIS is where a rejected Session Setup shows'
+            '                          up, as event 31001 with an SSPI status'
+            ''
+            'And regardless of the channels:'
             '  klist          was a ticket issued, and with which etype?'
             '  DC event 4769  did the KDC succeed?'
             '  trace.pcapng   the Session Setup failure and the real KRB error'
@@ -443,6 +493,91 @@ $krbErr = @{ 6 = 'C_PRINCIPAL_UNKNOWN'; 7 = 'S_PRINCIPAL_UNKNOWN'; 14 = 'ETYPE_N
              25 = 'PREAUTH_REQUIRED'; 37 = 'AP_ERR_SKEW'; 41 = 'AP_ERR_MODIFIED' }
 $smbCmd = @{ 0 = 'Negotiate'; 1 = 'Session Setup'; 2 = 'Logoff'; 3 = 'Tree Connect'
              4 = 'Tree Disconnect'; 5 = 'Create'; 8 = 'Read'; 9 = 'Write'; 14 = 'Query Directory' }
+# SMB2 statuses that are NOT failures. STATUS_MORE_PROCESSING_REQUIRED is the
+# normal status for an intermediate Session Setup response - and it is what the
+# service returns while REJECTING a ticket, because the rejection lives inside
+# the GSS blob, not in the SMB header. Filter on SMB status alone and you miss it.
+$smbOk = @('0x00000000', '0xc0000016', '0')
+
+# SMB 3.1.1 encryption negotiate context - MS-SMB2 2.2.3.1.2.
+$cipherName = @{ 1 = 'AES-128-CCM'; 2 = 'AES-128-GCM'; 3 = 'AES-256-CCM'; 4 = 'AES-256-GCM' }
+
+function ConvertTo-CipherNames([string]$Raw) {
+    $out = @()
+    foreach ($v in ($Raw -split ',')) {
+        $s = $v.Trim()
+        if (-not $s) { continue }
+        $n = if ($s -match '^0x') { [Convert]::ToInt32($s, 16) } else { [int]$s }
+        if ($cipherName.ContainsKey($n)) { $out += $cipherName[$n] } else { $out += "cipher($s)" }
+    }
+    $out
+}
+
+# Which cipher the two sides settled on, and in what order the client asked.
+#
+# This is the whole ball game for the channel-encryption fault. Azure Files takes
+# the client's FIRST offered cipher and does NOT filter that choice against the
+# storage account's channelEncryption list; the account check happens one step
+# later, at Session Setup. Two consequences that cost people days:
+#   1. Having an account-allowed cipher somewhere in the client list does nothing.
+#      It has to be the HEAD of the list.
+#   2. The server will happily settle on AES-256-CCM, which the account surface
+#      does not even expose (portal and PowerShell offer only AES-128-CCM,
+#      AES-128-GCM, AES-256-GCM) - so that negotiation can never be accepted.
+# Both verified on the wire in this lab, Aug 2026: a client whose list contained
+# two account-allowed ciphers still failed, because a disallowed one led.
+function Get-CipherStory([string]$Tshark, [string]$Pcap) {
+    $rows = & $Tshark -r $Pcap -Y 'smb2.cmd == 0' -T fields `
+        -e smb2.flags.response -e smb2.cipher_id -E 'separator=|' 2>$null
+    $offered = $null; $chosen = $null
+    foreach ($r in $rows) {
+        $f = $r -split '\|'
+        if ($f.Count -lt 2 -or -not $f[1]) { continue }
+        $names = ConvertTo-CipherNames $f[1]
+        if (-not $names.Count) { continue }
+        if ($f[0] -eq '1') { if (-not $chosen)  { $chosen  = $names } }
+        else               { if (-not $offered) { $offered = $names } }
+    }
+    if (-not $chosen -and -not $offered) {
+        return @(
+            'CIPHER: no encryption negotiate context found in this capture.'
+            '        Either the dialect is below 3.1.1, or this tshark build does'
+            '        not carry the smb2.cipher_id field. In Wireshark, open the'
+            '        Negotiate Protocol Response and read:'
+            '        SMB2 > Negotiate Context: SMB2_ENCRYPTION_CAPABILITIES > CipherId'
+        )
+    }
+    $lines = @('CIPHER (SMB3 channel encryption, settled at Negotiate):')
+    if ($offered) { $lines += "  client offered : $($offered -join ', ')" }
+    if ($chosen)  { $lines += "  server chose   : $($chosen -join ', ')" }
+    $lines += ''
+    $lines += '  The server takes the client''s FIRST offer. It does NOT consult the'
+    $lines += '  storage account channelEncryption list here - that check happens one'
+    $lines += '  step later, at Session Setup. So THE RULE IS:'
+    $lines += ''
+    $lines += '      the HEAD of the client list must be a cipher the account allows.'
+    $lines += ''
+    $lines += '  Having an allowed cipher further down the list buys you nothing.'
+    $lines += '  Read the account side with:'
+    $lines += '      (Get-AzStorageFileServiceProperty -ResourceGroupName <rg> `'
+    $lines += '           -StorageAccountName <sa>).ProtocolSettings.Smb.ChannelEncryption'
+    $lines += '  If "server chose" is not in that list, expect STATUS_ACCESS_DENIED with'
+    $lines += '  a zero-length blob - and it is NOT an identity problem.'
+    if ($chosen -and $chosen[0] -eq 'AES-256-CCM') {
+        $lines += ''
+        $lines += '  !! This capture negotiated AES-256-CCM. Azure Files does not expose'
+        $lines += '     AES-256-CCM on the account at all - the allowed set is only'
+        $lines += '     AES-128-CCM / AES-128-GCM / AES-256-GCM. So this negotiation can'
+        $lines += '     NEVER be accepted, whatever the account is set to. The client is'
+        $lines += '     leading with a cipher that has no counterpart on the service.'
+    }
+    $lines += ''
+    $lines += '  Repair on the CLIENT (put an account-allowed cipher at the head; keep'
+    $lines += '  the weaker ones listed, just lower - storage-KEY mounts need AES-128-CCM):'
+    $lines += '      Set-SmbClientConfiguration -EncryptionCiphers `'
+    $lines += '          "<account-allowed first>,AES_128_GCM,AES_128_CCM" -Force'
+    $lines
+}
 
 function Get-Tshark {
     $c = Get-Command tshark -ErrorAction SilentlyContinue
@@ -479,18 +614,26 @@ tshark -r trace.pcapng -Y "kerberos || smb2" -T fields ``
     -e frame.number -e frame.time_relative -e ip.dst ``
     -e kerberos.msg_type -e kerberos.error_code ``
     -e smb2.cmd -e smb2.flags.response -e smb2.nt_status
+
+tshark -r trace.pcapng -Y "smb2.cmd == 0" -T fields ``
+    -e smb2.flags.response -e smb2.cipher_id     # which cipher was agreed
 "@
+    # tcp ports matter: a Kerberos error on 88 is the KDC refusing, the SAME
+    # error inside SMB (445) is the SERVICE refusing. Opposite conclusions.
     $raw = & $tshark -r $pcap -Y 'kerberos || smb2' -T fields `
         -e frame.number -e frame.time_relative -e ip.dst `
+        -e tcp.srcport -e tcp.dstport `
         -e kerberos.msg_type -e kerberos.error_code `
         -e smb2.cmd -e smb2.flags.response -e smb2.nt_status `
         -E 'separator=|' 2>$null
 
-    $lines = @(); $sawTgsRep = $false; $ssFailure = $null; $krbError = $null
+    $lines = @(); $sawTgsRep = $false; $ssFailure = $null
+    $krbErrKdc = $null; $krbErrSvc = $null; $attempts = 0
     foreach ($r in $raw) {
         $f = $r -split '\|'
-        if ($f.Count -lt 8) { continue }
-        $num, $t, $dst, $kmsg, $kerr, $scmd, $sresp, $sstat = $f[0..7]
+        if ($f.Count -lt 10) { continue }
+        $num, $t, $dst, $sport, $dport, $kmsg, $kerr, $scmd, $sresp, $sstat = $f[0..9]
+        $onSmb = ($sport -eq '445' -or $dport -eq '445')
         # a frame can carry several messages; take the first of each field
         $kmsg = ($kmsg -split ',')[0]; $kerr = ($kerr -split ',')[0]
         $scmd = ($scmd -split ',')[0]; $sresp = ($sresp -split ',')[0]; $sstat = ($sstat -split ',')[0]
@@ -500,30 +643,66 @@ tshark -r trace.pcapng -Y "kerberos || smb2" -T fields ``
             $detail = ''
             if ($kerr) {
                 $en = if ($krbErr.ContainsKey([int]$kerr)) { $krbErr[[int]$kerr] } else { "code $kerr" }
-                $detail = "  <-- $en"; $krbError = $en
+                if ($onSmb) {
+                    # Carried in the SMB Session Setup response - the SERVICE said no.
+                    $detail = "  <-- $en   (from the SERVICE, inside SMB)"
+                    $krbErrSvc = $en; $attempts++
+                } else {
+                    $detail = "  <-- $en   (from the KDC)"
+                    if ($en -ne 'PREAUTH_REQUIRED') { $krbErrKdc = $en }
+                }
             }
             if ($name -eq 'TGS-REP') { $sawTgsRep = $true }
-            $lines += ('{0,6}  {1,8:N3}s  {2,-15} KRB   {3}{4}' -f $num, [double]$t, $dst, $name, $detail)
+            $where = if ($onSmb) { 'KRB/SMB' } else { 'KRB    ' }
+            $lines += ('{0,6}  {1,8:N3}s  {2,-15} {3} {4}{5}' -f $num, [double]$t, $dst, $where, $name, $detail)
         } elseif ($scmd) {
             $name = if ($smbCmd.ContainsKey([int]$scmd)) { $smbCmd[[int]$scmd] } else { "cmd $scmd" }
             $dir = if ($sresp -eq '1') { 'resp' } else { 'req ' }
             $st = ''
-            if ($sresp -eq '1' -and $sstat -and $sstat -ne '0' -and $sstat -ne '0x00000000') {
+            if ($sresp -eq '1' -and $sstat -and $smbOk -notcontains $sstat) {
                 $st = "  <-- STATUS $sstat"
                 if (-not $ssFailure) { $ssFailure = "$name $sstat" }
+            } elseif ($sresp -eq '1' -and $sstat -eq '0xc0000016') {
+                $st = '  (MORE_PROCESSING_REQUIRED - normal mid-handshake)'
             }
             $lines += ('{0,6}  {1,8:N3}s  {2,-15} SMB2  {3} {4}{5}' -f $num, [double]$t, $dst, $name, $dir, $st)
         }
     }
 
     $verdict = @()
-    if ($sawTgsRep -and $ssFailure) {
+    if ($krbErrSvc) {
+        $verdict += "READING: the KDC issued a ticket (TGS-REP), and then the SERVICE"
+        $verdict += "         rejected it inside SMB Session Setup: $krbErrSvc"
+        $verdict += "         Seen $attempts time(s) - the client keeps re-requesting the"
+        $verdict += '         ticket and the DC keeps issuing good ones, which is why the'
+        $verdict += "         DC's 4769 shows SUCCESS all through the outage."
+        $verdict += '         => the KDC is innocent. The service could not DECRYPT it.'
+        if ($krbErrSvc -eq 'AP_ERR_MODIFIED') {
+            $verdict += '         AP_ERR_MODIFIED = error 1396 = SEC_E_WRONG_PRINCIPAL.'
+            $verdict += '         The name is fine; the KEY is wrong. Check the salt inputs.'
+        }
+        $verdict += ''
+        $verdict += '  NOTE: the SMB2 header on those frames says STATUS_MORE_PROCESSING_'
+        $verdict += '        REQUIRED, which is NORMAL. The rejection is inside the GSS'
+        $verdict += '        blob. Filtering on SMB2 status alone would miss this entirely.'
+    } elseif ($sawTgsRep -and $ssFailure -like '*0xc0000022*') {
+        # Denied, but with no Kerberos error anywhere - so nothing ever looked at
+        # the ticket. This is the channel-cipher fault, and calling it an identity
+        # problem sends people into AD for an hour.
+        $verdict += 'READING: Kerberos is CLEAN. The KDC issued a ticket (TGS-REP) and no'
+        $verdict += '         Kerberos error came back inside SMB either. The service then'
+        $verdict += "         failed at: $ssFailure"
+        $verdict += '         A denial with NO Kerberos error - and, in Wireshark, a Session'
+        $verdict += '         Setup Response whose Blob Length is 0 - means the ticket was'
+        $verdict += '         never examined. This is not identity. Suspect the CHANNEL'
+        $verdict += '         CIPHER, and read the CIPHER block below before touching AD,'
+        $verdict += '         the computer object, or RBAC.'
+    } elseif ($sawTgsRep -and $ssFailure) {
         $verdict += 'READING: a TGS-REP came back (the KDC issued a ticket) and then SMB2'
         $verdict += "         failed at: $ssFailure"
         $verdict += '         => the KDC did its job; the SERVICE refused the ticket.'
-        $verdict += '         That is the error-1396 shape. Look at the salt inputs next.'
-    } elseif ($krbError) {
-        $verdict += "READING: the KDC itself returned an error ($krbError)."
+    } elseif ($krbErrKdc) {
+        $verdict += "READING: the KDC itself returned an error ($krbErrKdc), on port 88."
         $verdict += '         No ticket was ever issued - stop looking at the service.'
     } elseif ($sawTgsRep) {
         $verdict += 'READING: ticket issued and no SMB2 failure in this capture.'
@@ -533,13 +712,16 @@ tshark -r trace.pcapng -Y "kerberos || smb2" -T fields ``
         $verdict += '         exchange happened outside the capture window.'
     }
 
+    $cipher = Get-CipherStory $tshark $pcap
+
     $out = @("Trace summary - $pcap", ('=' * 78), '',
-             ('{0,6}  {1,9}  {2,-15} {3}' -f 'frame', 'time', 'dest', 'message'),
-             ('-' * 78)) + $lines + @('', ('=' * 78)) + $verdict
+             ('{0,6}  {1,9}  {2,-15} {3}' -f 'frame', 'time', 'dest', 'where / message'),
+             ('-' * 78)) + $lines + @('', ('=' * 78)) + $verdict +
+           @('', ('-' * 78)) + $cipher
     $out | Out-File $path -Encoding utf8
     Write-Host ''
     $out | ForEach-Object {
-        $c = if ($_ -match 'STATUS|<--|READING|=>') { 'Yellow' } else { 'Gray' }
+        $c = if ($_ -match 'STATUS|<--|READING|=>|CIPHER|server chose|client offered') { 'Yellow' } else { 'Gray' }
         Write-Host $_ -ForegroundColor $c
     }
 }
