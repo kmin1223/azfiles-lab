@@ -7,6 +7,33 @@ $ErrorActionPreference = 'Stop'
 Import-Module ActiveDirectory
 $domainDn = (Get-ADDomain).DistinguishedName
 
+# --- DNS forwarder: the lab's only path to the public internet -------------
+# The VNet hands every VM this DC as its ONLY DNS server (template dhcpOptions),
+# so nothing in the lab resolves a public name unless this DNS server forwards.
+# Install-ADDSForest -InstallDns leaves no forwarder here - it inherits the DC's
+# own NIC setting, which by then already points at itself - so resolution falls
+# back to root hints. That is slow and unreliable in Azure, and it fails in ways
+# that look like anything but DNS:
+#   - dsregcmd /join  -> 0x80072ee7 (name not resolved) -> 0x801c003d, no hybrid join
+#   - tool downloads  -> "The remote name could not be resolved"
+# 168.63.129.16 is Azure's platform DNS: reachable from inside every VNet, needs
+# no NSG rule, and never leaves the Azure fabric.
+try {
+    $fwd = @(Get-DnsServerForwarder -ErrorAction SilentlyContinue).IPAddress.IPAddressToString
+    if ($fwd -notcontains '168.63.129.16') {
+        Set-DnsServerForwarder -IPAddress '168.63.129.16' -PassThru -ErrorAction Stop | Out-Null
+        Write-Output 'DNS forwarder set to 168.63.129.16 (Azure platform DNS)'
+    } else {
+        Write-Output 'DNS forwarder already set'
+    }
+    # Prove it end to end rather than trusting the config.
+    $probe = Resolve-DnsName 'login.microsoftonline.com' -Server 127.0.0.1 -ErrorAction Stop
+    Write-Output "DNS forward test OK (login.microsoftonline.com -> $(@($probe)[0].IPAddress -join ','))"
+} catch {
+    Write-Output "WARNING: DNS forwarder setup/probe failed - $($_.Exception.Message.Split([char]10)[0])"
+    Write-Output 'WARNING: public-name resolution will fail on both VMs; Session 2 hybrid join CANNOT work.'
+}
+
 $ouName = 'AzureFilesLab'
 if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$ouName'" -ErrorAction SilentlyContinue)) {
     New-ADOrganizationalUnit -Name $ouName -Path $domainDn -ProtectedFromAccidentalDeletion $false

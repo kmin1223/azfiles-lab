@@ -36,12 +36,54 @@ Back in the Entra portal (Cloud sync blade):
 3. Leave **Password hash sync** enabled (required for this lab).
 4. **Enable** the configuration and save.
 
+## 2b. Enable DEVICE sync — do not skip this
+
+> **Without this step hybrid join can never succeed**, and the failure looks like
+> something else entirely. `dsregcmd /join` returns:
+>
+> ```
+> Join error subcode: error_missing_device
+> Join message: The device object by the given id (<guid>) is not found.
+> DsrDeviceAutoJoin failed 0x801c03f3.
+> ```
+>
+> That `<guid>` is the **objectGUID of the AD computer object** — Cloud Sync maps
+> `DeviceId` ← `objectGUID` directly. The client is asking Entra to complete a
+> registration against a device object that sync was supposed to create, and
+> device sync is **disabled by default**.
+
+1. Cloud sync blade → select your **AD to Microsoft Entra ID** configuration.
+2. **Properties** → **Basics** → edit icon.
+3. Tick **Enable device sync** → **Apply**.
+4. **Provision on demand** → **Device** tab → enter the computer's distinguished
+   name (`CN=azflab-cli,CN=Computers,DC=contoso,DC=local`) → **Provision**.
+   This avoids waiting for the next cycle.
+
+Requires provisioning agent **1.1.1107 or later** — if the Device tab or the
+Enable device sync toggle is missing, your agent is too old. Download the current
+one from the portal.
+
+> **Preview.** Device sync with Cloud Sync is a **preview** capability. The GA
+> path for Microsoft Entra hybrid join is **Entra Connect Sync**, which does sync
+> computer objects. This lab uses Cloud Sync because it is far lighter to stand
+> up and because the subject of the session is Azure Files, not directory sync.
+> Say this out loud to the audience — and remember it on cases: a customer whose
+> hybrid join fails with `error_missing_device` while running Cloud Sync is
+> almost certainly missing device sync, or needs Entra Connect Sync instead.
+
 ## 3. Verify
 
 Provisioning usually starts within 2–3 minutes:
 
 - Portal: **Entra ID → Users** → `labuser1` appears with
   **On-premises sync enabled = Yes**.
+- Portal: **Entra ID → Devices** → `azflab-cli` appears, Join type
+  **Microsoft Entra hybrid joined** (it may say Registered until the client
+  completes its side). The **Device ID must equal the AD computer object's
+  objectGUID** — check with `Get-ADComputer azflab-cli -Properties ObjectGUID`
+  on the DC.
+- Only then, on the CLIENT (elevated): `dsregcmd /join /debug` →
+  `AzureAdJoined : YES`. Sign out and back in to get the PRT.
 - PowerShell:
 
 ```powershell

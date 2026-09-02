@@ -148,23 +148,89 @@ Step '4/4 Configuring client (cloud TGT policy + hybrid join, reboots)'
 $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName "$Prefix-cli" `
     -CommandId 'RunPowerShellScript' `
     -ScriptPath (Join-Path (Join-Path $PSScriptRoot 'scripts') 'client-config.ps1')
-($r.Value | Where-Object Code -like '*StdOut*').Message | Write-Host
+$clientOut = ($r.Value | Where-Object Code -like '*StdOut*').Message
+$clientOut | Write-Host
+
+# Do NOT print a green "COMPLETE" over a failed join. The client output already
+# says AzureAdJoined: NO when discovery failed - saying "complete" on top of that
+# sends people off to do Cloud Sync on a device that can never get a PRT, and
+# they then debug the wrong half of the stack.
+if ($clientOut -match 'DNS FAIL' -or $clientOut -match '0x80072ee7') {
+    Write-Host @'
+
+==============================================================
+ SETUP STOPPED - PUBLIC DNS IS BROKEN
+==============================================================
+ The client cannot resolve public names, so the device cannot
+ reach Entra and hybrid join is impossible. This is NOT an Entra
+ or SCP problem.
+
+ The VNet points every VM at the DC for DNS, and the DC has no
+ forwarder. Fix it on the DC (elevated), then re-run this script:
+
+   Set-DnsServerForwarder -IPAddress 168.63.129.16
+   Resolve-DnsName login.microsoftonline.com -Server 127.0.0.1
+
+ From Cloud Shell, without RDP:
+   Invoke-AzVMRunCommand -ResourceGroupName <rg> -VMName <prefix>-dc `
+     -CommandId RunPowerShellScript -ScriptString `
+     "Set-DnsServerForwarder -IPAddress 168.63.129.16; Resolve-DnsName login.microsoftonline.com -Server 127.0.0.1"
+==============================================================
+'@ -ForegroundColor Red
+    throw 'Client cannot resolve public DNS - fix the DC forwarder and re-run.'
+}
+if ($clientOut -match 'error_missing_device' -or $clientOut -match '0x801c03f3') {
+    Write-Host @'
+
+==============================================================
+ AzureAdJoined: NO - and that is EXPECTED right now
+==============================================================
+ The client asked Entra to complete a registration for a device
+ object that does not exist yet, so DRS answered:
+     error_missing_device / 0x801c03f3
+
+ In a managed tenant the device object must be put into Entra by
+ DIRECTORY SYNC first. That is the manual step below - and its
+ device sync is OFF BY DEFAULT, so enabling it is a step people
+ miss. Nothing is broken; just do them in order.
+==============================================================
+'@ -ForegroundColor Yellow
+}
+elseif ($clientOut -match 'AzureAdJoined\s*:\s*NO') {
+    Write-Host @'
+
+==============================================================
+ WARNING - HYBRID JOIN DID NOT COMPLETE, AND NOT FOR THE USUAL REASON
+==============================================================
+ AzureAdJoined: NO, but WITHOUT error_missing_device. Read the
+ client output above for the first real error before continuing -
+ do not assume Cloud Sync will fix it.
+==============================================================
+'@ -ForegroundColor Yellow
+}
 
 Write-Host @"
 
 ==============================================================
  AUTOMATED SETUP COMPLETE
 ==============================================================
- REMAINING MANUAL STEP (do it now, ~10 min, needs Global Admin):
-   -> MANUAL-STEP-cloud-sync.md
-   Install the Entra provisioning agent on the DC and create a
-   Cloud Sync config scoping OU=AzureFilesLab. Wait for labuser1
-   to appear as a synced (hybrid) user.
+ REMAINING MANUAL STEPS (~15 min, needs Global Admin)
+   -> MANUAL-STEP-cloud-sync.md.  ORDER MATTERS:
 
- Then, verify on the CLIENT VM (as CONTOSO\labuser1):
-   dsregcmd /status        # AzureAdJoined: YES (hybrid)
-   klist purge ; klist get krbtgt
-   klist cloud_debug       # cloud TGT present?
+   1. Install the Entra provisioning agent on the DC
+   2. Create a Cloud Sync config scoping OU=AzureFilesLab
+   3. Properties > Basics > ENABLE DEVICE SYNC   <- off by default,
+      and hybrid join CANNOT work without it
+   4. Provision on demand -> Device tab ->
+      CN=$Prefix-cli,CN=Computers,DC=contoso,DC=local
+   5. Confirm in Entra ID > Devices that $Prefix-cli exists
+
+ Then, on the CLIENT VM (elevated), finish the join:
+   dsregcmd /join /debug   # now it should succeed
+   # sign out and back in to pick up the PRT, then:
+   dsregcmd /status        # AzureAdJoined: YES, AzureAdPrt: YES
+   klist cloud_debug       # enabled by policy: true
+   klist get krbtgt        # krbtgt/KERBEROS.MICROSOFTONLINE.COM
    net use Z: \\$saName.file.core.windows.net\labshare
 ==============================================================
 "@ -ForegroundColor Green

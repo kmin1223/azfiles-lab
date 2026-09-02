@@ -10,11 +10,57 @@ New-Item -Path $key -Force | Out-Null
 Set-ItemProperty -Path $key -Name CloudKerberosTicketRetrievalEnabled -Value 1 -Type DWord
 Write-Output 'CloudKerberosTicketRetrievalEnabled = 1'
 
-# 2. Trigger hybrid join (device reads the SCP from AD and registers with Entra)
+# 1b. DNS preflight. Hybrid join talks to enterpriseregistration.windows.net and
+# login.microsoftonline.com over HTTPS. The VNet points every VM at the DC for
+# DNS, so if the DC has no forwarder NOTHING public resolves - and dsregcmd
+# reports it as 0x80072ee7 -> 0x801c003d, which reads like a tenant/SCP problem
+# rather than what it is. Name it here so nobody debugs Entra for an hour.
+$dnsOk = $true
+foreach ($n in 'login.microsoftonline.com', 'enterpriseregistration.windows.net') {
+    try {
+        Resolve-DnsName $n -ErrorAction Stop | Out-Null
+        Write-Output "DNS OK: $n"
+    } catch {
+        $dnsOk = $false
+        Write-Output "DNS FAIL: $n could not be resolved"
+    }
+}
+if (-not $dnsOk) {
+    Write-Output ''
+    Write-Output '*** PUBLIC DNS IS BROKEN ON THIS CLIENT - hybrid join will fail. ***'
+    Write-Output 'Cause: the VNet points this VM at the DC, and the DC has no DNS forwarder.'
+    Write-Output 'Fix (on the DC, elevated), then re-run session2 setup.ps1:'
+    Write-Output '    Set-DnsServerForwarder -IPAddress 168.63.129.16'
+    Write-Output '    Resolve-DnsName login.microsoftonline.com -Server 127.0.0.1'
+    Write-Output ''
+}
+
+# 2. Prime hybrid join. THIS ATTEMPT IS EXPECTED TO FAIL on a first run, and that
+# is not a bug in this script - it is the order the lab is built in.
+#
+# In a MANAGED (non-federated) tenant the device object must already exist in
+# Entra before the client can complete registration: the client asks DRS to
+# renew a device whose id is its own AD computer objectGUID, and directory sync
+# is what puts that object in Entra (Cloud Sync maps DeviceId <- objectGUID).
+# Cloud Sync runs AFTER this script, and its device sync is off by default - so
+# on the first pass DRS answers:
+#     error_missing_device / "The device object by the given id ... is not found"
+#     DsrDeviceAutoJoin failed 0x801c03f3
+# We still run it here to create the local device keys and surface the SCP
+# discovery result early. The join that actually succeeds happens after Cloud
+# Sync device sync has provisioned the computer object.
 $task = Get-ScheduledTask -TaskName 'Automatic-Device-Join' `
     -TaskPath '\Microsoft\Windows\Workplace Join\' -ErrorAction SilentlyContinue
 if ($task) { $task | Start-ScheduledTask }
-dsregcmd /join /debug 2>&1 | Select-Object -Last 5 | Write-Output
+$joinOut = dsregcmd /join /debug 2>&1
+$joinOut | Select-Object -Last 8 | Write-Output
+if ($joinOut -match 'error_missing_device' -or $joinOut -match '0x801c03f3') {
+    Write-Output ''
+    Write-Output 'EXPECTED at this stage: the Entra device object does not exist yet.'
+    Write-Output 'Next: Cloud Sync -> Properties -> Basics -> Enable device sync (preview),'
+    Write-Output 'then Provision on demand for CN=azflab-cli,CN=Computers,DC=contoso,DC=local,'
+    Write-Output 'then re-run  dsregcmd /join /debug  on the client. See MANUAL-STEP-cloud-sync.md.'
+}
 
 # 3. Fiddler Classic + Kerberos.NET extension - the ONLY way to see the KDC
 # Proxy (HTTPS) exchange that Entra Kerberos uses. Wireshark/netsh only show
