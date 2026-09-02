@@ -20,10 +20,14 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# Same helpers the Session 2 scripts use: a Cloud-Shell-friendly Graph sign-in
+# (no 120-second device code) and a storage-account lookup that ignores the
+# second account Test-Coexistence creates.
+. (Join-Path $PSScriptRoot 'session2-entra-kerberos/scripts/Connect-LabGraph.ps1')
+
 $saName = $null
 if ($IncludeEntra) {
-    $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue |
-        Where-Object StorageAccountName -like "$Prefix*" | Select-Object -First 1
+    $sa = Get-LabStorageAccount -ResourceGroupName $ResourceGroupName -Prefix $Prefix -ErrorAction SilentlyContinue
     $saName = $sa.StorageAccountName
 }
 
@@ -31,7 +35,7 @@ Write-Host "Deleting resource group $ResourceGroupName (async)..." -ForegroundCo
 Remove-AzResourceGroup -Name $ResourceGroupName -Force -AsJob | Out-Null
 
 if ($IncludeEntra) {
-    Connect-MgGraph -Scopes 'Application.ReadWrite.All', 'Device.ReadWrite.All' -NoWelcome
+    Connect-LabGraph -Scopes 'Application.ReadWrite.All', 'Device.ReadWrite.All'
 
     if ($saName) {
         Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $saName.file.core.windows.net'" |

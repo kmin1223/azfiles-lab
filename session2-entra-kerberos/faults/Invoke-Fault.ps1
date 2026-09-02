@@ -73,8 +73,11 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName |
-    Where-Object StorageAccountName -like "$Prefix*" | Select-Object -First 1
+# Shared with setup.ps1: Cloud-Shell-friendly Graph sign-in (no device code) and
+# storage-account lookup that ignores Test-Coexistence's second account.
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts/Connect-LabGraph.ps1')
+
+$sa = Get-LabStorageAccount -ResourceGroupName $ResourceGroupName -Prefix $Prefix
 if (-not $sa) { throw "No $Prefix* storage account in $ResourceGroupName" }
 $saName = $sa.StorageAccountName
 $cliName = "$Prefix-cli"
@@ -169,7 +172,7 @@ Write-Output 'WinHTTP proxy reset (direct access restored)'
     }
 
     'ConsentRevoked' {
-        Connect-MgGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All' -NoWelcome
+        Connect-LabGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All'
         $spn = Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $saName.file.core.windows.net'"
         if (-not $spn) { throw 'Storage account service principal not found.' }
         if (-not $Repair) {

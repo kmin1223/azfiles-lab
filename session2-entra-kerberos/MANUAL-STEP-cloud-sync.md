@@ -45,7 +45,11 @@ Provisioning usually starts within 2–3 minutes:
 - PowerShell:
 
 ```powershell
-Connect-MgGraph -Scopes User.Read.All
+# In Cloud Shell. Use the shared helper - a bare Connect-MgGraph here falls back
+# to the device code flow and times out after 120 seconds.
+. ./scripts/Connect-LabGraph.ps1
+Connect-LabGraph -Scopes User.Read.All
+
 Get-MgUser -Filter "startsWith(userPrincipalName,'labuser1')" `
   -Property userPrincipalName,onPremisesSyncEnabled |
   Select-Object userPrincipalName,onPremisesSyncEnabled

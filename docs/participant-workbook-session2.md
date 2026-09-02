@@ -186,7 +186,7 @@ obvious place, yet the effective value is off.
 **Break it:**
 
 ```powershell
-cd session2-entra-kerberos
+# you are already in azfiles-lab/session2-entra-kerberos from Lab 1
 ./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
 ```
 
@@ -465,7 +465,8 @@ so it can be correlated with Entra server-side logs by Request ID.
 # Clean up
 
 ```powershell
-./cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra
+# cleanup.ps1 lives at the REPO ROOT, one level up from session2-entra-kerberos
+../cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra
 ```
 
 Then delete the Cloud Sync configuration and provisioning agent in the Entra
