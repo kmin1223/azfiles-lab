@@ -187,10 +187,124 @@ if (-not $vm) {
     Write-Host "  $vmName already exists - reusing"
 }
 
+# A public IP is not optional here, and not only for RDP. Azure retired DEFAULT
+# OUTBOUND ACCESS on 30 Sep 2025: a VM with no public IP and no NAT gateway has
+# no route to the internet at all. The VM still answers Run Command (that rides
+# the Azure fabric, not the internet), so the box looks alive while the Entra
+# join quietly fails - which is exactly how this probe failed the first time.
+Step '  Public IP (required for outbound - no default outbound access since Sep 2025)'
+$nicId = (Get-AzVM -ResourceGroupName $ResourceGroupName -Name $vmName
+         ).NetworkProfile.NetworkInterfaces[0].Id
+$nic   = Get-AzNetworkInterface -ResourceId $nicId
+if (-not $nic.IpConfigurations[0].PublicIpAddress) {
+    $pipName = "$vmName-pip"
+    $pip = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroupName -Name $pipName -ErrorAction SilentlyContinue
+    if (-not $pip) {
+        # A DNS name label is NOT cosmetic here. RDP with an Entra ("web")
+        # account refuses an IP address outright:
+        #   "IP addresses are not supported ... provide the NetBIOS domain name
+        #    or FQDN"
+        # so without an FQDN nobody can sign in as the cloud user at all.
+        $pip = New-AzPublicIpAddress -ResourceGroupName $ResourceGroupName -Name $pipName `
+            -Location $Location -AllocationMethod Static -Sku Standard `
+            -DomainNameLabel $vmName
+    }
+    $nic.IpConfigurations[0].PublicIpAddress = $pip
+    Set-AzNetworkInterface -NetworkInterface $nic | Out-Null
+    Write-Host "  attached $pipName"
+} else {
+    Write-Host '  already has one'
+}
+
+# Retro-fit a DNS label if the IP was created without one (earlier runs).
+$pipObj = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroupName `
+    -Name (Split-Path (Get-AzNetworkInterface -ResourceId $nicId).IpConfigurations[0].PublicIpAddress.Id -Leaf)
+if (-not $pipObj.DnsSettings -or -not $pipObj.DnsSettings.Fqdn) {
+    $pipObj.DnsSettings = New-Object Microsoft.Azure.Commands.Network.Models.PSPublicIpAddressDnsSettings `
+        -Property @{ DomainNameLabel = $saName }
+    Set-AzPublicIpAddress -PublicIpAddress $pipObj | Out-Null
+    $pipObj = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroupName -Name $pipObj.Name
+}
+$fqdn = $pipObj.DnsSettings.Fqdn
+Write-Host "  FQDN: $fqdn"
+
+# Prove outbound BEFORE installing the extension. Without this check the only
+# symptom is "AzureAdJoined : NO", which sends you to debug Entra instead of
+# networking. DNS is deliberately part of the test: the platform resolver answers
+# even with no internet, so "DNS yes / 443 no" is the signature of no egress.
+Step '  Outbound connectivity check'
+$probe = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName `
+    -CommandId 'RunPowerShellScript' -ScriptString @'
+# All four are required by device registration, not just login.microsoftonline.com.
+foreach ($h in 'login.microsoftonline.com','device.login.microsoftonline.com',
+               'enterpriseregistration.windows.net','pas.windows.net') {
+    $tcp = Test-NetConnection $h -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+    Write-Output "$h TCP443=$tcp"
+}
+'@
+$probeTxt = ($probe.Value | Where-Object Code -like '*StdOut*').Message
+$probeTxt.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  $_" }
+if ($probeTxt -match 'TCP443=False') {
+    throw @"
+The VM cannot reach one of the device-registration endpoints on 443, so the Entra
+join cannot possibly work. Fix egress first - attach a public IP or a NAT gateway
+to the subnet - then re-run. (DNS answering while 443 fails is the classic
+'no default outbound access' signature; Azure retired default outbound in Sep 2025.)
+"@
+}
+
+# A SYSTEM-ASSIGNED MANAGED IDENTITY IS A HARD PREREQUISITE for
+# AADLoginForWindows. Without it the extension still installs and still reports
+# success - and the Entra join SILENTLY FAILS. The only symptom is
+# "AzureAdJoined : NO" with nothing wrong anywhere else, which is a superb way to
+# lose an afternoon. The portal's "Login with Microsoft Entra ID" checkbox turns
+# the identity on for you; adding the extension by hand does not.
+Step '  System-assigned managed identity (silent prerequisite)'
+$vmObj = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $vmName
+if ($vmObj.Identity -and $vmObj.Identity.Type -match 'SystemAssigned') {
+    Write-Host "  already enabled ($($vmObj.Identity.PrincipalId))"
+} else {
+    Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vmObj -IdentityType SystemAssigned | Out-Null
+    $vmObj = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $vmName
+    Write-Host "  enabled ($($vmObj.Identity.PrincipalId))"
+}
+
+# The Entra device registers under the machine's own name(s). RDP with an Entra
+# ("web") account then asks Entra to find a device matching the host name you
+# typed - and refuses a bare IP address:
+#   AADSTS293004: The target-device identifier <fqdn> was not found in the tenant
+# So the VM must KNOW its Azure FQDN before it registers. Giving it a primary DNS
+# suffix means it registers <vm>.<region>.cloudapp.azure.com, which is exactly
+# what participants will type. Without this, every participant would have to edit
+# their own hosts file - which needs local admin on a corporate laptop.
+# The suffix only takes effect after a restart, so this happens BEFORE the join.
+Step '  Primary DNS suffix (so the device registers its Azure FQDN)'
+$dnsSuffix = "$Location.cloudapp.azure.com"
+$suffixScript = @"
+`$p = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+Set-ItemProperty -Path `$p -Name 'Domain'    -Value '$dnsSuffix'
+Set-ItemProperty -Path `$p -Name 'NV Domain' -Value '$dnsSuffix'
+Write-Output "primary DNS suffix = $dnsSuffix"
+"@
+$tmpS = New-TemporaryFile
+Set-Content -Path $tmpS -Value $suffixScript
+try {
+    $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName `
+        -CommandId 'RunPowerShellScript' -ScriptPath $tmpS
+    Write-Host "  $((($r.Value | Where-Object Code -like '*StdOut*').Message).Trim())"
+} finally { Remove-Item $tmpS -Force }
+Write-Host '  restarting so the suffix applies before registration...'
+Restart-AzVM -ResourceGroupName $ResourceGroupName -Name $vmName | Out-Null
+Start-Sleep 45
+
 # THE extension under test. It performs a Microsoft Entra JOIN (not hybrid) and
 # enables sign-in to the VM with Entra credentials. If this fails on WS2025 the
 # whole cloud-only participant track needs a different client OS.
+# Re-installed every run on purpose: the extension does NOT retry a failed join,
+# so a stale failed install would keep reporting success while nothing happens.
 Step '  AADLoginForWindows extension (this is what performs the Entra join)'
+Remove-AzVMExtension -ResourceGroupName $ResourceGroupName -VMName $vmName `
+    -Name 'AADLoginForWindows' -Force -ErrorAction SilentlyContinue | Out-Null
 Set-AzVMExtension -ResourceGroupName $ResourceGroupName -VMName $vmName `
     -Name 'AADLoginForWindows' -Publisher 'Microsoft.Azure.ActiveDirectory' `
     -ExtensionType 'AADLoginForWindows' -TypeHandlerVersion '2.0' `
@@ -230,12 +344,62 @@ try {
     ($r.Value | Where-Object Code -like '*StdOut*').Message | Write-Host
 } finally { Remove-Item $tmp -Force }
 
-$ip = (Get-AzPublicIpAddress -ResourceGroupName $ResourceGroupName |
-    Select-Object -First 1).IpAddress
+# Find the public IP through the VM's own NIC rather than by grabbing the first
+# one in the resource group, and give the allocation a moment to appear - a
+# dynamic address reads back empty until the VM is running, which produced an
+# .rdp file with a blank "full address" on the first run.
+Step 'Resolving the public IP'
+$ip = $null
+for ($i = 0; $i -lt 10 -and -not $ip; $i++) {
+    try {
+        $nicId = (Get-AzVM -ResourceGroupName $ResourceGroupName -Name $vmName
+                 ).NetworkProfile.NetworkInterfaces[0].Id
+        $nic   = Get-AzNetworkInterface -ResourceId $nicId
+        $pipId = $nic.IpConfigurations[0].PublicIpAddress.Id
+        if ($pipId) {
+            $cand = (Get-AzPublicIpAddress -ResourceGroupName $ResourceGroupName `
+                        -Name (Split-Path $pipId -Leaf)).IpAddress
+            if ($cand -and $cand -ne 'Not Assigned') { $ip = $cand }
+        }
+    } catch { }
+    if (-not $ip) { Start-Sleep 15 }
+}
+if ($ip) { Write-Host "  $ip" } else { Write-Host '  still unassigned - see the note in the report below' -ForegroundColor Yellow }
+
+# The Entra join is done by the extension a little after it reports success, so
+# the dsregcmd we ran above is too early to mean anything. Poll it here instead
+# of printing a premature "AzureAdJoined : NO" and sending someone to debug it.
+Step 'Waiting for the Entra join to complete (up to 6 min)'
+$joined = $false
+for ($i = 0; $i -lt 12 -and -not $joined; $i++) {
+    Start-Sleep 30
+    try {
+        $st = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName `
+            -CommandId 'RunPowerShellScript' `
+            -ScriptString 'dsregcmd /status | Select-String "AzureAdJoined|DomainJoined|TenantName"'
+        $txt  = ($st.Value | Where-Object Code -like '*StdOut*').Message
+        $line = @($txt -split "`r?`n" | Where-Object { $_ -match 'AzureAdJoined' })[0]
+        Write-Host "  $($line.Trim())"
+        if ($txt -match 'AzureAdJoined\s*:\s*YES') { $joined = $true }
+    } catch { Write-Host '  (run command busy, retrying)' }
+}
+if ($joined) {
+    Write-Host '  ENTRA JOIN OK - the AADLoginForWindows extension works on WS2025.' -ForegroundColor Green
+} else {
+    Write-Host '  STILL NOT JOINED after 6 minutes. Read the logs; do not guess:' -ForegroundColor Yellow
+    Write-Host '' -ForegroundColor Yellow
+    Write-Host "  Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName ``" -ForegroundColor Yellow
+    Write-Host "    -CommandId RunPowerShellScript -ScriptString 'Get-WinEvent -LogName ""Microsoft-Windows-User Device Registration/Admin"" -MaxEvents 15 | Format-List TimeCreated,Id,Message'" -ForegroundColor Yellow
+    Write-Host '' -ForegroundColor Yellow
+    Write-Host '  That channel is the primary evidence for device registration.' -ForegroundColor Yellow
+    Write-Host '  Extension logs on the VM:' -ForegroundColor Yellow
+    Write-Host '    C:\WindowsAzure\Logs\Plugins\Microsoft.Azure.ActiveDirectory.AADLoginForWindows' -ForegroundColor Yellow
+}
 
 # ------------------------------------------------------------------ report
+# FQDN, not $ip: RDP with an Entra account rejects a bare IP address.
 $rdp = @"
-full address:s:$ip
+full address:s:$fqdn
 username:s:AzureAD\$upn
 enablerdsaadauth:i:1
 authentication level:i:2
@@ -252,7 +416,9 @@ Write-Host @"
  file share      : $ShareName
  cloud user      : $upn
  password        : $plainPw
- VM              : $vmName   $ip
+ VM              : $vmName
+ RDP host (FQDN) : $fqdn
+ (IP $ip - for reference only; Entra sign-in will NOT accept an IP)
 
  The Entra join runs after the extension settles. Give it ~5 minutes.
 ==============================================================
