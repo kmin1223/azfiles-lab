@@ -77,20 +77,31 @@ if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyCont
 
 # --------------------------------------------------- 1. storage + AADKERB
 Step '1/6 Storage account with Entra Kerberos (no AD DS anywhere)'
-$suffix = -join ((1..8) | ForEach-Object { [char[]]'abcdefghijklmnopqrstuvwxyz' | Get-Random })
-$saName = "$Prefix$suffix"
-$sa = New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
-    -Location $Location -SkuName Standard_LRS -Kind StorageV2 `
-    -EnableLargeFileShare -MinimumTlsVersion TLS1_2
-Write-Host "  created $saName"
+# Re-running the probe is normal (it took three attempts to get past Graph the
+# first time). Reuse the account instead of littering the RG with new ones.
+$sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue |
+    Where-Object StorageAccountName -like "$Prefix*" | Select-Object -First 1
+if ($sa) {
+    $saName = $sa.StorageAccountName
+    Write-Host "  reusing $saName"
+} else {
+    $suffix = -join ((1..8) | ForEach-Object { [char[]]'abcdefghijklmnopqrstuvwxyz' | Get-Random })
+    $saName = "$Prefix$suffix"
+    New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
+        -Location $Location -SkuName Standard_LRS -Kind StorageV2 `
+        -EnableLargeFileShare -MinimumTlsVersion TLS1_2 | Out-Null
+    Write-Host "  created $saName"
+}
 
 # For CLOUD-ONLY there is no ActiveDirectoryDomainName / DomainGuid to supply -
 # that is the whole point. Just switch the identity source to AADKERB.
 Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
     -EnableAzureActiveDirectoryKerberosForFile $true | Out-Null
 $ctx = (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName).Context
-New-AzStorageShare -Name $ShareName -Context $ctx | Out-Null
-Write-Host "  AADKERB enabled, share '$ShareName' created"
+if (-not (Get-AzStorageShare -Name $ShareName -Context $ctx -ErrorAction SilentlyContinue)) {
+    New-AzStorageShare -Name $ShareName -Context $ctx | Out-Null
+}
+Write-Host "  AADKERB enabled, share '$ShareName' ready"
 
 # --------------------------------------------------- 2. admin consent
 Step '2/6 Admin consent for the storage account app'
@@ -116,28 +127,49 @@ Write-Host '  consent granted: openid profile User.Read'
 
 # --------------------------------------------------- 3. cloud-only user
 Step '3/6 Cloud-only Entra user (created in Entra, synced from nowhere)'
+# Cloud Shell ships the Microsoft.Graph sub-modules unevenly: Applications and
+# Identity.DirectoryManagement are there, Microsoft.Graph.Users is not, so
+# Get-MgUser/New-MgUser blow up. Invoke-MgGraphRequest lives in
+# Microsoft.Graph.Authentication - the same module Connect-MgGraph comes from -
+# so calling the REST API directly needs nothing extra and cannot drift.
+# Note: these return hashtables with camelCase keys, not typed objects.
+$graph = 'https://graph.microsoft.com/v1.0'
+
 $org = Get-MgOrganization | Select-Object -First 1
 $initialDomain = ($org.VerifiedDomains | Where-Object IsInitial).Name
 $upn = "$UserName@$initialDomain"
 
-$user = Get-MgUser -Filter "userPrincipalName eq '$upn'" -ErrorAction SilentlyContinue
-if ($user) {
+$flt  = [uri]::EscapeDataString("userPrincipalName eq '$upn'")
+$sel  = 'id,userPrincipalName,onPremisesSyncEnabled'
+$found = (Invoke-MgGraphRequest -Method GET `
+    -Uri "$graph/users?`$filter=$flt&`$select=$sel").value | Select-Object -First 1
+
+# ForceChangePasswordNextSignIn = false matters: a forced change on first
+# sign-in derails an RDP-based test for reasons that have nothing to do with
+# the question we are asking.
+$pwProfile = @{ password = $plainPw; forceChangePasswordNextSignIn = $false }
+
+if ($found) {
     Write-Host "  $upn already exists - resetting its password"
-    Update-MgUser -UserId $user.Id -PasswordProfile @{
-        Password = $plainPw; ForceChangePasswordNextSignIn = $false }
+    Invoke-MgGraphRequest -Method PATCH -Uri "$graph/users/$($found.id)" `
+        -Body @{ passwordProfile = $pwProfile } | Out-Null
+    $userId = $found.id
 } else {
-    # ForceChangePasswordNextSignIn = false matters: a forced change on first
-    # sign-in derails an RDP-based test for reasons that have nothing to do with
-    # the question we are asking.
-    $user = New-MgUser -DisplayName $UserName -MailNickname $UserName `
-        -UserPrincipalName $upn -AccountEnabled `
-        -PasswordProfile @{ Password = $plainPw; ForceChangePasswordNextSignIn = $false }
+    $new = Invoke-MgGraphRequest -Method POST -Uri "$graph/users" -Body @{
+        accountEnabled    = $true
+        displayName       = $UserName
+        mailNickname      = $UserName
+        userPrincipalName = $upn
+        passwordProfile   = $pwProfile
+    }
+    $userId = $new.id
     Write-Host "  created $upn"
 }
+
 # onPremisesSyncEnabled must be null/false here - if it is True you are looking
 # at a hybrid user and this probe is not testing what you think it is.
-$check = Get-MgUser -UserId $user.Id -Property userPrincipalName, onPremisesSyncEnabled
-Write-Host "  onPremisesSyncEnabled = $($check.OnPremisesSyncEnabled)  (must NOT be True)"
+$check = Invoke-MgGraphRequest -Method GET -Uri "$graph/users/$userId`?`$select=$sel"
+Write-Host "  onPremisesSyncEnabled = $($check.onPremisesSyncEnabled)  (must NOT be True)"
 
 # --------------------------------------------------- 4. VM + Entra join
 Step '4/6 Windows Server 2025 VM, Entra joined by extension (no domain)'
@@ -172,13 +204,14 @@ $saId    = (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $sa
 foreach ($r in @(
     @{ Role = 'Virtual Machine Administrator Login';        Scope = $rgScope },
     @{ Role = 'Storage File Data SMB Share Contributor';    Scope = $saId })) {
-    $existing = Get-AzRoleAssignment -ObjectId $user.Id -Scope $r.Scope `
+    $existing = Get-AzRoleAssignment -ObjectId $userId -Scope $r.Scope `
         -RoleDefinitionName $r.Role -ErrorAction SilentlyContinue
     if (-not $existing) {
-        New-AzRoleAssignment -ObjectId $user.Id -RoleDefinitionName $r.Role -Scope $r.Scope | Out-Null
+        New-AzRoleAssignment -ObjectId $userId -RoleDefinitionName $r.Role -Scope $r.Scope | Out-Null
     }
     Write-Host "  $($r.Role)"
 }
+Write-Host '  NOTE: role assignments can take a few minutes to propagate.'
 
 # --------------------------------------------------- 6. client policy
 Step '6/6 CloudKerberosTicketRetrievalEnabled = 1 on the client'
@@ -272,6 +305,7 @@ $rdp
 ==============================================================
  TEAR DOWN
    Remove-AzResourceGroup -Name $ResourceGroupName -Force -AsJob
-   Remove-MgUser -UserId $($user.Id)
+   Invoke-MgGraphRequest -Method DELETE -Uri "$graph/users/$userId"
+   # and remove the Entra DEVICE object for $vmName under Entra ID > Devices
 ==============================================================
 "@ -ForegroundColor Green
