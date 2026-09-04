@@ -281,9 +281,13 @@ Three things in that list surprise people:
   pre-authentication data, so the KDC asks for it and the client immediately
   retries. Wireshark paints it red; it is the most misread frame in any Kerberos
   capture. A healthy exchange contains it.
-- **`Negotiate` happens before Kerberos.** That is exactly why the SMB cipher
-  cannot be chosen per storage account — the dialect and cipher are agreed
-  before the client has even named the account. Lab 3 lives on this fact.
+- **`Negotiate` happens before Kerberos.** The dialect and the SMB cipher are
+  settled before a single Kerberos frame goes out, and the server simply takes
+  the **first cipher the client offered** — it does not consult the storage
+  account's `channelEncryption` at this point. That check happens one step later,
+  at Session Setup. Lab 3 lives on this fact. (The account name *is* on the wire
+  here, in `SMB2_NETNAME_NEGOTIATE_CONTEXT_ID` — the server just doesn't use it
+  to choose the cipher.)
 - **You never see `Tree Connect`.** Once Session Setup succeeds, SMB3 encryption
   is on and everything after it shows as `Encrypted SMB3`. **The wire shows you
   authentication, not authorization** — which is why the "Access denied" labs
@@ -293,6 +297,17 @@ Three things in that list surprise people:
 > `klist purge` first, so even the TGT has to be re-acquired and you get the AS
 > exchange too. On a real case the user already holds a TGT and you will usually
 > see only `TGS-REQ` / `TGS-REP`. Don't treat a missing AS exchange as a finding.
+>
+> **And note what did NOT happen: you were not asked to log on again.** The TGT
+> is not stored somewhere separate — the *credential that can fetch a TGT* is.
+> A logon session holds two things: the ticket cache, and the session's own
+> credential material. `klist purge` empties only the first, so the next Kerberos
+> request silently re-authenticates with the second. That AS exchange in your
+> capture **is** that silent re-authentication.
+>
+> Two consequences worth carrying to a real case: purge is a safe reset **only
+> while the DC is reachable**, and purge does **not** re-validate the password —
+> a changed password keeps working until the user signs in again.
 
 And on the **DC**, the KDC's own record of that ticket:
 
