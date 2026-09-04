@@ -300,6 +300,15 @@ authentication level:i:2
 $rdpPath = "$HOME/azfiles-cloudonly.rdp"
 $rdp | Set-Content -Path $rdpPath -Encoding ascii
 
+# Push the file to the browser straight away. enablerdsaadauth is a FILE
+# property - mstsc has no switch or GUI field for it - so everyone needs this
+# file, and hand-typing the FQDN is where people get it wrong. Cloud Shell
+# provides 'download'; if this is running somewhere else, just print the command.
+$autoDownloaded = $false
+if (Get-Command download -ErrorAction SilentlyContinue) {
+    try { download $rdpPath; $autoDownloaded = $true } catch { }
+}
+
 Write-Host @"
 
 ==============================================================
@@ -313,15 +322,27 @@ Write-Host @"
  RDP host        : $fqdn
  Entra joined    : $(if ($joined) { 'YES' } else { 'NOT YET - see the warning above' })
 ==============================================================
- CONNECT  (an .rdp file is at $rdpPath)
+ CONNECT
 
-   full address:s:$fqdn
-   username:s:AzureAD\labuser1@$initialDomain
-   enablerdsaadauth:i:1
-   authentication level:i:2
+   >>>  download $rdpPath  <<<
+$(if ($autoDownloaded) {
+"   Already sent to your browser - check your Downloads folder.
+   Run the command above again if you need another copy."
+} else {
+"   Run that in Cloud Shell to save the .rdp file locally."
+})
+   Then open it and sign in as
+     labuser1@$initialDomain  /  $plainPw
 
- Use the FQDN. Entra sign-in rejects a bare IP address, and it must
- match the name the device registered under.
+ Why a file: enablerdsaadauth is an .rdp property. mstsc has no
+ switch and no GUI field for it, so "mstsc /v:$fqdn" will NOT use
+ Entra sign-in. And the address must be this FQDN - Entra rejects a
+ bare IP, and the name has to match the one the device registered
+ under.
+
+ Fallbacks if the download is awkward: build the file by hand with
+ the four lines in $rdpPath, or use Azure portal -> the VM ->
+ Connect -> RDP -> login source "Microsoft Entra ID".
 
  FIRST SIGN-IN asks you to register MFA (security defaults). Have
  Microsoft Authenticator ready - it takes about two minutes.
