@@ -256,6 +256,13 @@ cipher를 먼저 정합니다.** 신원 얘기가 시작되기도 전이에요. 
 줍니다.
 
 ③ **입장권 제시** — 이제 DC는 끝났고, Azure Files에 그 티켓을 내밉니다.
+프로토콜 이름에 `AP-REQ inside`라고 적어둔 이유가 있습니다 — **트레이스 목록에서
+`AP-REQ`를 찾으면 없습니다.** 그건 프레임이 아니라 **Session Setup Request의
+security blob 안에** 들어 있거든요. Wireshark의 Info 열은 바깥 프로토콜인 SMB2가
+가져가고, AP-REQ를 보려면 그 프레임을 펼쳐서 Security Blob → GSS-API → SPNEGO로
+내려가야 합니다. **티켓이 blob 안에 산다** — 이게 이따 Lab 3에서 `Blob Length: 0`이
+왜 결정적인지의 근거가 됩니다.
+
 아까 용어에서 말했듯 이 티켓은 **Azure Files의 키로 암호화돼** 있어서, Azure
 Files가 자기 키로 복호화를 시도합니다. 여기가 함정입니다 — 티켓 발급까지
 완벽했어도 **복호화에 실패하면 여기서 죽습니다.**
