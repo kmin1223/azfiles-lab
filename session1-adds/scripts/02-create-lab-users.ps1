@@ -134,7 +134,7 @@ if (-not $hasReadAce) {
 # Dedicated service-bound RPC rules; do not enable the broad built-in rule group.
 foreach ($rule in @(
     @{ Name = 'AzureFilesLab-Evidence-EventLog-RPC'; Port = 'RPC'; Service = 'eventlog' },
-    @{ Name = 'AzureFilesLab-Evidence-RPC-EPMap'; Port = 'RPC-EPMap'; Service = 'RpcSs' }
+    @{ Name = 'AzureFilesLab-Evidence-RPC-EPMap'; Port = 'RPCEPMap'; Service = 'RpcSs' }
 )) {
     $settings = @{
         PolicyStore = 'PersistentStore'
@@ -149,9 +149,9 @@ foreach ($rule in @(
     }
 }
 
-# Native commands do not throw on a nonzero exit in Windows PowerShell 5.1.
-Invoke-EventUtility auditpol @('/set', '/subcategory:Kerberos Service Ticket Operations', '/success:enable', '/failure:enable') | Out-Null
-Invoke-EventUtility auditpol @('/set', '/subcategory:Kerberos Authentication Service', '/success:enable', '/failure:enable') | Out-Null
+# Use subcategory GUIDs so auditing also works on non-English Windows.
+Invoke-EventUtility auditpol @('/set', '/subcategory:{0CCE9240-69AE-11D9-BED3-505054503030}', '/success:enable', '/failure:enable') | Out-Null
+Invoke-EventUtility auditpol @('/set', '/subcategory:{0CCE9242-69AE-11D9-BED3-505054503030}', '/success:enable', '/failure:enable') | Out-Null
 $kdcPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc'
 $extraLogLevel = (Get-ItemProperty -Path $kdcPath -ErrorAction Stop).KdcExtraLogLevel
 # An absent override uses the KDC default (0x2, PKINIT logging).
