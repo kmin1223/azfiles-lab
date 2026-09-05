@@ -82,11 +82,16 @@ foreach ($u in 'labuser1', 'labuser2') {
         Add-ADGroupMember -Identity $readers -Members $user
     }
 }
-# Use the well-known SID, not a localized group name, for remote event access.
+# BUILTIN Event Log Readers cannot contain the domain's DomainLocal group.
+# Add users directly; retain the DomainLocal group for the Security channel ACE.
 $eventReaders = Get-ADGroup -Identity 'S-1-5-32-573'
-if (@(Get-ADGroupMember -Identity $eventReaders |
-        Select-Object -ExpandProperty DistinguishedName) -notcontains $readers.DistinguishedName) {
-    Add-ADGroupMember -Identity $eventReaders -Members $readers
+$eventReaderMembers = @(Get-ADGroupMember -Identity $eventReaders |
+    Select-Object -ExpandProperty DistinguishedName)
+foreach ($u in 'labuser1', 'labuser2') {
+    $user = Get-ADUser -Identity $u
+    if ($eventReaderMembers -notcontains $user.DistinguishedName) {
+        Add-ADGroupMember -Identity $eventReaders -Members $user
+    }
 }
 
 function Invoke-EventUtility {

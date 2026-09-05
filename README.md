@@ -121,8 +121,18 @@ the **post-deployment client tools installation** before using it; the
 The DC setup grants the lab evidence-reader group read access and enables
 remote event-log access from the lab client's private address only. It does
 not make the lab users domain administrators.
+The two lab users are added directly to the built-in Event Log Readers group;
+the DomainLocal evidence-reader group is used separately for the Security
+channel read ACE. Nesting that DomainLocal group into the built-in group fails
+with AD error 8520.
 Source updates do not update existing VMs automatically. Existing lab users
 must sign out and sign in again after the DC reader-group membership is applied.
+
+If deployment stopped at this group-membership error, stop the retrying deploy,
+update the source, and rerun with the same resource group and the original
+password supplied through `-AdminPassword` (a SecureString). Existing lab users
+are retained, so omitting that parameter and generating a new password would
+not synchronize their passwords. The partially created reader group is reused.
 
 Use **two PowerShell windows, three steps** on the client:
 
