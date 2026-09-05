@@ -300,6 +300,15 @@ Write-Output "Client clock re-synced: $(Get-Date)"
     }
 
     'DuplicateSpn' {
+        # NOTE: AD enforces servicePrincipalName uniqueness forest-wide at write
+        # time, so on a healthy modern domain the Add below is usually REFUSED
+        # ("SPN value provided for addition/modification is not unique
+        # forest-wide"). Test this fault before relying on it in a session. If it
+        # is refused, that refusal is the teaching point: real duplicate-SPN
+        # incidents come from lingering objects / restored DCs / writes that
+        # bypassed the check, not from a plain duplicate registration. When
+        # duplicates DO exist, expect KDC_ERR_PRINCIPAL_NOT_UNIQUE rather than a
+        # silent match on the wrong object.
         $spn = "cifs/$saName.file.core.windows.net"
         $decoy = "$saName-decoy"
         if (-not $Repair) {

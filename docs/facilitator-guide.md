@@ -154,10 +154,19 @@ what the Block445 lab produces. Diagnose:
 use private endpoint/VPN.
 
 **System error 64 — "network name no longer available"**
-A *different* signature: TCP 445 connects, but a proxy/NAT middlebox drops the
-SMB handshake. `Test-NetConnection` may even succeed. Diagnose with a network
-trace (handshake starts, no response). Teach the contrast with 53/67 — it's a
-frequent mis-triage in the field.
+A *different* signature from 53/67: TCP 445 connects and `Test-NetConnection` may
+even succeed, yet the session dies. The **most common** cause is a middlebox —
+proxy, NAT, firewall — dropping or resetting the SMB conversation after the TCP
+handshake.
+
+But do not close on that. Error 64 is `ERROR_NETNAME_DELETED`: it means the
+server side of the session went away, and **the server can tear a session down
+for its own reasons too** — Kerberos/account configuration problems and idle or
+policy-driven session teardown produce the same code. Rule: take a network trace
+and see *where* it stops. Handshake starts with no response points at the
+network path; a session that authenticates and then dies points back at
+configuration. Teach the contrast with 53/67 — the mis-triage is frequent — but
+teach 64 as "the session was torn down, find out by whom", not as "proxy".
 
 **System error 67 — network name cannot be found**
 Cause (classic): single slash in the UNC path typo, or DNS failure; also seen
@@ -319,9 +328,22 @@ against known-good. The three questions the evidence answers that an error
 string can't:
 
 1. **Did the KDC issue a ticket?** — event 4769 on the DC (and the TGS-REP in
-   the trace). Success here eliminates SPN, etype and DC problems in one step.
-2. **What did the client actually ask for?** — 4769's Service Name shows the SPN
-   string as requested, which exposes CNAME/suffix and typo problems.
+   the trace). Success here means the **KDC did its part**: it found an account
+   for the SPN and encrypted a ticket with a mutually supported etype. It does
+   **not** mean authentication succeeded — the AP exchange and SMB Session Setup
+   are still ahead, and Lab 2 is precisely a successful 4769 followed by a
+   failed mount. Say "the KDC issued it", never "authentication worked".
+
+   > And read a *missing* 4769 carefully. No event does not prove no request.
+   > Check that Kerberos auditing is on, that the log hasn't rolled, that you
+   > are looking at **the DC the client actually used**, and that the client
+   > wasn't simply serving the request from its own ticket cache (in which case
+   > there is no TGS request to log at all).
+2. **Which account did the KDC match?** — 4769's **Service Name** is the *account
+   or computer object* the ticket was requested for (`<sa>$`), not the SPN string
+   the client typed. That is exactly what makes it decisive for duplicate-SPN
+   hunts. To see the requested SPN, read the client side: `klist get <spn>` or
+   the TGS-REQ in the trace.
 3. **Where did it stop?** — TGS vs SessionSetup vs TreeConnect in the trace maps
    directly to authentication vs service-key vs authorization.
 

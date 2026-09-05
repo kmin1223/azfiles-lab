@@ -246,8 +246,12 @@ converts it to `.pcapng`, and collects the Kerberos/SMBClient logs into
 > a good ticket from the DC and sent a good AP-REQ. The refusal came from the
 > **service**, inside the SMB Session Setup — so it lands in `SMBClient/Security`.
 >
-> The 30904 events ("server does not support multichannel") are routine against
-> Azure Files — the Negotiate response simply doesn't advertise multichannel. The
+> The 30904 events ("server does not support multichannel") are routine **in this
+> lab's configuration** — our standard share's Negotiate response doesn't
+> advertise multichannel. Don't generalise it: **Azure Files does support SMB
+> Multichannel on premium (SSD) file shares**, where it is off by default and
+> enabled per storage account. So a customer seeing these events may simply not
+> have turned it on. The
 > collector labels them benign and tells you how many events are actually worth
 > reading, so a full-looking log doesn't send you chasing it.
 >
@@ -282,12 +286,19 @@ Three things in that list surprise people:
   retries. Wireshark paints it red; it is the most misread frame in any Kerberos
   capture. A healthy exchange contains it.
 - **`Negotiate` happens before Kerberos.** The dialect and the SMB cipher are
-  settled before a single Kerberos frame goes out, and the server simply takes
-  the **first cipher the client offered** — it does not consult the storage
-  account's `channelEncryption` at this point. That check happens one step later,
-  at Session Setup. Lab 3 lives on this fact. (The account name *is* on the wire
-  here, in `SMB2_NETNAME_NEGOTIATE_CONTEXT_ID` — the server just doesn't use it
-  to choose the cipher.)
+  settled before a single Kerberos frame goes out, and the storage account's
+  `channelEncryption` setting is **not** consulted at this point — that check
+  happens one step later, at Session Setup, which is what Lab 3 lives on. (The
+  account name *is* on the wire here, in `SMB2_NETNAME_NEGOTIATE_CONTEXT_ID` —
+  the server just doesn't use it to choose the cipher.)
+
+  > **How the cipher gets chosen — observed, not specified.** In every capture we
+  > took against Azure Files, the server returned the client's **first** offered
+  > cipher. MS-SMB2 leaves the selection algorithm to the implementation (Windows
+  > Server, for instance, picks by *server* preference), so treat "first offer
+  > wins" as **the behaviour of Azure Files as we measured it**, not as a
+  > protocol rule. The repair it implies is unaffected either way: put an
+  > account-allowed cipher at the **head** of the client's list.
 - **You never see `Tree Connect`.** Once Session Setup succeeds, SMB3 encryption
   is on and everything after it shows as `Encrypted SMB3`. **The wire shows you
   authentication, not authorization** — which is why the "Access denied" labs
@@ -305,9 +316,14 @@ Three things in that list surprise people:
 > request silently re-authenticates with the second. That AS exchange in your
 > capture **is** that silent re-authentication.
 >
-> Two consequences worth carrying to a real case: purge is a safe reset **only
-> while the DC is reachable**, and purge does **not** re-validate the password —
-> a changed password keeps working until the user signs in again.
+> Two consequences worth carrying to a real case. First, purge is a safe reset
+> **only while the DC is reachable** — purge with the DC down and you cannot get
+> a new TGT until you sign out and back in. Second, purge does **not** re-validate
+> the password: it reuses whatever credential material the logon session already
+> holds. So a purge tells you nothing about whether the password is still current
+> — and if that material has gone stale (the password was changed elsewhere), the
+> silent AS-REQ **fails** rather than succeeding quietly. Don't read "the mount
+> still works after purge" as "the password is fine".
 
 And on the **DC**, the KDC's own record of that ticket:
 
@@ -316,10 +332,18 @@ Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 5 |
   Format-List TimeCreated, Message
 ```
 
-Note three fields in event 4769: the **Service Name** (the SPN as the client
-asked for it), the **Ticket Encryption Type** (`0x12` = AES-256, what you have
-now; `0x17` = RC4, which is what you'll see after regressing to the legacy state
-in the migration lab), and the **Failure Code** (`0x0` on success).
+Note three fields in event 4769:
+
+- **Service Name** — the **account or computer object** the ticket was requested
+  *for*, so it looks like `<sa>$`, not like the SPN string the client typed.
+  (Microsoft's own field definition: *"the name of the account or computer for
+  which the service ticket was requested."*) This matters more than it sounds:
+  when you are hunting a duplicate SPN, this field tells you **which object the
+  KDC actually matched**. To see the SPN the client asked for, read the client
+  side — `klist get <spn>` or the TGS-REQ in the trace.
+- **Ticket Encryption Type** — `0x12` = AES-256, what you have now; `0x17` = RC4,
+  which is what you'll see after regressing to the legacy state in the migration lab.
+- **Failure Code** — `0x0` on success.
 
 ---
 
@@ -546,11 +570,21 @@ Three things that capture proves, and they are not what most people assume:
    at Session Setup. (The client *does* name the account at Negotiate — it is
    right there in `SMB2_NETNAME_NEGOTIATE_CONTEXT_ID` — the server just doesn't
    use it to filter the cipher list.)
-3. **The rejection carries no Kerberos error at all.** `Blob Length: 0`, no GSS
-   token, response in ~3 ms. The ticket was never opened. Compare with Lab 5,
-   where the same-looking denial *does* carry a Kerberos error (`AP_ERR_MODIFIED`)
-   inside the blob. **Empty blob ⇒ not identity. Populated blob ⇒ identity.**
-   That one distinction is the fastest triage in this whole session.
+3. **This particular rejection carries no Kerberos error at all.** `Blob Length: 0`,
+   no GSS token, response in ~3 ms. Compare with Lab 5, where the same-looking
+   denial *does* carry a Kerberos error (`AP_ERR_MODIFIED`) inside the blob.
+
+   The useful triage rule is a **conjunction**, not a single field:
+
+   | You see | Read it as |
+   |---|---|
+   | `0xc0000022` + blob length **0** + Kerberos logs/trace **clean** | the service refused before identity — look at channel/config, e.g. the cipher |
+   | denial + blob **populated** with a KRB error | identity — read that error |
+
+   A populated blob proves a Kerberos error was returned; **an empty blob on its
+   own proves only that no GSS token came back.** Confirm with the SMB status
+   code and the client-side Kerberos logs before you rule identity out. Used with
+   that qualifier, it is still the fastest triage in this session.
 
 This also matches the documented requirement: if you set an account to
 AES-256-GCM only, Microsoft's own guidance is to run
@@ -760,7 +794,8 @@ Fix: `-Fault Block445 -Repair`.
 
 **Why:** SMB needs outbound TCP 445. ISPs, firewalls, and NSGs often block it;
 the fix is to open it or use a private endpoint / VPN. (A related but different
-error, 64, means 445 connects but a proxy/NAT drops the SMB handshake.)
+error, 64, means 445 connects but the session gets torn down — usually a
+proxy/NAT/firewall, though not only.)
 
 ## 7b · Lost share-level access
 
@@ -796,15 +831,26 @@ trace or event 4769. That's the point.
   error is vague; the trace shows `KRB_AP_ERR_SKEW`. Confirm with
   `w32tm /stripchart /computer:azflab-dc /samples:3`. (Kerberos tolerates about
   5 minutes.)
-- **`-Fault DuplicateSpn`** — the "ghost object": registers the storage SPN on a
-  second AD object. A share that worked yesterday breaks with no config change
-  on the storage account at all — the KDC matches the ghost and encrypts the
-  ticket with the *wrong account's* key (→ 1396 at the service), or, if the
-  ghost has no usable key, returns `ETYPE_NOSUPP`. Diagnosis order:
+- **`-Fault DuplicateSpn`** — the "ghost object": tries to register the storage
+  SPN on a second AD object.
+
+  > **Read this before you run it.** AD enforces SPN uniqueness forest-wide at
+  > write time, so on a healthy modern domain this write is usually **refused**
+  > (*"SPN value provided for addition/modification is not unique forest-wide"*).
+  > That refusal is itself the lesson — it is why real duplicate-SPN incidents
+  > come from odd states (lingering objects, restored-from-backup DCs, writes
+  > that bypassed the check) rather than from someone simply typing `setspn -a`
+  > twice. And **when duplicates do exist, the usual KDC answer is
+  > `KDC_ERR_PRINCIPAL_NOT_UNIQUE`**, not a silent match on the wrong object.
+  > Treat "the KDC matched the ghost and used the wrong key" as one possible
+  > outcome, not the expected one.
+
+  Diagnosis order:
   1. `setspn -X` (or `-F -Q cifs/<sa>...`) to look for duplicates — but know its
-     limit: these query the **GC**, so a ghost that exists only in one DC's local
-     domain partition (lingering object) or in another domain of the forest can
-     hide from it.
+     limit: `-F` is a **forest** search against the GC, so another *domain* in the
+     forest does **not** hide a duplicate. What can hide is an object that never
+     replicated properly — a **lingering object** sitting in one DC's local
+     partition.
   2. The decisive evidence is **event 4769 on the DC that failed the request**:
      its Service Name / Service ID show *which account the KDC actually
      matched*. One 4769 line beats hours of theorising. (Straight from a real
@@ -861,7 +907,7 @@ Wireshark filter:  kerberos || smb2
 | `KRB_AP_ERR_SKEW` | Clock skew > ~5 min between client and DC |
 | duplicate SPN in `setspn -X` | Two AD objects claim the same SPN |
 | System error 53 / 67 / timeout | Port 445 blocked or DNS |
-| System error 64 | 445 connects, proxy/NAT drops the SMB handshake |
+| System error 64 | 445 connects but the session is torn down. Most often a proxy/NAT/firewall middlebox — **but not only**: `ERROR_NETNAME_DELETED` also covers server-side teardown, so Kerberos/account config stays on the list. Trace it and see where it stops. |
 | System error 1396 (AP_ERR_MODIFIED) | Kerb key ≠ AD account password — **or** an AES salt mismatch (wrong DomainName) |
 | 0xc000018b / PRINCIPAL_UNKNOWN | SPN missing or wrong |
 | "encryption type not supported" | Encryption mismatch (use AES-256) |
