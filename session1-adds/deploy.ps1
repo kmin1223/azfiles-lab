@@ -85,12 +85,12 @@ function Show-Cmd([string]$Command) {
 # What actually runs inside each Run Command payload - the one-line essence.
 $scriptCore = @{
     '01-promote-dc.ps1'         = "Install-ADDSForest -DomainName $DomainName (then reboot)"
-    '02-create-lab-users.ps1'   = 'New-ADUser labuser1/labuser2; OU AzureFilesLab; auditpol Kerberos 4768/4769'
+    '02-create-lab-users.ps1'   = 'lab users; read-only DC Security evidence; client-scoped RPC; Kerberos auditing'
     '03-join-domain-client.ps1' = "Add-Computer -DomainName $DomainName (then reboot); RDP group for Domain Users"
     '04-domain-join-storage.ps1'= 'New-ADComputer <sa>; setspn cifs/<sa>.file.core.windows.net; Set-ADAccountPassword = kerb1'
     '06-sync-kerb-password.ps1' = 'Set-ADAccountPassword (AD object) = current kerb1; then net use with the storage KEY + icacls'
     '05-set-ntfs-perms.ps1'     = 'net use with the storage KEY, then icacls on the share root'
-    '07-install-tools.ps1'      = 'client: module bundle + RSAT | DC: auditpol Kerberos 4768/4769 + operational logs'
+    '07-install-tools.ps1'      = 'client only: module bundle + RSAT + evidence collector with DC target'
     '08-verify-mount.ps1'       = 'net use \\<sa>.file.core.windows.net\labshare as a domain user; report etype'
 }
 
@@ -279,6 +279,10 @@ function Invoke-VmScript {
             $out = ($r.Value | Where-Object Code -like '*StdOut*').Message
             $err = ($r.Value | Where-Object Code -like '*StdErr*').Message
             if ($err) { Write-Warning $err }
+            if ($ScriptFile -eq '02-create-lab-users.ps1' -and
+                ($out -join "`n") -notmatch '(?m)^DC_EVIDENCE_READY\r?$') {
+                throw 'DC evidence preparation did not report DC_EVIDENCE_READY; deployment is not ready.'
+            }
             return $out
         } catch {
             if (Test-RunCommandBusy $_) {
@@ -400,9 +404,9 @@ if ($promoteOut -notmatch 'ALREADY_PROMOTED') {
 # The script also enables Kerberos auditing (4768/4769 incl. failures) and the
 # operational logs - folded in rather than a separate call, because each Run
 # Command round-trip costs ~60s regardless of what it does.
-Step '3/9 Creating lab users + DC Kerberos auditing (retries until AD is up)'
+Step '3/9 Creating lab users + read-only DC evidence access (retries until AD is up)'
 Invoke-VmScript -VmName $dcName -ScriptFile '02-create-lab-users.ps1' `
-    -Params @{ Password = $plainPw } -Retries 8 -RetryDelaySec 60 | Write-Host
+    -Params @{ Password = $plainPw; EvidenceClientAddress = '10.100.0.5' } -Retries 8 -RetryDelaySec 60 | Write-Host
 
 # ----------------------------------------------------- 4. Join client VM
 # Started as a job: the client reboot (~3 min) overlaps the storage-account
@@ -556,8 +560,9 @@ $pwLine Transcript      : $logFile
    ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Legacy
  (takes ~3 min - kick it off while the RC4-retirement slides are running)
 
- Diagnostics are preinstalled on the CLIENT VM (Az + AzFilesHybrid).
- The DC deliberately has no Azure tooling - only Kerberos auditing (4768/4769):
+ Diagnostics are installed after this summary on the CLIENT VM (Az + AzFilesHybrid).
+ The DC has no Azure tooling; its read-only Security evidence access is prepared.
+ Run these diagnostic commands on the CLIENT VM only, after tools installation:
    Connect-AzAccount
    Debug-AzStorageAccountAuth -StorageAccountName $saName ``
      -ResourceGroupName $ResourceGroupName -Verbose
@@ -576,7 +581,7 @@ Write-Host "Saved to: $infoFile" -ForegroundColor Yellow
 $cmdFile = Join-Path $LogPath "lab-commands-$stamp.txt"
 try {
     & (Join-Path $scriptRoot 'Get-LabCommands.ps1') -ResourceGroupName $ResourceGroupName `
-        -Prefix $Prefix -OutFile $cmdFile | Out-Null
+        -Prefix $Prefix -DomainController "$dcName.$DomainName" -OutFile $cmdFile | Out-Null
     Write-Host ''
     Write-Host " Lab commands (real account name filled in): $cmdFile" -ForegroundColor Cyan
     Write-Host "   view:  Get-Content $cmdFile" -ForegroundColor DarkGray
@@ -597,7 +602,7 @@ try {
 Step 'Post-deploy: installing diagnostics on the client (bundle path, ~2-4 min)'
 Write-Host '  The lab environment is READY - this last step is optional tooling.' -ForegroundColor Yellow
 Write-Host '  Safe to Ctrl+C: once issued, the VM finishes the install on its own.' -ForegroundColor Yellow
-$toolParams = @{}
+$toolParams = @{ DomainController = "$dcName.$DomainName" }
 if ($ModuleBundleUri) { $toolParams['ModuleBundleUri'] = $ModuleBundleUri }
 try {
     $toolsOut = Invoke-VmScript -VmName $cliName -ScriptFile '07-install-tools.ps1' -Params $toolParams

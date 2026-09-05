@@ -15,7 +15,7 @@
   Windows referenced below:
       [A] Azure Cloud Shell        deploy, faults, the migration lab
       [B] Client VM  (RDP)         klist / net use / evidence   <- most of it
-      [C] DC VM      (RDP)         event 4769, setspn
+      [C] DC VM      (RDP)         optional manual follow-up / setspn
 
 .EXAMPLE
   ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab
@@ -26,6 +26,7 @@ param(
     [Parameter(Mandatory)] [string]$ResourceGroupName,
     [string]$Prefix = 'azflab',
     [string]$Share  = 'labshare',
+    [string]$DomainController,
     [string]$OutFile
 )
 $ErrorActionPreference = 'Stop'
@@ -44,6 +45,13 @@ $ad     = $sa.AzureFilesIdentityBasedAuth.ActiveDirectoryProperties
 $nb     = if ($ad -and $ad.NetBiosDomainName) { $ad.NetBiosDomainName } else { 'CONTOSO' }
 $realm  = if ($ad -and $ad.DomainName) { $ad.DomainName.ToUpper() } else { 'CONTOSO.LOCAL' }
 $source = $sa.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
+# Legacy storage metadata can hold a NetBIOS name instead of a DNS root.
+# deploy.ps1 supplies the authoritative forest DNS name; standalone runs only
+# infer a target when the stored domain is a dotted DNS name.
+if (-not $DomainController -and $ad -and $ad.DomainName -match '^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$') {
+    $DomainController = "$Prefix-dc.$($ad.DomainName)"
+}
+$dcArgument = if ($DomainController) { " -DomainController '$($DomainController.Replace("'", "''"))'" } else { '' }
 
 $ips = @{}
 foreach ($p in Get-AzPublicIpAddress -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue) {
@@ -61,7 +69,7 @@ $text = @"
 
  [A] Cloud Shell     you are already signed in; no Connect-AzAccount
  [B] Client VM       mstsc /v:$cliIp     sign in as $nb\labuser1
- [C] DC VM           mstsc /v:$dcIp     sign in as $nb\labadmin   (labadmin only)
+ [C] DC VM           mstsc /v:$dcIp     $nb\labadmin only; optional follow-up
 
  Share: $unc
 
@@ -78,15 +86,26 @@ $text = @"
 
     Expect: Server = cifs/$fqdn, encryption type AES-256.
 
-[B] baseline evidence - three windows, in this order
+[B] baseline evidence - two windows, three steps in this order
     # 1. ELEVATED PowerShell (UAC -> Yes)
-    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
+    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace$dcArgument
     # 2. NORMAL PowerShell - the mount must happen in YOUR session
-    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $saName
+    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $saName -Share $Share
     # 3. back in the ELEVATED window
     C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace
 
-[C] the KDC's own record
+[B] the KDC's own record is collected remotely at StopTrace
+    Open dc-summary.txt in the capture folder, then inspect the time-bounded
+    DC Security exports (4768/4769/4771, XML/JSON/CSV) for the reproduced request.
+    No separate DC sign-in is needed. Without a reliable DNS target above,
+    the collector uses its installed DC configuration/domain discovery.
+    Missing/denied/empty DC evidence is not proof that the KDC is healthy.
+    Sign out/in after new group membership; use -DcCredential if needed
+    (the collector does not store credentials).
+    Retry only DC collection for an existing capture:
+    C:\LabTools\Get-KerberosEvidence.ps1 -CollectDc -Path '<capture-folder>'$dcArgument
+
+[C] optional administrator follow-up if remote DC collection is unavailable
     Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 100 |
       Where-Object Message -match '$saName' |
       Select-Object -First 3 | Format-List TimeCreated, Message
@@ -117,13 +136,14 @@ $text = @"
     Mount succeeds but klist is empty? You reused the old session - sign out/in.
 
 [B] step 3 - collect evidence, then read it
-    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace          # elevated
-    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $saName
+    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace$dcArgument          # elevated
+    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $saName -Share $Share
     C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace           # elevated
     klist
 
-[A]     ticket issued + 4769 success => the KDC is innocent.
-        The derived key is wrong, and a derived key is password + SALT:
+[B]     Read dc-summary.txt and correlate the DC exports with this request.
+        A matching 4769 success proves issuance, not that every KDC/key path is healthy.
+[A]     For this planted defect, check the derived-key salt metadata:
     ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Status
         -> ActiveDirectoryDomainName reads $nb (NetBIOS), not the DNS root.
 

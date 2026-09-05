@@ -6,7 +6,8 @@ param(
     # Prebuilt module bundle (see tools\New-LabToolsBundle.ps1). One HTTPS GET
     # beats ~9 minutes of Install-Module round trips. Pass '' to force the
     # gallery path.
-    [string]$ModuleBundleUri = 'https://github.com/kmin1223/azfiles-lab/releases/latest/download/labtools-modules.zip'
+    [string]$ModuleBundleUri = 'https://github.com/kmin1223/azfiles-lab/releases/latest/download/labtools-modules.zip',
+    [string]$DomainController
 )
 $ErrorActionPreference = 'Continue'   # never fail the deployment over tooling
 $ProgressPreference = 'SilentlyContinue'  # much faster downloads
@@ -217,6 +218,10 @@ if ($psd1) {
 # Kept on both: a DC-side capture of the KDC exchange is a legitimate technique.
 $toolDir = 'C:\LabTools'
 New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
+if ($DomainController) {
+    @{ DomainControllers = @($DomainController) } | ConvertTo-Json |
+        Set-Content "$toolDir\evidence-config.json" -Encoding UTF8 -ErrorAction Stop
+}
 if (-not (Test-Path "$toolDir\etl2pcapng.exe")) {
     try {
         $url = 'https://github.com/microsoft/etl2pcapng/releases/latest/download/etl2pcapng.exe'
@@ -256,7 +261,7 @@ $helper = @'
      MOUNT must happen in the affected user's own, non-elevated session - that
      is the session whose ticket cache and drive mappings you are diagnosing.
 
-        ELEVATED window :  Get-KerberosEvidence.ps1 -StartTrace
+        ELEVATED window :  Get-KerberosEvidence.ps1 -StartTrace [-DomainController <dc-fqdn>]
         NORMAL window   :  Get-KerberosEvidence.ps1 -Reproduce -StorageAccount <sa>
         ELEVATED window :  Get-KerberosEvidence.ps1 -StopTrace
 
@@ -269,9 +274,20 @@ $helper = @'
         Get-KerberosEvidence.ps1 -Analyze                 newest run
         Get-KerberosEvidence.ps1 -Analyze -Path <folder>  a specific one
 
-     The identity is still the same domain user, so the Kerberos evidence is
-     faithful - but the mount lands in the elevated logon session, which has its
-     own ticket cache and drive letters.
+  4) Retry DC collection without another mount:
+        Get-KerberosEvidence.ps1 -CollectDc -Path <folder> [-DcCredential <PSCredential>]
+
+     All-in-one captures its caller's context, not necessarily the affected
+     application's context. Prefer split capture for user-specific failures.
+
+  DC SECURITY LOGS
+      Stop queries 4768/4769/4771 for the recorded reproduction interval.
+      DC selection: explicit -DomainController, run config, installed config,
+      then computer-domain discovery (a candidate, not proof of the issuing DC).
+      -DcCredential on Stop/All optionally supplies read credentials in memory.
+      No credentials are saved. Azure Files backend collection remains manual.
+      Reproduce resets mappings and purges this logon session's tickets.
+      Use one reproduction per capture; original state is saved before reset.
 
   OUTPUT  ->  C:\LabTools\evidence\<timestamp>\
       trace.etl / trace.pcapng    network capture of the whole attempt
@@ -284,31 +300,221 @@ $helper = @'
       smbclient-security.txt      SMBClient/Security
       smb-connection.txt          negotiated dialect / encryption / signing
       smb-client-config.txt       client SMB settings (cipher order, etc.)
+      reproduction.json          UTC interval, identity/context, mount exit code
+      dc-summary.txt             collection status + candidate event table
+      dc-<name>\security.*       bounded DC events: original XML, JSON and CSV
+      dc-collection.json         per-DC status, count, truncation and errors
+      azure-files-handoff.txt    target and UTC interval for manual backend lookup
+      *-collector.txt            elevated Stop snapshots (separate from reproduce)
 
-  Which channel sees what matters. For error 1396, Kerberos/Operational stays
-  quiet (the client's Kerberos stack did nothing wrong) but SMBClient/Security
-  logs event 31001 with SSPI status 0x80090322 = SEC_E_WRONG_PRINCIPAL - the
-  service could not decrypt the ticket. Each file explains itself at the top,
-  including the status codes Windows leaves as "Unknown".
+  No events is not proof of no KDC request; check cache, actual KDC, clocks,
+  auditing and retention. Event candidates are not automatic root-cause verdicts.
 #>
 [CmdletBinding(DefaultParameterSetName = 'All')]
 param(
     [Parameter(ParameterSetName = 'All', Mandatory)]
     [Parameter(ParameterSetName = 'Reproduce', Mandatory)]
+    [ValidatePattern('^[a-z0-9]{3,24}$')]
     [string]$StorageAccount,
 
     [Parameter(ParameterSetName = 'Start', Mandatory)][switch]$StartTrace,
     [Parameter(ParameterSetName = 'Reproduce', Mandatory)][switch]$Reproduce,
     [Parameter(ParameterSetName = 'Stop', Mandatory)][switch]$StopTrace,
     [Parameter(ParameterSetName = 'Analyze', Mandatory)][switch]$Analyze,
+    [Parameter(ParameterSetName = 'Dc', Mandatory)][switch]$CollectDc,
+    [Parameter(ParameterSetName = 'Dc', Mandatory)]
     [Parameter(ParameterSetName = 'Analyze')][string]$Path,
 
-    [string]$Share = 'labshare',
-    [string]$DriveLetter = 'Z'
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$')][string]$Share = 'labshare',
+    [ValidatePattern('^[A-Za-z]$')][string]$DriveLetter = 'Z',
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string[]]$DomainController,
+    [PSCredential]$DcCredential,
+    [ValidateRange(1,100000)][int]$MaxDcEvents = 2000,
+    [ValidateRange(0,300)][int]$DcTimePaddingSeconds = 5
 )
 
 $root    = 'C:\LabTools\evidence'
 $pointer = Join-Path $root '.current-run.txt'
+$ErrorActionPreference = 'Stop'
+
+function Write-JsonFile($Value, [string]$File) {
+    ConvertTo-Json -InputObject $Value -Depth 10 |
+        Set-Content -LiteralPath $File -Encoding UTF8
+}
+
+function Get-DcTargets([string]$Out) {
+    if ($DomainController) { return @($DomainController | Sort-Object -Unique) }
+    foreach ($file in @((Join-Path $Out 'run.json'), 'C:\LabTools\evidence-config.json')) {
+        if (Test-Path -LiteralPath $file) {
+            $config = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+            if ($config.DomainControllers) { return @($config.DomainControllers | Sort-Object -Unique) }
+        }
+    }
+    $domain = [DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
+    try {
+        $dc = $domain.FindDomainController()
+        try {
+            Write-Warning 'Using a discovered DC candidate. In a multi-DC domain specify the actual responding DC(s).'
+            return $dc.Name
+        } finally { $dc.Dispose() }
+    } finally { $domain.Dispose() }
+}
+
+function Initialize-EvidenceRun([string]$Out) {
+    $targets = @()
+    $preflight = @()
+    try { $targets = @(Get-DcTargets $Out) } catch {
+        $preflight += [pscustomobject]@{ Computer = ''; Status = 'Failed'; Error = $_.Exception.Message }
+        Write-Warning "DC discovery/configuration failed: $($_.Exception.Message). Specify -DomainController on Stop."
+    }
+    foreach ($dc in $targets) {
+        $query = @{ ComputerName = $dc; ListLog = 'Security'; ErrorAction = 'Stop' }
+        if ($DcCredential) { $query.Credential = $DcCredential }
+        try {
+            $null = Get-WinEvent @query
+            $preflight += [pscustomobject]@{ Computer = $dc; Status = 'Accessible'; Error = '' }
+        } catch {
+            $preflight += [pscustomobject]@{ Computer = $dc; Status = 'Failed'; Error = $_.Exception.Message }
+            Write-Warning "DC Security preflight failed on ${dc}: $($_.Exception.Message). Client capture can still proceed."
+        }
+    }
+    Write-JsonFile $preflight (Join-Path $Out 'dc-preflight.json')
+    Write-JsonFile ([ordered]@{
+        RunId = Split-Path $Out -Leaf
+        DomainControllers = $targets
+        CaptureStartUtc = [DateTime]::UtcNow.ToString('o')
+    }) (Join-Path $Out 'run.json')
+}
+
+function Convert-DcEvent($Event, $Context) {
+    [xml]$xml = $Event.ToXml()
+    $fields = [ordered]@{}
+    foreach ($node in $xml.SelectNodes("/*[local-name()='Event']/*[local-name()='EventData']/*[local-name()='Data']")) {
+        $fields[$node.GetAttribute('Name')] = $node.InnerText
+    }
+    $reasons = @()
+    $user = [string]$fields['TargetUserName']
+    if ($user -and ($user -split '@')[0] -ieq $Context.UserName) { $reasons += 'User' }
+    $ip = ([string]$fields['IpAddress']) -replace '^::ffff:', ''
+    if ($ip -and @($Context.ClientAddresses) -contains $ip) { $reasons += 'ClientIP' }
+    $service = [string]$fields['ServiceName']
+    if ($service -and ($service.TrimEnd('$') -ieq $Context.StorageAccount -or
+                      $service -ieq $Context.Spn)) { $reasons += 'Service' }
+    [pscustomobject][ordered]@{
+        TimeUtc = $Event.TimeCreated.ToUniversalTime().ToString('o')
+        DC = $Event.MachineName
+        RecordId = $Event.RecordId
+        EventId = $Event.Id
+        User = $user
+        Service = $service
+        ClientIP = [string]$fields['IpAddress']
+        Status = [string]$fields['Status']
+        TicketEncryptionType = [string]$fields['TicketEncryptionType']
+        CandidateReasons = $reasons -join ','
+        EventData = $fields
+    }
+}
+
+function Save-DcEvidence([string]$Out) {
+    $file = Join-Path $Out 'reproduction.json'
+    if (-not (Test-Path -LiteralPath $file)) {
+        $status = @([pscustomobject]@{ Computer = ''; Status = 'Skipped'; Error = 'No recorded reproduction interval.' })
+        Write-JsonFile $status (Join-Path $Out 'dc-collection.json')
+        'DC collection skipped: no reproduction.json. No statement about KDC activity is possible.' |
+            Set-Content (Join-Path $Out 'dc-summary.txt')
+        Write-Warning 'No reproduction recorded; DC Security collection skipped.'
+        return
+    }
+    $context = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+    if (-not $context.EndUtc) { throw 'Reproduction is still running or was interrupted. No complete DC query interval is available.' }
+    $start = [DateTimeOffset]::Parse($context.StartUtc).UtcDateTime
+    $end = [DateTimeOffset]::Parse($context.EndUtc).UtcDateTime
+    if ($end -lt $start) { throw 'Invalid reproduction interval: end precedes start. Check client clock changes.' }
+    $start = $start.AddSeconds(-$DcTimePaddingSeconds)
+    $end = $end.AddSeconds($DcTimePaddingSeconds)
+    $states = @()
+    $all = @()
+    $targets = @()
+    try { $targets = @(Get-DcTargets $Out) } catch {
+        $states += [pscustomobject]@{ Computer = ''; Status = 'Failed'; Count = 0; Truncated = $false; Error = $_.Exception.Message }
+        Write-Warning "DC selection failed: $($_.Exception.Message)"
+    }
+    foreach ($dc in $targets) {
+        if ($dc -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$') { throw "Invalid DC name in configuration: $dc" }
+        $folder = Join-Path $Out "dc-$dc"
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        $query = @{
+            ComputerName = $dc
+            FilterHashtable = @{ LogName = 'Security'; Id = @(4768,4769,4771); StartTime = $start; EndTime = $end }
+            MaxEvents = $MaxDcEvents + 1
+            ErrorAction = 'Stop'
+        }
+        if ($DcCredential) { $query.Credential = $DcCredential }
+        $events = @()
+        $queryError = $null
+        try { $events = @(Get-WinEvent @query) } catch {
+            if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $queryError = $_ }
+        }
+        if ($queryError) {
+            $states += [pscustomobject]@{ Computer = $dc; Status = 'Failed'; Count = 0; Truncated = $false; Error = $queryError.Exception.Message }
+            Write-Warning "DC Security collection failed on ${dc}: $($queryError.Exception.Message)"
+            continue
+        }
+        $truncated = $events.Count -gt $MaxDcEvents
+        $events = @($events | Select-Object -First $MaxDcEvents | Sort-Object TimeCreated,RecordId)
+        $rows = @($events | ForEach-Object { Convert-DcEvent $_ $context })
+        Write-JsonFile $rows (Join-Path $folder 'security.json')
+        @('<Events>') + @($events | ForEach-Object { $_.ToXml() }) + @('</Events>') |
+            Set-Content (Join-Path $folder 'security.xml') -Encoding UTF8
+        if ($rows.Count) {
+            $rows | Select-Object TimeUtc,DC,RecordId,EventId,User,Service,ClientIP,Status,TicketEncryptionType,CandidateReasons |
+                Export-Csv (Join-Path $folder 'security.csv') -NoTypeInformation -Encoding UTF8
+        } else {
+            '"TimeUtc","DC","RecordId","EventId","User","Service","ClientIP","Status","TicketEncryptionType","CandidateReasons"' |
+                Set-Content (Join-Path $folder 'security.csv') -Encoding UTF8
+        }
+        $states += [pscustomobject]@{
+            Computer = $dc
+            Status = $(if ($rows.Count) { 'Collected' } else { 'NoMatchingEvents' })
+            Count = $rows.Count
+            Truncated = $truncated
+            Error = ''
+        }
+        if ($truncated) { Write-Warning "DC query on $dc exceeded $MaxDcEvents events. Increase -MaxDcEvents or narrow the reproduction." }
+        $all += $rows
+    }
+    Write-JsonFile $states (Join-Path $Out 'dc-collection.json')
+    $candidates = @($all | Where-Object CandidateReasons | Sort-Object TimeUtc)
+    $display = @($candidates | Select-Object -First 40)
+    $summary = @(
+        'DC Security evidence - observations, not an automatic diagnosis'
+        "Requested UTC interval: $($start.ToString('o')) through $($end.ToString('o')) (padding: ${DcTimePaddingSeconds}s)"
+        "Reproduce account: $($context.Account); LUID: $($context.LogonId)"
+        "Target: $($context.Spn); share: $($context.Share)"
+        ''
+        ($states | Format-Table Computer,Status,Count,Truncated,Error -Wrap -AutoSize | Out-String -Width 200)
+        "Candidate events matching user, client IP or service: $($candidates.Count); showing $($display.Count)."
+        'A candidate match is not proof of causation. All queried events are retained per DC.'
+        ($display | Format-Table TimeUtc,EventId,User,Service,ClientIP,Status,CandidateReasons -AutoSize | Out-String -Width 220)
+        '4769 success = ticket issuance, not Azure Files acceptance.'
+        'No matching events: check cached tickets, responding DC, clock offsets, time window, auditing/KdcExtraLogLevel and retention.'
+        'Collection Failed is different from a successful query with no events.'
+        'Azure Files backend logs are NOT collected. See azure-files-handoff.txt.'
+    )
+    $summary | Set-Content (Join-Path $Out 'dc-summary.txt') -Encoding UTF8
+    $summary | ForEach-Object { Write-Host $_ }
+    @(
+        "Storage account: $($context.StorageAccount)"
+        "Share: $($context.Share)"
+        "SPN: $($context.Spn)"
+        "Client: $($context.Computer); addresses: $($context.ClientAddresses -join ', ')"
+        "User: $($context.Account); SID: $($context.UserSid); LUID: $($context.LogonId)"
+        "Reproduction UTC: $($context.StartUtc) through $($context.EndUtc)"
+        "Mount exit code: $($context.MountExitCode); output: mount-result.txt"
+        'Determine the failing SMB operation/status from the trace and backend records.'
+        'Find the matching backend Activity ID, then inspect XSMB logs. Do not equate Activity ID with SMB MessageId/SessionId.'
+    ) | Set-Content (Join-Path $Out 'azure-files-handoff.txt') -Encoding UTF8
+}
 
 # Every command this collector runs is echoed BEFORE it runs, so you can see
 # exactly what produced each file - and reuse the commands by hand on a case.
@@ -349,13 +555,10 @@ function Get-CurrentRun {
 }
 
 function Start-Capture([string]$Out) {
-    # Clear a trace left running by an earlier attempt, then start and VERIFY.
     Show-Cmd @"
-netsh trace stop                                    # clear anything left running
 netsh trace start capture=yes overwrite=yes maxsize=512 ``
       tracefile="$Out\trace.etl"
 "@
-    netsh trace stop 2>&1 | Out-Null
     $started = netsh trace start capture=yes overwrite=yes maxsize=512 tracefile="$Out\trace.etl" 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning 'netsh trace failed to start:'
@@ -371,24 +574,27 @@ function Stop-Capture([string]$Out) {
 netsh trace stop
 etl2pcapng.exe "$Out\trace.etl" "$Out\trace.pcapng"   # for Wireshark
 "@
-    netsh trace stop | Out-Null
+    $stopOutput = netsh trace stop 2>&1
+    $stopOutput | Out-File "$Out\trace-stop.txt" -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw "Trace stop failed. Run pointer retained for recovery; see $Out\trace-stop.txt." }
     if ((Test-Path "$Out\trace.etl") -and (Test-Path 'C:\LabTools\etl2pcapng.exe')) {
         & 'C:\LabTools\etl2pcapng.exe' "$Out\trace.etl" "$Out\trace.pcapng" | Out-Null
+        $conversionExit = $LASTEXITCODE
         $pcap = Get-Item "$Out\trace.pcapng" -ErrorAction SilentlyContinue
-        if ($pcap -and $pcap.Length -gt 0) {
+        if ($conversionExit -eq 0 -and $pcap -and $pcap.Length -gt 0) {
             Write-Host ("pcapng ready: {0} ({1:N0} KB)" -f $pcap.FullName, ($pcap.Length / 1KB)) -ForegroundColor Green
         } else {
-            Write-Warning "Conversion produced an empty file - check $Out\trace.etl."
+            Write-Warning "Conversion failed or produced an empty file (exit $conversionExit). Original ETL retained."
         }
     } else {
-        Write-Warning "No trace.etl in $Out - the capture did not run."
+        Write-Warning "ETL or etl2pcapng converter unavailable; keep $Out\trace.etl for analysis. DC collection is independent."
     }
 }
 
 # Events that are routine against Azure Files and say nothing about a failure.
 # Without this note a screenful of them looks like a lead.
 $benign = @{
-    30904 = 'SMB Multichannel not offered by the server - normal for Azure Files'
+    30904 = 'SMB Multichannel not offered in this connection - verify server tier/capabilities if relevant'
     30800 = 'share reconnected - routine'
 }
 # The opposite list: events that ARE about your failure, and what to read in them.
@@ -399,24 +605,40 @@ $meaningful = @{
 # logged as "Unknown NTSTATUS Error code" because it is a SECURITY_STATUS, not
 # an NTSTATUS - so the event tells you nothing unless you know this table.
 $statusNotes = @{
-    '0x80090322' = 'SEC_E_WRONG_PRINCIPAL - mapped from Kerberos KRB_AP_ERR_MODIFIED (41). The service could NOT decrypt the ticket. Surfaces to net use as 1396. The name is fine; the KEY is wrong.'
-    '0xc000006d' = 'STATUS_LOGON_FAILURE - the service refused the identity (see the 1326 / computer-account case).'
-    '0xc0000022' = 'STATUS_ACCESS_DENIED at Session Setup. If Kerberos on the wire is CLEAN (AS-REP and TGS-REP both succeeded) and the Session Setup Response carries a ZERO-LENGTH security blob, this is not an identity problem at all - it is the channel-cipher check. Read the CIPHER line in trace-summary.txt and compare it with the account channelEncryption setting.'
+    '0x80090322' = 'SEC_E_WRONG_PRINCIPAL - investigate target/SPN and ticket validation; not proof of a particular key/salt defect.'
+    '0xc000006d' = 'STATUS_LOGON_FAILURE - inspect operation, credentials and effective identity; the code does not identify the caller.'
+    '0xc0000022' = 'STATUS_ACCESS_DENIED - identify the failed SMB operation and inspect auth, policy or authorization evidence. Blob length does not classify the cause.'
 }
 
 function Save-Log([string]$Out, [string]$LogName, [string]$File, [string[]]$Props) {
-    $since = (Get-Date).AddMinutes(-15)
-    $ev = Get-WinEvent -FilterHashtable @{LogName = $LogName; StartTime = $since} -ErrorAction SilentlyContinue
+    $intervalFile = Join-Path $Out 'reproduction.json'
+    if (-not (Test-Path $intervalFile)) {
+        "Skipped $LogName`: no recorded reproduction interval." | Out-File (Join-Path $Out $File) -Encoding utf8
+        return
+    }
+    $interval = Get-Content $intervalFile -Raw | ConvertFrom-Json
+    $since = [DateTimeOffset]::Parse($interval.StartUtc).UtcDateTime.AddSeconds(-$DcTimePaddingSeconds)
+    $until = [DateTimeOffset]::Parse($interval.EndUtc).UtcDateTime.AddSeconds($DcTimePaddingSeconds)
+    $ev = @()
+    try {
+        $ev = @(Get-WinEvent -FilterHashtable @{LogName = $LogName; StartTime = $since; EndTime = $until} -ErrorAction Stop)
+    } catch {
+        if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+            "Collection failed for $LogName`: $($_.Exception.Message)" | Out-File (Join-Path $Out $File) -Encoding utf8
+            Write-Warning "Collection failed for $LogName`: $($_.Exception.Message)"
+            return
+        }
+    }
     $path = Join-Path $Out $File
     if ($ev) {
         $ids = $ev | Group-Object Id | Sort-Object Count -Descending
         $summary = ($ids | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
-        $interesting = @($ev | Where-Object { -not $benign.ContainsKey([int]$_.Id) })
+        $interesting = @($ev)
 
         $head = @("$LogName - $(@($ev).Count) event(s) since $since", "Event IDs: $summary", '')
         foreach ($g in $ids) {
             if ($benign.ContainsKey([int]$g.Name)) {
-                $head += "  $($g.Name) x$($g.Count)   BENIGN - $($benign[[int]$g.Name])"
+                $head += "  $($g.Name) x$($g.Count)   CONTEXT - $($benign[[int]$g.Name])"
             } elseif ($meaningful.ContainsKey([int]$g.Name)) {
                 $head += "  $($g.Name) x$($g.Count)   READ THIS - $($meaningful[[int]$g.Name])"
             }
@@ -463,17 +685,14 @@ function Save-Log([string]$Out, [string]$LogName, [string]$File, [string[]]$Prop
         Write-Host ("  {0,-44} {1,3} event(s)  {2,-16} {3}" -f $LogName, @($ev).Count, $summary, $note)
     } else {
         @(
-            "No events in $LogName in the last 15 minutes."
+            "No events in $LogName between $($since.ToString('o')) and $($until.ToString('o'))."
             ''
             'Empty does NOT mean the mount was healthy - it means THIS channel had'
             'nothing to say. Different failures land in different channels:'
             ''
-            '  Kerberos/Operational    quiet for error 1396 - the client Kerberos'
-            '                          stack did nothing wrong (it got a good ticket'
-            '                          and sent a good AP-REQ)'
-            '  SMBClient/Operational   mostly routine chatter (multichannel etc.)'
-            '  SMBClient/Security      THIS is where a rejected Session Setup shows'
-            '                          up, as event 31001 with an SSPI status'
+            '  Kerberos/Operational    client-side Kerberos events when recorded'
+            '  SMBClient/Operational   SMB operational context'
+            '  SMBClient/Security      authentication/security events'
             ''
             'And regardless of the channels:'
             '  klist          was a ticket issued, and with which etype?'
@@ -513,19 +732,7 @@ function ConvertTo-CipherNames([string]$Raw) {
     $out
 }
 
-# Which cipher the two sides settled on, and in what order the client asked.
-#
-# This is the whole ball game for the channel-encryption fault. Azure Files takes
-# the client's FIRST offered cipher and does NOT filter that choice against the
-# storage account's channelEncryption list; the account check happens one step
-# later, at Session Setup. Two consequences that cost people days:
-#   1. Having an account-allowed cipher somewhere in the client list does nothing.
-#      It has to be the HEAD of the list.
-#   2. The server will happily settle on AES-256-CCM, which the account surface
-#      does not even expose (portal and PowerShell offer only AES-128-CCM,
-#      AES-128-GCM, AES-256-GCM) - so that negotiation can never be accepted.
-# Both verified on the wire in this lab, Aug 2026: a client whose list contained
-# two account-allowed ciphers still failed, because a disallowed one led.
+# These first observed fields are navigation aids, not a correlated negotiation.
 function Get-CipherStory([string]$Tshark, [string]$Pcap) {
     $rows = & $Tshark -r $Pcap -Y 'smb2.cmd == 0' -T fields `
         -e smb2.flags.response -e smb2.cipher_id -E 'separator=|' 2>$null
@@ -533,7 +740,7 @@ function Get-CipherStory([string]$Tshark, [string]$Pcap) {
     foreach ($r in $rows) {
         $f = $r -split '\|'
         if ($f.Count -lt 2 -or -not $f[1]) { continue }
-        $names = ConvertTo-CipherNames $f[1]
+        $names = @(ConvertTo-CipherNames $f[1])
         if (-not $names.Count) { continue }
         if ($f[0] -eq '1') { if (-not $chosen)  { $chosen  = $names } }
         else               { if (-not $offered) { $offered = $names } }
@@ -551,31 +758,10 @@ function Get-CipherStory([string]$Tshark, [string]$Pcap) {
     if ($offered) { $lines += "  client offered : $($offered -join ', ')" }
     if ($chosen)  { $lines += "  server chose   : $($chosen -join ', ')" }
     $lines += ''
-    $lines += '  The server takes the client''s FIRST offer. It does NOT consult the'
-    $lines += '  storage account channelEncryption list here - that check happens one'
-    $lines += '  step later, at Session Setup. So THE RULE IS:'
-    $lines += ''
-    $lines += '      the HEAD of the client list must be a cipher the account allows.'
-    $lines += ''
-    $lines += '  Having an allowed cipher further down the list buys you nothing.'
-    $lines += '  Read the account side with:'
-    $lines += '      (Get-AzStorageFileServiceProperty -ResourceGroupName <rg> `'
-    $lines += '           -StorageAccountName <sa>).ProtocolSettings.Smb.ChannelEncryption'
-    $lines += '  If "server chose" is not in that list, expect STATUS_ACCESS_DENIED with'
-    $lines += '  a zero-length blob - and it is NOT an identity problem.'
-    if ($chosen -and $chosen[0] -eq 'AES-256-CCM') {
-        $lines += ''
-        $lines += '  !! This capture negotiated AES-256-CCM. Azure Files does not expose'
-        $lines += '     AES-256-CCM on the account at all - the allowed set is only'
-        $lines += '     AES-128-CCM / AES-128-GCM / AES-256-GCM. So this negotiation can'
-        $lines += '     NEVER be accepted, whatever the account is set to. The client is'
-        $lines += '     leading with a cipher that has no counterpart on the service.'
-    }
-    $lines += ''
-    $lines += '  Repair on the CLIENT (put an account-allowed cipher at the head; keep'
-    $lines += '  the weaker ones listed, just lower - storage-KEY mounts need AES-128-CCM):'
-    $lines += '      Set-SmbClientConfiguration -EncryptionCiphers `'
-    $lines += '          "<account-allowed first>,AES_128_GCM,AES_128_CCM" -Force'
+    $lines += '  First observed request/response fields only; they are not correlated'
+    $lines += '  by connection. Verify the target stream before interpreting them.'
+    $lines += '  Compare account policy and the actual failure operation/status.'
+    $lines += '  Neither cipher order nor security-buffer length proves root cause.'
     $lines
 }
 
@@ -655,7 +841,8 @@ tshark -r trace.pcapng -Y "smb2.cmd == 0" -T fields ``
             if ($name -eq 'TGS-REP') { $sawTgsRep = $true }
             $where = if ($onSmb) { 'KRB/SMB' } else { 'KRB    ' }
             $lines += ('{0,6}  {1,8:N3}s  {2,-15} {3} {4}{5}' -f $num, [double]$t, $dst, $where, $name, $detail)
-        } elseif ($scmd) {
+        }
+        if ($scmd) {
             $name = if ($smbCmd.ContainsKey([int]$scmd)) { $smbCmd[[int]$scmd] } else { "cmd $scmd" }
             $dir = if ($sresp -eq '1') { 'resp' } else { 'req ' }
             $st = ''
@@ -669,48 +856,16 @@ tshark -r trace.pcapng -Y "smb2.cmd == 0" -T fields ``
         }
     }
 
-    $verdict = @()
-    if ($krbErrSvc) {
-        $verdict += "READING: the KDC issued a ticket (TGS-REP), and then the SERVICE"
-        $verdict += "         rejected it inside SMB Session Setup: $krbErrSvc"
-        $verdict += "         Seen $attempts time(s) - the client keeps re-requesting the"
-        $verdict += '         ticket and the DC keeps issuing good ones, which is why the'
-        $verdict += "         DC's 4769 shows SUCCESS all through the outage."
-        $verdict += '         => the KDC is innocent. The service could not DECRYPT it.'
-        if ($krbErrSvc -eq 'AP_ERR_MODIFIED') {
-            $verdict += '         AP_ERR_MODIFIED = error 1396 = SEC_E_WRONG_PRINCIPAL.'
-            $verdict += '         The name is fine; the KEY is wrong. Check the salt inputs.'
-        }
-        $verdict += ''
-        $verdict += '  NOTE: the SMB2 header on those frames says STATUS_MORE_PROCESSING_'
-        $verdict += '        REQUIRED, which is NORMAL. The rejection is inside the GSS'
-        $verdict += '        blob. Filtering on SMB2 status alone would miss this entirely.'
-    } elseif ($sawTgsRep -and $ssFailure -like '*0xc0000022*') {
-        # Denied, but with no Kerberos error anywhere - so nothing ever looked at
-        # the ticket. This is the channel-cipher fault, and calling it an identity
-        # problem sends people into AD for an hour.
-        $verdict += 'READING: Kerberos is CLEAN. The KDC issued a ticket (TGS-REP) and no'
-        $verdict += '         Kerberos error came back inside SMB either. The service then'
-        $verdict += "         failed at: $ssFailure"
-        $verdict += '         A denial with NO Kerberos error - and, in Wireshark, a Session'
-        $verdict += '         Setup Response whose Blob Length is 0 - means the ticket was'
-        $verdict += '         never examined. This is not identity. Suspect the CHANNEL'
-        $verdict += '         CIPHER, and read the CIPHER block below before touching AD,'
-        $verdict += '         the computer object, or RBAC.'
-    } elseif ($sawTgsRep -and $ssFailure) {
-        $verdict += 'READING: a TGS-REP came back (the KDC issued a ticket) and then SMB2'
-        $verdict += "         failed at: $ssFailure"
-        $verdict += '         => the KDC did its job; the SERVICE refused the ticket.'
-    } elseif ($krbErrKdc) {
-        $verdict += "READING: the KDC itself returned an error ($krbErrKdc), on port 88."
-        $verdict += '         No ticket was ever issued - stop looking at the service.'
-    } elseif ($sawTgsRep) {
-        $verdict += 'READING: ticket issued and no SMB2 failure in this capture.'
-    } else {
-        $verdict += 'READING: no TGS-REP in this capture. Either the client never asked'
-        $verdict += '         (cached session / wrong SPN / no path to the DC), or the'
-        $verdict += '         exchange happened outside the capture window.'
-    }
+    $verdict = @(
+        'OBSERVATIONS across the capture (not correlated by target/connection):'
+        "  Any TGS-REP observed: $sawTgsRep"
+        "  Last Kerberos error outside SMB: $krbErrKdc"
+        "  Last Kerberos error inside SMB: $krbErrSvc"
+        "  First observed SMB failure: $ssFailure"
+        'Read the actual operation/status/token, and corroborate with dc-summary.txt.'
+        'TGS issuance does not prove service acceptance. Missing packets/events and'
+        'security-buffer length do not establish root cause. Later retries can differ.'
+    )
 
     $cipher = Get-CipherStory $tshark $pcap
 
@@ -729,7 +884,7 @@ tshark -r trace.pcapng -Y "smb2.cmd == 0" -T fields ``
 function Save-EventLogs([string]$Out) {
     Write-Host 'Event logs:'
     Show-Cmd @"
-Get-WinEvent -FilterHashtable @{LogName='<channel>'; StartTime=(Get-Date).AddMinutes(-15)}
+Get-WinEvent -FilterHashtable @{LogName='<channel>'; StartTime=<repro-start>; EndTime=<repro-end>}
   Microsoft-Windows-Kerberos/Operational
   Microsoft-Windows-SMBClient/Operational
   Microsoft-Windows-SMBClient/Connectivity
@@ -742,7 +897,39 @@ Get-WinEvent -FilterHashtable @{LogName='<channel>'; StartTime=(Get-Date).AddMin
 
 # The mount itself, plus the state that only exists in THIS logon session.
 function Invoke-MountAttempt([string]$Out) {
+    if (Test-Path (Join-Path $Out 'reproduction.json')) {
+        throw 'This capture already has a reproduction. Stop it and start a new capture; evidence will not be overwritten.'
+    }
     $fqdn = "$StorageAccount.file.core.windows.net"
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $original = klist 2>&1 | Out-String
+    $original | Out-File "$Out\klist-original.txt" -Encoding utf8
+    $luid = if ($original -match '(?m)^[^\r\n]*?(\d+:0x[0-9a-fA-F]+)') { $Matches[1] } else { 'unparsed - see klist-original.txt' }
+    $addresses = @()
+    try {
+        $addresses = @([Net.Dns]::GetHostAddresses($env:COMPUTERNAME) |
+            ForEach-Object IPAddressToString | ForEach-Object { $_ -replace '^::ffff:', '' })
+    } catch { Write-Warning "Client address discovery failed: $($_.Exception.Message)" }
+    $context = [ordered]@{
+        StartUtc = [DateTime]::UtcNow.ToString('o')
+        EndUtc = $null
+        Account = $identity.Name
+        UserName = ($identity.Name -split '\\')[-1]
+        UserSid = $identity.User.Value
+        LogonId = $luid
+        Elevated = Test-Admin
+        Computer = $env:COMPUTERNAME
+        ClientAddresses = $addresses
+        StorageAccount = $StorageAccount
+        Spn = "cifs/$fqdn"
+        Share = $Share
+        MountExitCode = $null
+        Error = ''
+    }
+    Write-JsonFile $context (Join-Path $Out 'reproduction.json')
+    net use 2>&1 | Out-File "$Out\mappings-original.txt" -Encoding utf8
+    Write-Warning 'Reproduce resets the selected mappings and purges tickets in THIS logon session. Original state has been saved.'
+    try {
     # A dead mapping can hold the drive letter while 'net use' lists nothing,
     # which surfaces as "System error 85 - the local device name is already in
     # use". Clear both the letter and the UNC path before trying.
@@ -755,69 +942,117 @@ klist > klist-before.txt
 net use ${DriveLetter}: \\$fqdn\$Share /persistent:no
 klist > klist-after.txt
 "@
-    net use "${DriveLetter}:" /delete /y 2>$null | Out-Null
-    net use "\\$fqdn\$Share" /delete /y 2>$null | Out-Null
+    foreach ($target in @("${DriveLetter}:", "\\$fqdn\$Share")) {
+        # Merge stderr in cmd so an absent mapping does not terminate PowerShell 5.1.
+        $resetOutput = cmd /c "net use $target /delete /y 2>&1"
+        $resetExit = $LASTEXITCODE
+        @("Reset ${target}: exit $resetExit") + @($resetOutput) |
+            Out-File "$Out\mapping-reset.txt" -Encoding utf8 -Append
+        if ($resetExit -ne 0) {
+            Write-Host "Mapping reset for $target returned $resetExit (possibly absent); see mapping-reset.txt."
+        }
+    }
     Remove-SmbMapping -LocalPath "${DriveLetter}:" -Force -ErrorAction SilentlyContinue
     klist purge | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'klist purge failed; the intended fresh-ticket reproduction could not be prepared.' }
     klist > "$Out\klist-before.txt"
 
     Write-Host 'Attempting the mount...'
     # /persistent:no - a remembered mapping outlives the lab and keeps the
     # drive letter reserved, which later shows up as "System error 85".
     $mount = cmd /c "net use ${DriveLetter}: \\$fqdn\$Share /persistent:no 2>&1"
+    $context.MountExitCode = $LASTEXITCODE
     $mount | Out-File "$Out\mount-result.txt" -Encoding utf8
     Write-Host ($mount -join "`n")
 
     Start-Sleep -Seconds 2
     klist > "$Out\klist-after.txt"
     Save-SmbState $Out
+    } catch {
+        $context.Error = $_.Exception.Message
+        throw
+    } finally {
+        $context.EndUtc = [DateTime]::UtcNow.ToString('o')
+        Write-JsonFile $context (Join-Path $Out 'reproduction.json')
+        $identity.Dispose()
+    }
 }
 
 # Get-SmbConnection needs an ELEVATED token - a standard user (even one who is a
 # local admin) gets "Access is denied". Rather than fail the whole reproduce
 # step, note it and let -StopTrace pick it up from the elevated window.
-function Save-SmbState([string]$Out) {
+function Save-SmbState([string]$Out, [string]$Suffix = '') {
     Show-Cmd @"
 Get-SmbConnection          # needs an ELEVATED window
 Get-SmbClientConfiguration # negotiated dialect / encryption / signing
 "@
     try {
         Get-SmbConnection -ErrorAction Stop | Format-List * |
-            Out-File "$Out\smb-connection.txt" -Encoding utf8
+            Out-File "$Out\smb-connection$Suffix.txt" -Encoding utf8
     } catch {
         @(
             'Get-SmbConnection was not available in this session:'
             "  $($_.Exception.Message)"
             ''
             'This cmdlet requires an ELEVATED window. -StopTrace collects it.'
-        ) | Out-File "$Out\smb-connection.txt" -Encoding utf8
+        ) | Out-File "$Out\smb-connection$Suffix.txt" -Encoding utf8
     }
     try {
         Get-SmbClientConfiguration -ErrorAction Stop | Format-List * |
-            Out-File "$Out\smb-client-config.txt" -Encoding utf8
+            Out-File "$Out\smb-client-config$Suffix.txt" -Encoding utf8
     } catch {
         "Get-SmbClientConfiguration failed: $($_.Exception.Message)" |
-            Out-File "$Out\smb-client-config.txt" -Encoding utf8
+            Out-File "$Out\smb-client-config$Suffix.txt" -Encoding utf8
     }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $logonInfo = klist 2>&1 | Out-String
+        $logonId = if ($logonInfo -match '(?m)^[^\r\n]*?(\d+:0x[0-9a-fA-F]+)') { $Matches[1] } else { 'unparsed - see klist-context file' }
+        $logonInfo | Out-File "$Out\klist-context$Suffix.txt" -Encoding utf8
+        Write-JsonFile @{ Account = $identity.Name; UserSid = $identity.User.Value; LogonId = $logonId; Elevated = Test-Admin; TimeUtc = [DateTime]::UtcNow.ToString('o') } `
+            (Join-Path $Out "smb-context$Suffix.json")
+    } finally { $identity.Dispose() }
+}
+
+function Complete-EvidenceRun([string]$Out) {
+    $reproFile = Join-Path $Out 'reproduction.json'
+    if ((Test-Path $reproFile) -and -not (Get-Content $reproFile -Raw | ConvertFrom-Json).EndUtc) {
+        throw 'Reproduction has no end time. Wait for it to finish before stopping; for an interrupted process stop netsh manually and preserve the run.'
+    }
+    $run = Get-Content (Join-Path $Out 'run.json') -Raw | ConvertFrom-Json
+    if (-not $run.TraceStopped) {
+        Stop-Capture $Out
+        $run | Add-Member NoteProperty TraceStopped $true -Force
+        $run | Add-Member NoteProperty CaptureEndUtc ([DateTime]::UtcNow.ToString('o')) -Force
+        Write-JsonFile $run (Join-Path $Out 'run.json')
+    }
+    Save-DcEvidence $Out
+    Save-EventLogs $Out
+    Save-SmbState $Out '-collector'
+    Show-TraceSummary $Out
+    Remove-Item -LiteralPath $pointer
+    Write-Host "Done. Read $Out\dc-summary.txt; raw data and collection errors are retained." -ForegroundColor Green
 }
 
 switch ($PSCmdlet.ParameterSetName) {
 
     'Start' {
         Assert-Admin 'Starting a network trace'
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        if (Test-Path $pointer) { throw 'A collector run is already recorded. Finish it with -StopTrace before starting another.' }
+        $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
         $out = Join-Path $root $stamp
         New-Item -ItemType Directory -Path $out -Force | Out-Null
         # Let the non-elevated session write its half of the evidence here.
         icacls $out /grant "*S-1-5-32-545:(OI)(CI)M" 2>&1 | Out-Null
-        Set-Content -Path $pointer -Value $out -Encoding ascii
-
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot grant the normal session write access to the evidence folder.' }
+        Initialize-EvidenceRun $out
         if (-not (Start-Capture $out)) { exit 1 }
+        Set-Content -Path $pointer -Value $out -Encoding ascii
         Write-Host ''
         Write-Host "Trace running. Evidence folder: $out" -ForegroundColor Cyan
         Write-Host ''
         Write-Host 'NOW, in your NORMAL (non-elevated) PowerShell window:' -ForegroundColor Yellow
-        Write-Host "    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $StorageAccount" -ForegroundColor White
+        Write-Host '    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount <sa> -Share labshare' -ForegroundColor White
         Write-Host ''
         Write-Host 'Then come back here and run:' -ForegroundColor Yellow
         Write-Host '    C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace' -ForegroundColor White
@@ -825,12 +1060,14 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'Reproduce' {
         if (Test-Admin) {
-            Write-Warning 'You are in an ELEVATED window - that is the wrong one for this step.'
+            Write-Warning 'You are in an ELEVATED window. Confirm this is the actual affected logon context.'
             Write-Host 'The point of -Reproduce is to mount in the affected user''s own session,' -ForegroundColor Yellow
             Write-Host 'which has its own ticket cache and drive letters. Use a normal window.'   -ForegroundColor Yellow
             Write-Host ''
         }
         $out = Get-CurrentRun
+        $run = Get-Content (Join-Path $out 'run.json') -Raw | ConvertFrom-Json
+        if ($run.TraceStopped) { throw 'Trace is already stopped. Finish -StopTrace and start a new capture.' }
         Write-Host "Reproducing as $env:USERDOMAIN\$env:USERNAME -> $out" -ForegroundColor Cyan
         Invoke-MountAttempt $out
         Write-Host ''
@@ -851,35 +1088,31 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-TraceSummary $out
     }
 
+    'Dc' {
+        Save-DcEvidence (Resolve-Path -LiteralPath $Path).Path
+    }
+
     'Stop' {
         Assert-Admin 'Stopping the network trace'
         $out = Get-CurrentRun
-        Stop-Capture $out
-        Show-TraceSummary $out
-        Save-EventLogs $out
-        # Elevated here, so this succeeds even if -Reproduce could not run it.
-        Save-SmbState $out
-        Remove-Item $pointer -ErrorAction SilentlyContinue
-        Write-Host ''
-        Write-Host "Done. Open $out" -ForegroundColor Green
+        Complete-EvidenceRun $out
         Write-Host 'Wireshark filter to start with:  kerberos || smb2'
     }
 
     'All' {
         Assert-Admin 'Capturing a network trace'
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        if (Test-Path $pointer) { throw 'A collector run is already recorded. Finish it with -StopTrace first.' }
+        $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
         $out = Join-Path $root $stamp
         New-Item -ItemType Directory -Path $out -Force | Out-Null
         Write-Host "Collecting evidence -> $out" -ForegroundColor Cyan
         Write-Host 'Note: the mount happens in THIS elevated session. To capture the' -ForegroundColor DarkGray
         Write-Host 'user session instead, use -StartTrace / -Reproduce / -StopTrace.'  -ForegroundColor DarkGray
 
-        $ok = Start-Capture $out
-        Invoke-MountAttempt $out
-        if ($ok) { Stop-Capture $out; Show-TraceSummary $out }
-        Save-EventLogs $out
-        Write-Host ''
-        Write-Host "Done. Open $out" -ForegroundColor Green
+        Initialize-EvidenceRun $out
+        if (-not (Start-Capture $out)) { exit 1 }
+        Set-Content -Path $pointer -Value $out -Encoding ascii
+        try { Invoke-MountAttempt $out } finally { Complete-EvidenceRun $out }
         Write-Host 'Wireshark filter to start with:  kerberos || smb2'
     }
 }

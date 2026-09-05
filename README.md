@@ -113,6 +113,75 @@ deployment itself is never left in a broken shape. A verified environment takes 
 the diagnostic tooling (Az + AzFilesHybrid) installs on the client **after**
 that, off the critical path, so a slow download can't hold up the lab.
 
+### Collect Client and DC evidence for a mount attempt
+
+The client installer generates `C:\LabTools\Get-KerberosEvidence.ps1`. Wait for
+the **post-deployment client tools installation** before using it; the
+`DEPLOYMENT COMPLETE` banner alone does not mean the collector is installed.
+The DC setup grants the lab evidence-reader group read access and enables
+remote event-log access from the lab client's private address only. It does
+not make the lab users domain administrators.
+Source updates do not update existing VMs automatically. Existing lab users
+must sign out and sign in again after the DC reader-group membership is applied.
+
+Use **two PowerShell windows, three steps** on the client:
+
+```powershell
+# Elevated window: uses the DC recorded by deployment.
+C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
+
+# Normal window: reproduce as the affected user.
+C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount <sa> -Share labshare
+
+# Return to the elevated window.
+C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace
+```
+
+Reproduce saves the original ticket/mapping state, then **resets the selected
+mappings and purges this logon session's tickets** before mounting. Use one
+reproduction per capture. The elevated Stop snapshots have a `-collector`
+suffix and do not replace the reproducing user's snapshots.
+
+Stop retrieves **DC Security events 4768, 4769 and 4771** for the recorded
+reproduction interval, with five seconds of padding on each side, independently
+of whether Wireshark/tshark is installed. Results appear in the console and in
+the same `C:\LabTools\evidence\<run>\` directory:
+
+| File | Purpose |
+|---|---|
+| `reproduction.json` | UTC interval, user/SID/LUID, target and mount exit code |
+| `dc-summary.txt` | Per-DC collection status and candidate event table |
+| `dc-<name>\security.xml`, `.json`, `.csv` | Original event XML and structured fields for the queried interval |
+| `dc-collection.json` | Counts, errors and explicit truncation status |
+| `azure-files-handoff.txt` | Target/context and UTC interval for manual service-side investigation |
+
+The default per-DC limit is 2,000 events; a limit hit is explicitly reported.
+Candidate matches use user, client IP or service fields, but all returned events
+are retained. A successful empty query is **not** the same as an access/RPC
+failure, and neither proves that the KDC was never contacted. Check the actual
+KDC, cached tickets, clock offsets, audit settings and log retention.
+
+Override DC selection with `-DomainController <dc-fqdn>` on Start/Stop. Multiple
+DC names are supported; automatic discovery chooses a candidate, not necessarily
+the KDC that handled a request in a multi-DC environment. Retry just the DC read
+without resetting mappings or tickets:
+
+```powershell
+C:\LabTools\Get-KerberosEvidence.ps1 -CollectDc -Path C:\LabTools\evidence\<run> `
+    -DomainController <dc-fqdn> -MaxDcEvents 5000
+```
+
+If another read identity is needed, supply `-DcCredential (Get-Credential)` on
+Stop or CollectDc. Credentials are used in memory and are never written to the
+run/config files. A credential supplied during Start preflight must be supplied
+again for Stop; it is deliberately not persisted.
+
+Trace summaries show **observations, not root-cause verdicts**. Ticket issuance
+does not prove Azure Files accepted the ticket, and security-buffer length does
+not separate authentication from cipher/authorization failures. Azure Files
+backend logs remain a separate, authorized manual collection step; the handoff
+file helps correlate the attempt but does not contain a backend Activity ID.
+
 ### If your shell disconnects mid-deploy
 
 Cloud Shell drops the session after roughly 20 minutes without interaction, and

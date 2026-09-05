@@ -1,6 +1,21 @@
 # Runs ON the DC VM after promotion. Creates lab OU and users.
 # Args: -Password <pw>
-param([string]$Password)
+param(
+    [string]$Password,
+    [ValidateScript({
+        $address = $null
+        if ($_ -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -or
+            -not [System.Net.IPAddress]::TryParse($_, [ref]$address) -or
+            $address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+            $address.IPAddressToString -ne $_ -or
+            $address.GetAddressBytes()[0] -in @(0, 127) -or
+            $address.GetAddressBytes()[0] -ge 224) {
+            throw 'EvidenceClientAddress must be one unicast IPv4 address, not a subnet or wildcard.'
+        }
+        $true
+    })]
+    [string]$EvidenceClientAddress = '10.100.0.5'
+)
 $ErrorActionPreference = 'Stop'
 
 # Fails until AD web services are up after reboot -> deploy.ps1 retries.
@@ -49,19 +64,103 @@ foreach ($u in 'labuser1', 'labuser2') {
             -PasswordNeverExpires $true
     }
 }
-# --- Kerberos auditing + operational logs, folded in here on purpose ---
-# Every Run Command invocation costs ~60s of fixed overhead, so these four
-# commands don't get their own step. The labs depend on them: event 4769
-# (service-ticket ops incl. FAILURES - success-only is the DC default) is the
-# KDC-side evidence for the AES-256 migration and etype labs.
-try {
-    auditpol /set /subcategory:"Kerberos Service Ticket Operations" /success:enable /failure:enable | Out-Null
-    auditpol /set /subcategory:"Kerberos Authentication Service" /success:enable /failure:enable | Out-Null
-    wevtutil sl Microsoft-Windows-Kerberos/Operational /e:true 2>$null
-    wevtutil sl Microsoft-Windows-SMBClient/Operational /e:true 2>$null
-    Write-Output 'DC_AUDITING_READY (events 4768/4769 incl. failures + operational logs)'
-} catch {
-    Write-Output "DC auditing warning: $($_.Exception.Message)"
+# --- Read-only DC evidence for the two lab users, from the client only ---
+$readerName = 'AzureFilesLabEvidenceReaders'
+$readers = Get-ADGroup -Filter "SamAccountName -eq '$readerName'"
+if (-not $readers) {
+    $readers = New-ADGroup -Name $readerName -SamAccountName $readerName `
+        -GroupScope DomainLocal -GroupCategory Security -Path $ouDn -PassThru
+}
+if ($readers.GroupScope -ne 'DomainLocal' -or $readers.GroupCategory -ne 'Security' -or
+    $readers.DistinguishedName -ne "CN=$readerName,$ouDn") {
+    throw "Existing $readerName must be a DomainLocal security group in $ouDn."
+}
+$members = @(Get-ADGroupMember -Identity $readers | Select-Object -ExpandProperty DistinguishedName)
+foreach ($u in 'labuser1', 'labuser2') {
+    $user = Get-ADUser -Identity $u
+    if ($members -notcontains $user.DistinguishedName) {
+        Add-ADGroupMember -Identity $readers -Members $user
+    }
+}
+# Use the well-known SID, not a localized group name, for remote event access.
+$eventReaders = Get-ADGroup -Identity 'S-1-5-32-573'
+if (@(Get-ADGroupMember -Identity $eventReaders |
+        Select-Object -ExpandProperty DistinguishedName) -notcontains $readers.DistinguishedName) {
+    Add-ADGroupMember -Identity $eventReaders -Members $readers
 }
 
+function Invoke-EventUtility {
+    param([string]$Executable, [string[]]$Arguments)
+    $result = & $Executable @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Executable failed (exit $LASTEXITCODE): $($Arguments -join ' ')"
+    }
+    $result
+}
+
+$channelXml = [xml]((Invoke-EventUtility wevtutil @('gl', 'Security', '/f:xml')) -join "`n")
+$channelAccess = $channelXml.SelectSingleNode("//*[local-name()='channelAccess']")
+if (-not $channelAccess -or -not $channelAccess.InnerText) {
+    throw 'Cannot read the existing Security channel SDDL.'
+}
+$descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($channelAccess.InnerText)
+if ($null -eq $descriptor.DiscretionaryAcl) {
+    throw 'Security channel has no DACL; refusing to replace its access policy.'
+}
+$readerSid = [System.Security.Principal.SecurityIdentifier]::new($readers.SID.Value)
+$hasReadAce = @($descriptor.DiscretionaryAcl | Where-Object {
+    $_ -is [System.Security.AccessControl.CommonAce] -and
+    $_.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed -and
+    $_.AceFlags -eq [System.Security.AccessControl.AceFlags]::None -and
+    $_.SecurityIdentifier -eq $readerSid -and $_.AccessMask -eq 0x1
+}).Count -gt 0
+if (-not $hasReadAce) {
+    # Keep every existing ACE, owner, group and SACL; add only event-log READ (0x1).
+    $readAce = [System.Security.AccessControl.CommonAce]::new(
+        [System.Security.AccessControl.AceFlags]::None,
+        [System.Security.AccessControl.AceQualifier]::AccessAllowed,
+        0x1, $readerSid, $false, $null)
+    $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $readAce)
+    $sddl = $descriptor.GetSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+    Invoke-EventUtility wevtutil @('sl', 'Security', "/ca:$sddl") | Out-Null
+}
+
+# Dedicated service-bound RPC rules; do not enable the broad built-in rule group.
+foreach ($rule in @(
+    @{ Name = 'AzureFilesLab-Evidence-EventLog-RPC'; Port = 'RPC'; Service = 'eventlog' },
+    @{ Name = 'AzureFilesLab-Evidence-RPC-EPMap'; Port = 'RPC-EPMap'; Service = 'RpcSs' }
+)) {
+    $settings = @{
+        PolicyStore = 'PersistentStore'
+        Direction = 'Inbound'; Action = 'Allow'; Enabled = 'True'; Profile = 'Domain'
+        Protocol = 'TCP'; LocalPort = $rule.Port; RemoteAddress = $EvidenceClientAddress
+        Program = "$env:SystemRoot\System32\svchost.exe"; Service = $rule.Service
+    }
+    if (Get-NetFirewallRule -PolicyStore PersistentStore -Name $rule.Name -ErrorAction SilentlyContinue) {
+        Set-NetFirewallRule -Name $rule.Name @settings | Out-Null
+    } else {
+        New-NetFirewallRule -Name $rule.Name -DisplayName $rule.Name @settings | Out-Null
+    }
+}
+
+# Native commands do not throw on a nonzero exit in Windows PowerShell 5.1.
+Invoke-EventUtility auditpol @('/set', '/subcategory:Kerberos Service Ticket Operations', '/success:enable', '/failure:enable') | Out-Null
+Invoke-EventUtility auditpol @('/set', '/subcategory:Kerberos Authentication Service', '/success:enable', '/failure:enable') | Out-Null
+$kdcPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc'
+$extraLogLevel = (Get-ItemProperty -Path $kdcPath -ErrorAction Stop).KdcExtraLogLevel
+# An absent override uses the KDC default (0x2, PKINIT logging).
+if ($null -eq $extraLogLevel) { $extraLogLevel = 0x2 }
+New-ItemProperty -Path $kdcPath -Name KdcExtraLogLevel -PropertyType DWord `
+    -Value ([int]$extraLogLevel -bor 0x11) -Force | Out-Null
+foreach ($channel in 'Microsoft-Windows-Kerberos/Operational', 'Microsoft-Windows-SMBClient/Operational') {
+    try {
+        Invoke-EventUtility wevtutil @('sl', $channel, '/e:true') | Out-Null
+    } catch {
+        # These optional DC channels are not the Security events collected remotely.
+        Write-Warning "Optional DC channel ${channel}: $($_.Exception.Message)"
+    }
+}
+
+Write-Output 'DC_AUDITING_READY (Security events 4768/4769/4771 incl. failures)'
 Write-Output 'USERS_READY'
+Write-Output 'DC_EVIDENCE_READY'
