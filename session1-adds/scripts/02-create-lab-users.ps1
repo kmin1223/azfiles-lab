@@ -132,13 +132,15 @@ if (-not $hasReadAce) {
 }
 
 # Dedicated service-bound RPC rules; do not enable the broad built-in rule group.
+# A newly promoted DC can retain the Public profile. Scope access by client IP
+# and service on every profile rather than depending on NLA domain detection.
 foreach ($rule in @(
     @{ Name = 'AzureFilesLab-Evidence-EventLog-RPC'; Port = 'RPC'; Service = 'eventlog' },
     @{ Name = 'AzureFilesLab-Evidence-RPC-EPMap'; Port = 'RPCEPMap'; Service = 'RpcSs' }
 )) {
     $settings = @{
         PolicyStore = 'PersistentStore'
-        Direction = 'Inbound'; Action = 'Allow'; Enabled = 'True'; Profile = 'Domain'
+        Direction = 'Inbound'; Action = 'Allow'; Enabled = 'True'; Profile = 'Any'
         Protocol = 'TCP'; LocalPort = $rule.Port; RemoteAddress = $EvidenceClientAddress
         Program = "$env:SystemRoot\System32\svchost.exe"; Service = $rule.Service
     }

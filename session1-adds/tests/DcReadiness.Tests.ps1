@@ -34,16 +34,17 @@ Describe 'DC evidence firewall and readiness' {
         $script:knownRules = @{}
         $script:existingLogLevel = 0x20
         Mock Get-NetFirewallRule {
-            if ($knownRules.ContainsKey($Name)) { [pscustomobject]@{ Name = $Name } }
+            if ($knownRules.ContainsKey($Name)) { [pscustomobject]@{ Name = $Name; Profile = $knownRules[$Name] } }
         }
         Mock New-NetFirewallRule {
             if ($LocalPort -notin @('RPC', 'RPCEPMap')) { throw "Invalid firewall port: $LocalPort" }
             if ($knownRules.ContainsKey($Name)) { throw "Rule already exists: $Name" }
-            $script:knownRules[$Name] = $true
+            $script:knownRules[$Name] = $Profile
         }
         Mock Set-NetFirewallRule {
             if ($LocalPort -notin @('RPC', 'RPCEPMap')) { throw "Invalid firewall port: $LocalPort" }
             if (-not $knownRules.ContainsKey($Name)) { throw "Rule does not exist: $Name" }
+            $script:knownRules[$Name] = $Profile
         }
         Mock Get-ItemProperty { [pscustomobject]@{ KdcExtraLogLevel = $existingLogLevel } }
         Mock New-ItemProperty {}
@@ -51,11 +52,11 @@ Describe 'DC evidence firewall and readiness' {
         Mock Write-Warning {}
     }
 
-    It 'creates only client-scoped Domain RPC rules with valid service and port pairs' {
+    It 'creates only client-scoped RPC rules on every profile with valid service and port pairs' {
         $result = @(& $readinessSetup)
         $result -contains 'DC_EVIDENCE_READY' | Should Be $true
         Assert-MockCalled New-NetFirewallRule -Times 2 -Exactly -Scope It -ParameterFilter {
-            $RemoteAddress -eq '10.100.0.5' -and $Profile -eq 'Domain' -and
+            $RemoteAddress -eq '10.100.0.5' -and $Profile -eq 'Any' -and
             $Protocol -eq 'TCP' -and $Direction -eq 'Inbound' -and
             $Action -eq 'Allow' -and $Enabled -eq 'True' -and
             $PolicyStore -eq 'PersistentStore' -and $Program -eq "$env:SystemRoot\System32\svchost.exe"
@@ -74,7 +75,7 @@ Describe 'DC evidence firewall and readiness' {
         $result -contains 'DC_EVIDENCE_READY' | Should Be $true
         Assert-MockCalled Set-NetFirewallRule -Times 1 -Exactly -Scope It -ParameterFilter {
             $Name -eq 'AzureFilesLab-Evidence-EventLog-RPC' -and $LocalPort -eq 'RPC' -and
-            $RemoteAddress -eq '10.100.0.5' -and $Profile -eq 'Domain'
+            $RemoteAddress -eq '10.100.0.5' -and $Profile -eq 'Any'
         }
         Assert-MockCalled New-NetFirewallRule -Times 1 -Exactly -Scope It -ParameterFilter {
             $Name -eq 'AzureFilesLab-Evidence-RPC-EPMap' -and $LocalPort -eq 'RPCEPMap'
@@ -88,9 +89,25 @@ Describe 'DC evidence firewall and readiness' {
         $knownRules.Count | Should Be 2
         Assert-MockCalled New-NetFirewallRule -Times 2 -Exactly -Scope It
         Assert-MockCalled Set-NetFirewallRule -Times 2 -Exactly -Scope It -ParameterFilter {
-            $RemoteAddress -eq '10.100.0.8' -and $Profile -eq 'Domain' -and
+            $RemoteAddress -eq '10.100.0.8' -and $Profile -eq 'Any' -and
             $Protocol -eq 'TCP' -and $Action -eq 'Allow' -and $Direction -eq 'Inbound'
         }
+    }
+
+    It 'repairs existing Domain-only rules without changing their client scope' {
+        $script:knownRules['AzureFilesLab-Evidence-EventLog-RPC'] = 'Domain'
+        $script:knownRules['AzureFilesLab-Evidence-RPC-EPMap'] = 'Domain'
+        $result = @(& $readinessSetup)
+        $result -contains 'DC_EVIDENCE_READY' | Should Be $true
+        Assert-MockCalled New-NetFirewallRule -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-NetFirewallRule -Times 2 -Exactly -Scope It -ParameterFilter {
+            $Profile -eq 'Any' -and $RemoteAddress -eq '10.100.0.5' -and
+            $PolicyStore -eq 'PersistentStore' -and $Protocol -eq 'TCP' -and
+            $Program -eq "$env:SystemRoot\System32\svchost.exe" -and
+            (($LocalPort -eq 'RPC' -and $Service -eq 'eventlog') -or
+             ($LocalPort -eq 'RPCEPMap' -and $Service -eq 'RpcSs'))
+        }
+        foreach ($profile in $knownRules.Values) { $profile | Should Be 'Any' }
     }
 
     It 'enables both Kerberos audits by stable GUID and preserves existing KDC flags' {

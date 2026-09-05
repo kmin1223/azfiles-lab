@@ -121,6 +121,13 @@ the **post-deployment client tools installation** before using it; the
 The DC setup grants the lab evidence-reader group read access and enables
 remote event-log access from the lab client's private address only. It does
 not make the lab users domain administrators.
+The two dedicated RPC firewall rules apply on all network profiles, but remain
+restricted to the client's single private IP, the service, and its RPC ports.
+A newly promoted DC can retain the Public network profile; Domain-only rules
+then do not apply, even though the DC and client belong to the domain.
+TCP 135 connectivity alone is not sufficient: the Event Log service's dynamic
+RPC port must also be reachable. Do not disable the firewall or open the entire
+dynamic port range to work around this.
 The two lab users are added directly to the built-in Event Log Readers group;
 the DomainLocal evidence-reader group is used separately for the Security
 channel read ACE. Nesting that DomainLocal group into the built-in group fails
