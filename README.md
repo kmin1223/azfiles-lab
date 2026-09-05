@@ -128,8 +128,9 @@ with AD error 8520.
 Source updates do not update existing VMs automatically. Existing lab users
 must sign out and sign in again after the DC reader-group membership is applied.
 
-If deployment stopped at this group-membership error, stop the retrying deploy,
-update the source, and rerun with the same resource group and the original
+If deployment stopped during DC evidence setup (group membership or Security
+configuration parsing), stop the retrying deploy, update the source, and rerun
+with the same resource group and the original
 password supplied through `-AdminPassword` (a SecureString). Existing lab users
 are retained, so omitting that parameter and generating a new password would
 not synchronize their passwords. The partially created reader group is reused.

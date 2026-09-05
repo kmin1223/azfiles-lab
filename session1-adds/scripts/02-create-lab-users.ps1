@@ -104,11 +104,12 @@ function Invoke-EventUtility {
 }
 
 $channelXml = [xml]((Invoke-EventUtility wevtutil @('gl', 'Security', '/f:xml')) -join "`n")
-$channelAccess = $channelXml.SelectSingleNode("//*[local-name()='channelAccess']")
-if (-not $channelAccess -or -not $channelAccess.InnerText) {
-    throw 'Cannot read the existing Security channel SDDL.'
+# wevtutil XML puts channelAccess on the channel element as an attribute.
+$channelAccess = $channelXml.SelectSingleNode("/*[local-name()='channel' and @name='Security']/@channelAccess")
+if (-not $channelAccess -or [string]::IsNullOrWhiteSpace($channelAccess.Value)) {
+    throw 'Security configuration XML is missing its channelAccess attribute; existing permissions were not changed.'
 }
-$descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($channelAccess.InnerText)
+$descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($channelAccess.Value)
 if ($null -eq $descriptor.DiscretionaryAcl) {
     throw 'Security channel has no DACL; refusing to replace its access policy.'
 }
