@@ -83,11 +83,17 @@ function Invoke-OnDc([string]$Script, [string]$Display) {
     # $Display: what to SHOW instead of $Script, when the script embeds a secret.
     Show-Cmd -Where "runs on the DC, $dcName" -Command ($(if ($Display) { $Display } else { $Script }))
     $tmp = New-TemporaryFile
-    Set-Content -Path $tmp -Value $Script
+    Set-Content -Path $tmp -Value ("`$ErrorActionPreference = 'Stop'`n" + $Script + "`nWrite-Output 'MIGRATION_DC_COMPLETE'")
     try {
         $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $dcName `
             -CommandId 'RunPowerShellScript' -ScriptPath $tmp
-        ($r.Value | Where-Object Code -like '*StdOut*').Message
+        $out = ($r.Value | Where-Object Code -like '*StdOut*').Message -join "`n"
+        $err = ($r.Value | Where-Object Code -like '*StdErr*').Message -join "`n"
+        if ($err -or $out -notmatch '(?m)^MIGRATION_DC_COMPLETE\r?$') {
+            # The payload contains a key during password sync; do not echo errors.
+            throw 'DC migration command failed or did not complete. Inspect the Run Command result securely on the DC.'
+        }
+        ($out -replace '(?m)^MIGRATION_DC_COMPLETE\r?\n?', '').TrimEnd()
     } finally { Remove-Item $tmp -Force }
 }
 
@@ -118,7 +124,20 @@ Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName ``
         -ActiveDirectoryAccountType $adProps.AccountType | Out-Null
 }
 
+# Embedded in the existing DC calls, not a separate Run Command.
+$replicationScript = @'
+$controllers = @(Get-ADDomainController -Filter * -Server $pdc -ErrorAction Stop)
+if ($controllers.Count -eq 0) { throw 'Cannot determine the domain controller topology.' }
+if ($controllers.Count -gt 1) {
+    repadmin /syncall $pdc /AdeP 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'AD replication failed.' }
+} else {
+    Write-Output 'Single DC: replication skipped'
+}
+'@
+
 function Sync-KerbKeyToAd {
+    param([switch]$SetRc4)
     Show-Cmd -Where 'runs here, against Azure' -Command @"
 New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -KeyName kerb1
 `$kerb = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
@@ -128,13 +147,20 @@ New-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -Key
     Start-Sleep -Seconds 15   # let the new key value settle before reading it
     $kerb = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $saName -ListKerbKey |
         Where-Object KeyName -eq 'kerb1').Value
+    $encryptionScript = if ($SetRc4) {
+        @'
+Set-ADComputer -Identity $comp.DistinguishedName -Server $pdc -KerberosEncryptionType RC4
+Write-Output 'AD object now advertises RC4'
+'@
+    } else { '' }
     $dcScript = @"
 Import-Module ActiveDirectory
 `$pdc = (Get-ADDomain).PDCEmulator
 `$comp = Get-ADComputer -Identity '$saName' -Server `$pdc
+$encryptionScript
 Set-ADAccountPassword -Identity `$comp.DistinguishedName -Server `$pdc -Reset ``
   -NewPassword (ConvertTo-SecureString '$($kerb.Replace("'","''"))' -AsPlainText -Force)
-repadmin /syncall `$pdc /AdeP 2>&1 | Out-Null
+$replicationScript
 Write-Output "AD password re-synced to the new kerb1 key on `$pdc"
 "@
     Invoke-OnDc -Script $dcScript -Display ($dcScript -replace [regex]::Escape($kerb.Replace("'","''")), '<kerb1-key>') |
@@ -170,7 +196,7 @@ Get-ADComputer -Identity '$saName' -Server `$pdc ``
 Import-Module ActiveDirectory
 `$pdc = (Get-ADDomain).PDCEmulator
 Set-ADComputer -Identity '$saName' -Server `$pdc -KerberosEncryptionType AES256
-repadmin /syncall `$pdc /AdeP 2>&1 | Out-Null
+$replicationScript
 Write-Output 'AD object now advertises AES256 only'
 "@ | Write-Host
         Write-Host @"
@@ -233,13 +259,7 @@ RC4 is unsalted, so the wrong DomainName is completely invisible - the share
 mounts perfectly. That is exactly why the defect can sit there for years.
 "@ -ForegroundColor Yellow
         Set-AdProperties -DomainNameValue $adProps.NetBiosDomainName
-        Invoke-OnDc @"
-Import-Module ActiveDirectory
-`$pdc = (Get-ADDomain).PDCEmulator
-Set-ADComputer -Identity '$saName' -Server `$pdc -KerberosEncryptionType RC4
-Write-Output 'AD object now advertises RC4'
-"@ | Write-Host
-        Sync-KerbKeyToAd
+        Sync-KerbKeyToAd -SetRc4
 
         # Prove RC4 still works in this environment before the lab depends on it.
         # Recent Windows builds and hardening baselines disable RC4 outright; if

@@ -113,6 +113,13 @@ deployment itself is never left in a broken shape. A verified environment takes 
 the diagnostic tooling (Az + AzFilesHybrid) installs on the client **after**
 that, off the critical path, so a slow download can't hold up the lab.
 
+`Invoke-Aes256Migration.ps1 -Step Legacy` combines the RC4 setting and AD
+password synchronization in one DC Run Command. It retains the 15-second
+key-refresh wait and the subsequent client mount probe. Legacy, Enforce, and
+Repair skip `repadmin /syncall` when the domain has only one DC; domains with
+multiple DCs retain the replication step. No extra Run Command is needed to
+check the topology.
+
 ### Collect Client and DC evidence for a mount attempt
 
 The client installer generates `C:\LabTools\Get-KerberosEvidence.ps1`. Wait for
