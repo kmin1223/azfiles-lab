@@ -10,7 +10,7 @@ No password is embedded in repository source or intentionally written to the
 installer log. Windows Task Scheduler stores the fixed worker credential.
 
 Stages trusted repository scripts in an administrator-only, run-specific folder
-under C:\Program Files\AzureFilesLabEvidenceBootstrap. Keeps the scripts and
+at C:\Program Files\AzureFilesLabEvidenceBootstrap-<run-id>. Keeps the scripts and
 install.log for troubleshooting. No certificates, encryption handshake, extra
 cleanup Run Commands, redeployment, or storage-key rotation are performed.
 #>
@@ -79,7 +79,10 @@ function Read-EvidenceBootstrapMarker {
     if ($failures.Count -eq 1) {
         $failure = $failures[0].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop
         if ($failure.RunId -cne $RunId) { throw 'Remote failure record belongs to another run.' }
-        throw "Stage '$($failure.Stage)': $($failure.Message) [$($failure.Script):$($failure.Line); $($failure.ErrorId)]. VM log: $($failure.LogPath)"
+        $logLocation = if ([string]::IsNullOrWhiteSpace([string]$failure.LogPath)) {
+            'VM log not created: staging initialization did not complete.'
+        } else { "VM log: $($failure.LogPath)" }
+        throw "Stage '$($failure.Stage)': $($failure.Message) [$($failure.Script):$($failure.Line); $($failure.ErrorId)]. $logLocation"
     }
     foreach ($entry in @($Result.Value)) {
         if ($entry.Code -match '(?i)failed|error' -or
@@ -112,9 +115,8 @@ function New-EvidenceBootstrapScript {
 param([Parameter(Mandatory)][string]$LabPassword)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$root = 'C:\Program Files\AzureFilesLabEvidenceBootstrap'
 $runId = '__RUN_ID__'
-$directory = Join-Path $root $runId
+$directory = $null
 $logPath = $null
 $stage = 'Preparing staging directory'
 $sourceNames = @('Install-LabEvidenceAutomation.ps1', 'Invoke-LabEvidenceAutomation.ps1', 'Get-KerberosEvidence.ps1')
@@ -139,7 +141,9 @@ function Assert-SafeDirectory([string]$Path, [switch]$Private) {
     foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted) { continue }
         if (-not $Private -and ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
-        if ($Private -or ($rule.FileSystemRights -band $writeMask)) { throw "Unsafe directory permissions: $Path" }
+        if ($Private -or ($rule.FileSystemRights -band $writeMask)) {
+            throw "Unsafe directory permissions: $Path; SID=$($rule.IdentityReference.Value); rights=$($rule.FileSystemRights); inherited=$($rule.IsInherited)"
+        }
     }
 }
 function New-PrivateDirectory([string]$Path) {
@@ -152,6 +156,16 @@ function New-PrivateDirectory([string]$Path) {
     }
     [IO.Directory]::CreateDirectory($Path,$acl) | Out-Null
     Assert-SafeDirectory $Path -Private
+}
+function New-InstallDirectory([string]$RunId) {
+    if ($RunId -cnotmatch '^[a-f0-9]{32}$') { throw 'Invalid installation run ID.' }
+    Assert-SafeDirectory 'C:\'
+    Assert-SafeDirectory 'C:\Program Files'
+    # Do not reuse a mutable shared bootstrap parent from an earlier attempt.
+    $path = Join-Path 'C:\Program Files' ('AzureFilesLabEvidenceBootstrap-' + $RunId)
+    if (Test-Path -LiteralPath $path) { throw "Run directory already exists: $path" }
+    New-PrivateDirectory $path
+    return $path
 }
 function Invoke-StagedEvidenceInstall($Config, [string]$Directory) {
     $securePassword = ConvertTo-SecureString $LabPassword -AsPlainText -Force
@@ -172,12 +186,7 @@ function Invoke-StagedEvidenceInstall($Config, [string]$Directory) {
     }
 }
 try {
-    Assert-SafeDirectory 'C:\'
-    Assert-SafeDirectory 'C:\Program Files'
-    if (Test-Path -LiteralPath $root) { Assert-SafeDirectory $root -Private }
-    else { New-PrivateDirectory $root }
-    if (Test-Path -LiteralPath $directory) { throw 'Run directory already exists.' }
-    New-PrivateDirectory $directory
+    $directory = New-InstallDirectory $runId
     $logPath = Join-Path $directory 'install.log'
     Write-InstallLog ("Run $runId started at " + [DateTime]::UtcNow.ToString('o'))
     $stage = 'Staging repository scripts'

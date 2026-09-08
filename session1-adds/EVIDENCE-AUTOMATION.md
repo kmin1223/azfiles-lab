@@ -42,13 +42,22 @@ VM-local log path. Staged scripts and `install.log` remain in the run-specific
 administrator-only folder:
 
 ```text
-C:\Program Files\AzureFilesLabEvidenceBootstrap\<run-id>\install.log
+C:\Program Files\AzureFilesLabEvidenceBootstrap-<run-id>\install.log
 ```
 
 An error before that directory is created is returned directly without a log
 path. An Azure transport interruption might also prevent a structured response.
 Only a matching readiness record counts as completed installation; ARM request
 success alone does not.
+
+Each attempt creates a separate protected directory directly under Program Files.
+The older shared `C:\Program Files\AzureFilesLabEvidenceBootstrap` folder is no
+longer used. Its ACL or a previous failed run cannot block initialization of a
+new attempt. Existing logs and folders are left untouched; their permissions
+are not loosened. The new folder still requires administrator/SYSTEM ownership
+and access, and unsafe parent permissions or linked paths still stop setup.
+ACL failures include the offending SID and rights. If staging did not complete,
+the error explicitly says that no VM log was created.
 
 The older `Credential details withheld` message did not identify the actual
 failure. After updating the repository, rerun only the update command above.

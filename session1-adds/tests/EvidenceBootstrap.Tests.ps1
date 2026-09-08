@@ -87,7 +87,94 @@ Describe 'One-call remote installer construction' {
         $remote | Should Match 'FullyQualifiedErrorId'
         $remote | Should Match 'ScriptStackTrace'
         $remote | Should Match 'AUTO_EVIDENCE_FAILED:'
+        $remote | Should Match '\$directory = New-InstallDirectory \$runId'
         $remote | Should Not Match '\-Recurse|Remove-AzVMRunCommand|Remove-Item|Unregister-ScheduledTask'
+    }
+}
+
+Describe 'Independent staging initialization without VM filesystem changes' {
+    BeforeAll {
+        $source=New-EvidenceBootstrapScript ('1'*32) (New-TestEvidenceSources) (New-TestEvidenceConfig)
+        $lex=$null; $err=$null
+        $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$lex,[ref]$err)
+        foreach($definition in $ast.FindAll({
+            param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -in @('Assert-SafeDirectory','New-PrivateDirectory','New-InstallDirectory')
+        },$true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+    }
+    BeforeEach {
+        $script:legacy='C:\Program Files\AzureFilesLabEvidenceBootstrap'
+        Mock Test-Path { param($LiteralPath) $LiteralPath -eq $script:legacy }
+        Mock Assert-SafeDirectory {
+            param($Path)
+            if ($Path -eq $script:legacy) { throw 'Unsafe legacy directory permissions' }
+        }
+        Mock New-PrivateDirectory {}
+    }
+    It 'creates independent private siblings without checking or using the unsafe legacy folder' {
+        $first=New-InstallDirectory ('1'*32)
+        $second=New-InstallDirectory ('2'*32)
+        $first | Should Be ('C:\Program Files\AzureFilesLabEvidenceBootstrap-' + ('1'*32))
+        $second | Should Be ('C:\Program Files\AzureFilesLabEvidenceBootstrap-' + ('2'*32))
+        Assert-MockCalled New-PrivateDirectory -Times 2 -Exactly -Scope It
+        Assert-MockCalled Assert-SafeDirectory -Times 2 -Exactly -Scope It -ParameterFilter { $Path -eq 'C:\Program Files' }
+        Assert-MockCalled Assert-SafeDirectory -Times 0 -Exactly -Scope It -ParameterFilter { $Path -eq $script:legacy }
+        Assert-MockCalled Test-Path -Times 0 -Exactly -Scope It -ParameterFilter { $LiteralPath -eq $script:legacy }
+    }
+    It 'refuses an existing run path instead of repairing or reusing it' {
+        Mock Test-Path { $true }
+        { New-InstallDirectory ('1'*32) } | Should Throw 'Run directory already exists'
+        Assert-MockCalled New-PrivateDirectory -Times 0 -Exactly -Scope It
+    }
+    It 'still rejects unsafe Program Files permissions before creating anything' {
+        Mock Assert-SafeDirectory {
+            param($Path)
+            if ($Path -eq 'C:\Program Files') { throw 'Unsafe parent ACL' }
+        }
+        { New-InstallDirectory ('1'*32) } | Should Throw 'Unsafe parent ACL'
+        Assert-MockCalled New-PrivateDirectory -Times 0 -Exactly -Scope It
+    }
+    It 'does not hide failure to establish the new private directory' {
+        Mock New-PrivateDirectory { throw 'Private ACL validation failed' }
+        { New-InstallDirectory ('1'*32) } | Should Throw 'Private ACL validation failed'
+    }
+    It 'rejects malformed run identifiers before touching any path' {
+        { New-InstallDirectory '..\other' } | Should Throw 'Invalid installation run ID'
+        Assert-MockCalled Assert-SafeDirectory -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-PrivateDirectory -Times 0 -Exactly -Scope It
+    }
+}
+
+Describe 'Private staging ACL validation with in-memory security descriptors' {
+    BeforeEach {
+        $script:acl=New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true,$false)
+        $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+        foreach($sid in @('S-1-5-18','S-1-5-32-544')) {
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                [Security.Principal.SecurityIdentifier]$sid,'FullControl','Allow')))
+        }
+        Mock Get-Item { [pscustomobject]@{PSIsContainer=$true;Attributes=[IO.FileAttributes]::Directory} }
+        Mock Get-Acl { $script:acl }
+    }
+    It 'accepts protected administrator and SYSTEM permissions' {
+        { Assert-SafeDirectory 'C:\fixture' -Private } | Should Not Throw
+    }
+    It 'keeps extra read permissions forbidden on the new private folder and names the ACE' {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]'S-1-5-32-545','ReadAndExecute','Allow')))
+        { Assert-SafeDirectory 'C:\fixture' -Private } | Should Throw 'SID=S-1-5-32-545; rights=ReadAndExecute'
+    }
+    It 'rejects untrusted write permissions' {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]'S-1-5-32-545','Modify','Allow')))
+        { Assert-SafeDirectory 'C:\fixture' -Private } | Should Throw 'Unsafe directory permissions'
+    }
+    It 'rejects untrusted owners and linked directories' {
+        $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-21-1-2-3-1100')
+        { Assert-SafeDirectory 'C:\fixture' -Private } | Should Throw 'Unsafe directory owner'
+        Mock Get-Item { [pscustomobject]@{PSIsContainer=$true;Attributes=[IO.FileAttributes]::ReparsePoint} }
+        { Assert-SafeDirectory 'C:\fixture' -Private } | Should Throw 'Unsafe directory:'
     }
 }
 
@@ -151,6 +238,14 @@ Write-Error 'Failed after marker' -ErrorAction Continue
 }
 
 Describe 'Actionable, correlated remote results' {
+    It 'explains why there is no log when staging initialization fails' {
+        $id='1'*32
+        $r=New-TestEvidenceResult 'AUTO_EVIDENCE_FAILED:' @{
+            RunId=$id;Stage='Preparing staging directory';Message='Unsafe parent ACL'
+            Script='script.ps1';Line=31;ErrorId='UnsafeAcl';LogPath=$null
+        }
+        { Read-EvidenceBootstrapMarker $r $id } | Should Throw 'VM log not created: staging initialization did not complete'
+    }
     It 'requires exactly one matching readiness record' {
         $id='1'*32
         $r=New-TestEvidenceResult 'AUTO_EVIDENCE_READY:' @{RunId=$id;LogPath='C:\private\install.log'}
