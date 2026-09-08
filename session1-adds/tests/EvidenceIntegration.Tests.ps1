@@ -42,6 +42,9 @@ Describe 'Generated command sheet uses automatic and explicit manual flows' {
         $text | Should Match 'Update-LabEvidenceAutomation.ps1 -ResourceGroupName lab-rg -Prefix custom -StorageAccount customlabstorage -Share evidence'
         $text | Should Match 'original window''s klist is NOT'
         $text | Should Match 'user\\dc-summary.txt'
+        $text | Should Match 'Approve ONE UAC consent'
+        $text | Should Match 'interactive \(2\) logon'
+        $text | Should Not Match 'SYSTEM captures|batch logon|automatic tasks'
         $text | Should Not Match 'step 2 - retest. DROP THE SMB SESSION'
         $text | Should Match 'VM password: Not supplied'
     }

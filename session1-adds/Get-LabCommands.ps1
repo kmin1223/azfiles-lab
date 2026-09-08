@@ -117,7 +117,8 @@ $text = @"
 [B] optional automatic evidence - ONE command in the NORMAL labuser1 window
     # Requires AUTO_EVIDENCE_READY from deployment/upgrade.
     C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-    # SYSTEM captures; a new non-elevated labuser1 batch logon connects via UNC.
+    # Approve ONE UAC consent for the elevated capture coordinator.
+    # Stored credentials create a fresh non-elevated labuser1 interactive (2) logon.
     # No Z: mapping, logout, password prompt or separate StopTrace is needed.
     # Read the printed run folder: user\ holds mount/tickets/DC evidence;
     # capture\ holds the trace and collector-side events/state.
@@ -138,7 +139,7 @@ $text = @"
     the collector uses its installed DC configuration/domain discovery.
     Missing/denied/empty DC evidence is not proof that the KDC is healthy.
     Sign out/in after new group membership; use -DcCredential if needed
-    (manual DC credentials are not stored; automatic tasks use the deployment credential).
+    (manual DC credentials are not stored; the automatic worker uses the stored lab credential).
     Retry only DC collection for an existing capture:
     C:\LabTools\Get-KerberosEvidence.ps1 -CollectDc -Path '<capture-folder>'$dcArgument
 
@@ -241,7 +242,8 @@ $text = @"
 
 [A] Existing VM / interrupted deployment: install or update automatic evidence
     ./Update-LabEvidenceAutomation.ps1 -ResourceGroupName $ResourceGroupName -Prefix $Prefix -StorageAccount $saName -Share $Share$dcArgument
-    # One-time labuser1 password prompt at setup; no password prompts per capture.
+    # One-time labuser1 password prompt at setup; ONE UAC consent, no password prompts per capture.
+    # Dedicated disposable password only; protected local credential storage is not a vault.
 
 [A] teardown
     Remove-AzResourceGroup -Name $ResourceGroupName -Force

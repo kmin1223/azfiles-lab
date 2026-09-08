@@ -14,7 +14,7 @@
     7. Final kerb key rotation + AD password sync (1396 guard) + NTFS ACLs
        (one Run Command - each round-trip costs ~60s fixed overhead)
     9. Verify the client actually mounts the share
-   10. Install one-command evidence tasks (SYSTEM capture + fresh labuser1 logon)
+   10. Install one-command evidence scripts (UAC capture + fresh labuser1 logon)
 
   Timing design:
     * the client's domain join and reboot run in the background while the
@@ -565,7 +565,8 @@ $pwLine Transcript      : $logFile
  The DC has no Azure tooling; its read-only Security evidence access is prepared.
  After AUTO_EVIDENCE_READY, normal labuser1 can capture/reproduce/stop with:
    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
- This uses a fresh non-elevated batch logon and UNC connection, not the RDP session.
+ Approve one UAC consent; stored credentials create a fresh non-elevated interactive (2)
+ logon and UNC connection, not the RDP session. No per-capture password prompt.
  Run these diagnostic commands on the CLIENT VM only, after tools installation:
    Connect-AzAccount
    Debug-AzStorageAccountAuth -StorageAccountName $saName ``

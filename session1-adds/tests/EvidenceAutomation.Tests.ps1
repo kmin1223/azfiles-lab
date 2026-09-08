@@ -11,7 +11,7 @@ foreach ($tree in @($runtimeAst,$installerAst)) {
         param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
     }, $true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
 }
-# Collector stand-ins: never invoke capture, Scheduler mutations, logons or services.
+# Collector stand-ins: never invoke capture, credential logons, UAC or services.
 function Test-Admin { $false }
 function Start-Capture($Out) { throw 'Unmocked capture' }
 function Stop-Capture($Out) { throw 'Unmocked stop' }
@@ -21,16 +21,23 @@ function Write-JsonFile($Value,$Path) { $Value | ConvertTo-Json -Depth 6 | Set-C
 function New-TestConfig {
     [pscustomobject]@{ StorageAccount='labstorage'; Share='labshare'; DomainController='dc.contoso.local'
         ExpectedUserSid='S-1-5-21-1-2-3-1100'; Account='CONTOSO\labuser1'
-        TaskFolder='\AzureFilesLabEvidence'; BrokerTask='Broker'; WorkerTask='Worker' }
+        Version=2 }
 }
 
 Describe 'Automatic evidence validation and boundaries' {
+    It 'does not reuse the old Scheduler native helper in an existing PowerShell session' {
+        if (-not ('LabEvidence.SafeReader' -as [type])) {
+            Add-Type 'namespace LabEvidence { public static class SafeReader { } }'
+        }
+        Initialize-EvidenceNativeReader
+        ([LabEvidence.Direct.SafeReader].GetMethod('Logon') -ne $null) | Should Be $true
+    }
     BeforeEach { $script:config = New-TestConfig }
     It 'accepts the fixed nonsecret configuration' { { Assert-EvidenceConfig $config } | Should Not Throw }
-    It 'rejects command injection and arbitrary task names' {
+    It 'rejects command injection and old configuration versions' {
         $config.StorageAccount = 'lab;whoami'
         { Assert-EvidenceConfig $config } | Should Throw
-        $config = New-TestConfig; $config.WorkerTask = 'OtherTask'
+        $config = New-TestConfig; $config.Version = 1
         { Assert-EvidenceConfig $config } | Should Throw
     }
     It 'rejects SYSTEM and builtin users as the reproduction principal' {
@@ -49,10 +56,12 @@ Describe 'Automatic evidence validation and boundaries' {
         Mock Get-Item { [pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint } }
         { Assert-EvidencePath 'C:\isolated\link' } | Should Throw
     }
-    It 'requires SYSTEM only for the broker' {
+    It 'requires the elevated configured lab account for the coordinator, never SYSTEM' {
         Mock Get-EvidenceIdentity { [pscustomobject]@{ Sid='S-1-5-18'; Admin=$true } }
-        { Assert-EvidenceIdentity $config 'Broker' } | Should Not Throw
+        { Assert-EvidenceIdentity $config 'Coordinator' } | Should Throw
         { Assert-EvidenceIdentity $config 'Worker' } | Should Throw
+        Mock Get-EvidenceIdentity { [pscustomobject]@{ Sid=$config.ExpectedUserSid; Admin=$true } }
+        { Assert-EvidenceIdentity $config 'Coordinator' } | Should Not Throw
     }
     It 'rejects an elevated or wrong-user client and worker' {
         Mock Get-EvidenceIdentity { [pscustomobject]@{ Sid=$config.ExpectedUserSid; Admin=$true } }
@@ -68,11 +77,6 @@ Describe 'Automatic evidence validation and boundaries' {
         ($write.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) |
             Where-Object { $_.IdentityReference.Value -eq $config.ExpectedUserSid }).FileSystemRights.ToString() | Should Match 'Modify'
         $read.AreAccessRulesProtected | Should Be $true
-    }
-    It 'does not accept unsafe existing task ACLs' {
-        $task = [pscustomobject]@{}
-        $task | Add-Member ScriptMethod GetSecurityDescriptor { param($Flags) 'O:BAG:BAD:P(A;;GA;;;WD)' }
-        { Assert-EvidenceTaskSecurity $task } | Should Throw
     }
 }
 
@@ -133,117 +137,57 @@ Describe 'Local administrator membership versus effective token privileges' {
     }
 }
 
-Describe 'Optional Scheduler lookups during initial and partial installation' {
-    BeforeAll {
-        if (-not ('LabEvidenceTests.SchedulerLookup' -as [type])) {
-            Add-Type -TypeDefinition @'
-namespace LabEvidenceTests {
- public class SchedulerLookup {
-  public System.Exception Failure;
-  public object Result;
-  public object GetFolder(string name) { if(Failure != null) throw Failure; return Result; }
-  public object GetTask(string name) { if(Failure != null) throw Failure; return Result; }
- }
-}
-'@
-        }
-    }
-    BeforeEach { $script:container = New-Object LabEvidenceTests.SchedulerLookup }
-    It 'accepts missing folders and tasks mapped to FileNotFoundException' {
-        $container.Failure = New-Object IO.FileNotFoundException('fixture missing')
-        foreach ($kind in @('Folder','Task')) {
-            $result = Get-OptionalEvidenceSchedulerItem $container $kind 'missing'
-            ($null -eq $result) | Should Be $true
-        }
-    }
-    It 'also accepts the original COMException mapping for exactly 0x80070002' {
-        $container.Failure = New-Object Runtime.InteropServices.COMException('fixture missing', -2147024894)
-        foreach ($kind in @('Folder','Task')) {
-            $result = Get-OptionalEvidenceSchedulerItem $container $kind 'missing'
-            ($null -eq $result) | Should Be $true
-        }
-    }
-    It 'propagates access denied and other failures rather than treating them as absent' {
-        foreach ($failure in @(
-            (New-Object Runtime.InteropServices.COMException('fixture denied', -2147024891)),
-            (New-Object UnauthorizedAccessException('fixture denied')),
-            (New-Object IO.DirectoryNotFoundException('fixture unexpected path')),
-            (New-Object InvalidOperationException('fixture service failure')))) {
-            $container.Failure = $failure
-            foreach ($kind in @('Folder','Task')) {
-                { Get-OptionalEvidenceSchedulerItem $container $kind 'target' } | Should Throw $failure.Message
-            }
-        }
-    }
-    It 'returns existing items unchanged for the normal security and state checks' {
-        $container.Result = [pscustomobject]@{Name='existing';State=4}
-        foreach ($kind in @('Folder','Task')) {
-            $result = Get-OptionalEvidenceSchedulerItem $container $kind 'existing'
-            $result.Name | Should Be 'existing'
-            $result.State | Should Be 4
-        }
-        $installerAst.Extent.Text | Should Match 'Assert-EvidenceTaskSecurity \$folder'
-        $installerAst.Extent.Text | Should Match 'Assert-EvidenceTaskSecurity \$task'
-        $installerAst.Extent.Text | Should Match 'Cannot update automation while a task is running'
-    }
-    It 'handles native Scheduler not-found results using read-only calls' {
-        $scheduler = $null; $folder = $null
-        try {
-            $scheduler = New-Object -ComObject 'Schedule.Service'
-            $scheduler.Connect()
-            $folder = Get-OptionalEvidenceSchedulerItem $scheduler 'Folder' '\'
-            ($null -eq $folder) | Should Be $false
-            $name = 'AzureFilesLabEvidence-Probe-' + [guid]::NewGuid().ToString('N')
-            ($null -eq (Get-OptionalEvidenceSchedulerItem $scheduler 'Folder' ('\' + $name))) | Should Be $true
-            ($null -eq (Get-OptionalEvidenceSchedulerItem $folder 'Task' $name)) | Should Be $true
-        } finally {
-            if ($folder) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($folder) }
-            if ($scheduler) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($scheduler) }
-        }
-    }
-}
-
-Describe 'Task definitions without live Scheduler mutations' {
+Describe 'Direct process launches without credentials, UAC or service changes' {
     BeforeEach {
-        $script:action = [pscustomobject]@{ Path=''; Arguments=''; WorkingDirectory='' }
-        $actions = [pscustomobject]@{}
-        $actions | Add-Member ScriptMethod Create { param($Type) $script:action }
-        $script:definition = [pscustomobject]@{
-            RegistrationInfo=[pscustomobject]@{ Description='' }
-            Principal=[pscustomobject]@{ UserId=''; LogonType=0; RunLevel=0 }
-            Settings=[pscustomobject]@{ Enabled=$false; AllowDemandStart=$false; AllowHardTerminate=$false; MultipleInstances=0
-                ExecutionTimeLimit=''; DisallowStartIfOnBatteries=$true; StopIfGoingOnBatteries=$true
-                StartWhenAvailable=$true; RestartCount=9 }
-            Actions=$actions
+        $script:InstallRoot = 'C:\Program Files\AzureFilesLabEvidence'
+        $script:RuntimeRoot = Join-Path $TestDrive 'runtime'
+        $script:run = [guid]::NewGuid().ToString('D')
+        $script:secret = 'fixture-$`''"&-' + [char]0x6f22 + [char]0x5b57
+        $script:fixtureCredential = [pscredential]::new('CONTOSO\labuser1', (ConvertTo-SecureString $secret -AsPlainText -Force))
+        Mock Assert-EvidenceAcl {}
+        Mock Start-Process { [pscustomobject]@{Id=123} }
+    }
+    It 'uses RunAs only for the coordinator, with fixed executable and validated nonsecret arguments' {
+        (Start-EvidenceProcess 'Coordinator' $run '0:0x123').Id | Should Be 123
+        Assert-MockCalled Start-Process -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Verb -eq 'RunAs' -and -not $Credential -and
+            $FilePath -eq 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -and
+            $WorkingDirectory -eq $InstallRoot -and $PassThru -and
+            $ArgumentList -match '-Mode Coordinator -RunId' -and $ArgumentList -notmatch 'password|labuser1'
         }
-        $script:scheduler = [pscustomobject]@{}
-        $scheduler | Add-Member ScriptMethod NewTask { param($Flags) $script:definition }
     }
-    It 'uses a password batch worker with least privilege and no retries' {
-        $task = New-EvidenceTaskDefinition $scheduler 'Worker' 'CONTOSO\labuser1'
-        $task.Principal.LogonType | Should Be 1
-        $task.Principal.RunLevel | Should Be 0
-        $task.Settings.MultipleInstances | Should Be 2
-        $task.Settings.ExecutionTimeLimit | Should Be 'PT3M'
-        $task.Settings.RestartCount | Should Be 0
-        $task.Settings.AllowHardTerminate | Should Be $true
-        $action.Path | Should Be 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-        $action.Arguments | Should Match '-Mode Worker$'
-        $action.Arguments | Should Not Match 'password|credential|StorageAccount|labuser1'
-        $action.WorkingDirectory | Should Be 'C:\Program Files\AzureFilesLabEvidence'
+    It 'passes special characters only inside PSCredential, never with RunAs or in arguments' {
+        Start-EvidenceProcess 'Worker' $run '0:0x123' $fixtureCredential
+        Assert-MockCalled Start-Process -Times 1 -Exactly -Scope It -ParameterFilter {
+            -not $Verb -and $Credential.GetNetworkCredential().Password -ceq $secret -and $LoadUserProfile -and
+            $ArgumentList -match '-NoProfile -NonInteractive' -and
+            $ArgumentList -match '-Mode Worker -RunId' -and
+            $RedirectStandardError -eq (Join-Path (Get-EvidenceRunPaths $run).Capture 'worker-stderr.txt') -and
+            -not $ArgumentList.Contains($secret) -and $ArgumentList -notmatch 'password|labuser1'
+        }
     }
-    It 'uses a fixed SYSTEM broker action with a bounded lifetime' {
-        $task = New-EvidenceTaskDefinition $scheduler 'Broker' 'SYSTEM'
-        $task.Principal.LogonType | Should Be 5
-        $task.Settings.ExecutionTimeLimit | Should Be 'PT10M'
-        $action.Arguments | Should Match '-NoProfile -NonInteractive'
-        $action.Arguments | Should Match '-Mode Broker$'
+    It 'rejects argument injection, mixed elevation and credential modes before launch' {
+        { Start-EvidenceProcess 'Worker' '..\outside' '0:0x123' $fixtureCredential } | Should Throw
+        { Start-EvidenceProcess 'Worker' $run '0:0x123 & whoami' $fixtureCredential } | Should Throw
+        { Start-EvidenceProcess 'Coordinator' $run '0:0x123' $fixtureCredential } | Should Throw
+        { Start-EvidenceProcess 'Worker' $run '0:0x123' } | Should Throw
+        Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
     }
-    It 'does not grant worker execute permission or serialize the password' {
-        $source = $installerAst.Extent.Text
-        $source | Should Match '\$workerSddl = \$baseSddl \+ "\(A;;GR;;;'
-        $source | Should Not Match 'Export-Clixml|ConvertFrom-SecureString|Start-Transcript'
-        $source | Should Match 'GetNetworkCredential\(\).Password, 1, \$workerSddl'
+    It 'reports UAC cancellation without requesting capture or a credential logon' {
+        Mock Start-Process { throw (New-Object ComponentModel.Win32Exception(1223)) }
+        { Start-EvidenceProcess 'Coordinator' $run '0:0x123' } | Should Throw 'UAC consent was cancelled'
+    }
+    It 'reports credential launch failure without echoing a secret-bearing exception' {
+        Mock Start-Process { throw (New-Object ComponentModel.Win32Exception(1326, $script:secret)) }
+        try { Start-EvidenceProcess 'Worker' $run '0:0x123' $fixtureCredential; throw 'unexpected success' }
+        catch {
+            $_.Exception.Message | Should Match 'Worker launch failed'
+            $_.Exception.Message.Contains($secret) | Should Be $false
+        }
+    }
+    It 'contains no Scheduler runtime, task registration, password CLI or SendKeys fallback' {
+        ($runtimeAst.Extent.Text + $installerAst.Extent.Text) |
+            Should Not Match 'Schedule.Service|RegisterTask|NewTask|Get-EvidenceFolder|SendKeys|runas.exe|BatchLogon'
     }
     It 'leaves the caller-owned credential and SecureString alive' {
         $installerAst.Extent.Text | Should Not Match '\$LabCredential(?:\.Password)?\.Dispose\s*\('
@@ -257,15 +201,87 @@ Describe 'Task definitions without live Scheduler mutations' {
         $source | Should Not Match 'AUTO_EVIDENCE_READY:'
         $source.IndexOf('Publish-EvidenceDispatcher') | Should BeLessThan $source.IndexOf("Write-Output 'AUTO_EVIDENCE_READY'")
     }
+
     It 'owns worker descendants in a non-breakaway kill-on-close job without live job assignment' {
         $runtimeAst.Extent.Text | Should Match 'limits.Basic.Flags=0x2000;'
         $runtimeAst.Extent.Text | Should Match 'AssignProcessToJobObject\(job,GetCurrentProcess\(\)\)'
-        $runtimeAst.Extent.Text | Should Match '\$script:WorkerJob = \[LabEvidence.SafeReader\]::OwnWorkerProcessTree\(\)'
+        $runtimeAst.Extent.Text | Should Match '\$script:WorkerJob = \[LabEvidence.Direct.SafeReader\]::OwnWorkerProcessTree\(\)'
         $runtimeAst.Extent.Text | Should Not Match '\$script:WorkerJob.Dispose'
         $workerCode = $runtimeAst.Find({ param($n)
             $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-EvidenceWorker'
         },$true).Extent.Text
         $workerCode.IndexOf('OwnWorkerProcessTree') | Should BeLessThan $workerCode.IndexOf('Invoke-MountAttempt')
+    }
+}
+
+Describe 'Explicit legacy migration without touching installed tasks' {
+    It 'rejects either exact legacy task before installation' {
+        foreach ($name in @('Broker','Worker')) {
+            $script:legacy = "C:\Windows\System32\Tasks\AzureFilesLabEvidence\$name"
+            Mock Test-Path { param($LiteralPath) $LiteralPath -eq $script:legacy }
+            { Assert-NoLegacyEvidenceTasks } | Should Throw 'Legacy evidence tasks exist'
+        }
+        $installerAst.Extent.Text | Should Not Match 'Unregister-ScheduledTask|Stop-ScheduledTask'
+    }
+    It 'does not require Scheduler when neither legacy task exists' {
+        Mock Test-Path { $false }
+        { Assert-NoLegacyEvidenceTasks } | Should Not Throw
+    }
+    It 'propagates inability to inspect legacy paths' {
+        Mock Test-Path { throw 'fixture access denied' }
+        { Assert-NoLegacyEvidenceTasks } | Should Throw 'fixture access denied'
+    }
+}
+
+Describe 'Stored disposable credential round trip using synthetic data only' {
+    BeforeEach {
+        $script:InstallRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('D'))
+        New-Item -ItemType Directory -Path (Join-Path $InstallRoot 'Credentials') -Force | Out-Null
+        $script:config = New-TestConfig
+        $script:syntheticPassword = 'fixture-$`''"&-' + [char]0x6f22 + [char]0x5b57 + [guid]::NewGuid().ToString('N')
+        $script:syntheticCredential = [pscredential]::new($config.Account,
+            (ConvertTo-SecureString $syntheticPassword -AsPlainText -Force))
+        # Fixture paths only: exercise DPAPI and serialization, not installation/real credential files.
+        Mock Assert-EvidencePrivateAcl {}
+    }
+    It 'round trips Unicode and shell-special characters without writing plaintext or disposing the input' {
+        Save-EvidenceCredential $syntheticCredential $config.Account
+        $path = Join-Path $InstallRoot 'Credentials\credential.json'
+        (Get-Content $path -Raw).Contains($syntheticPassword) | Should Be $false
+        $loaded = Read-EvidenceCredential $config
+        try {
+            $loaded.UserName | Should Be $config.Account
+            $loaded.GetNetworkCredential().Password | Should Be $syntheticPassword
+            $syntheticCredential.GetNetworkCredential().Password | Should Be $syntheticPassword
+        } finally { $loaded.Password.Dispose() }
+        @(Get-ChildItem (Split-Path $path -Parent) -Filter '*.new').Count | Should Be 0
+    }
+    It 'replaces the protected credential for password rotation and verifies the new value' {
+        Save-EvidenceCredential $syntheticCredential $config.Account
+        $rotated = [pscredential]::new($config.Account, (ConvertTo-SecureString 'rotated-fixture' -AsPlainText -Force))
+        Save-EvidenceCredential $rotated $config.Account
+        $loaded = Read-EvidenceCredential $config
+        try { $loaded.GetNetworkCredential().Password | Should Be 'rotated-fixture' }
+        finally { $loaded.Password.Dispose() }
+    }
+    It 'refuses mismatched account configuration before decrypting' {
+        Save-EvidenceCredential $syntheticCredential $config.Account
+        $config.Account = 'OTHER\labuser1'
+        { Read-EvidenceCredential $config } | Should Throw 'does not match'
+    }
+    It 'rejects corrupt ciphertext instead of falling back to a password prompt' {
+        @{Account=$config.Account; Password='not-base64'} | ConvertTo-Json |
+            Set-Content (Join-Path $InstallRoot 'Credentials\credential.json')
+        { Read-EvidenceCredential $config } | Should Throw
+        $runtimeAst.Extent.Text | Should Not Match 'Get-Credential|Read-Host'
+    }
+}
+
+Describe 'Credential privacy validation' {
+    It 'refuses read access for the non-elevated lab account even when write ACL validation succeeds' {
+        Mock Assert-EvidenceAcl {}
+        Mock Get-Acl { New-EvidenceAcl 'S-1-5-21-1-2-3-1100' }
+        { Assert-EvidencePrivateAcl 'C:\fixture\credential.json' } | Should Throw 'only to Administrators and SYSTEM'
     }
 }
 
@@ -371,9 +387,9 @@ Describe 'Bounded installer failure diagnostics' {
         $credential = [pscredential]::new('CONTOSO\labuser1', (ConvertTo-SecureString $secret -AsPlainText -Force))
         try { throw "fixture registration failure: $secret" } catch {
             $record = $_
-            $message = Format-EvidenceInstallFailure $record 'register-worker' $credential
+            $message = Format-EvidenceInstallFailure $record 'store-lab-credential' $credential
         }
-        $message | Should Match 'FAILED step=register-worker; line=\d+; id='
+        $message | Should Match 'FAILED step=store-lab-credential; line=\d+; id='
         $message | Should Match '\[REDACTED\]'
         $message | Should Not Match $secret
         $credential.GetNetworkCredential().Password | Should Be $secret
@@ -435,7 +451,7 @@ Describe 'Isolated inherited root ACL normalization' {
         } finally {
             if ($guard) { $guard.Dispose() }
             # DACL-only restoration needs no SACL/owner privilege under a non-admin test runner.
-            [LabEvidence.SafeReader]::ProtectDirectoryOnly($root, $fixtureAcl.GetSecurityDescriptorBinaryForm())
+            [LabEvidence.Direct.SafeReader]::ProtectDirectoryOnly($root, $fixtureAcl.GetSecurityDescriptorBinaryForm())
         }
     }
 }
@@ -454,12 +470,12 @@ Describe 'Run correlation and sanitized worker context' {
         $script:to = $from.AddSeconds(3)
     }
     It 'ignores stale completion and delayed start records' {
-        $state = [pscustomobject]@{ BrokerInstanceId='old'; RunId='oldrun'; Complete=$true }
-        (Test-EvidenceCompletion $state 'new' 'oldrun') | Should Be $false
-        $state.BrokerInstanceId='new'
-        (Test-EvidenceCompletion $state 'new' 'oldrun') | Should Be $false
-        $state.RunId='newrun'
-        (Test-EvidenceCompletion $state 'new' 'oldrun') | Should Be $true
+        $state = [pscustomobject]@{ CoordinatorProcessId=42; CallerLogonId='0:0x123'; RunId='oldrun'; Complete=$true }
+        (Test-EvidenceCompletion $state 'newrun' 42 '0:0x123') | Should Be $false
+        $state.RunId = 'newrun'
+        (Test-EvidenceCompletion $state 'newrun' 43 '0:0x123') | Should Be $false
+        (Test-EvidenceCompletion $state 'newrun' 42 '0:0x124') | Should Be $false
+        (Test-EvidenceCompletion $state 'newrun' 42 '0:0x123') | Should Be $true
     }
     It 'rejects arbitrary run paths' {
         { Get-EvidenceRunPaths '..\outside' } | Should Throw
@@ -469,7 +485,7 @@ Describe 'Run correlation and sanitized worker context' {
         $safe = ConvertTo-EvidenceContext $context $config $from $to
         $safe.MountExitCode | Should Be 5
         ($safe.PSObject.Properties.Name -contains 'ArbitraryPath') | Should Be $false
-        $safe.ExpectedLogonType | Should Be 'Batch (4)'
+        $safe.ExpectedLogonType | Should Be 'Interactive (2), credential-created'
     }
     It 'rejects mismatched SID, privileged LUID and stale intervals' {
         $context.LogonId='0:0x3e7'
@@ -479,19 +495,43 @@ Describe 'Run correlation and sanitized worker context' {
         $context.UserSid=$config.ExpectedUserSid; $context.EndUtc='2026-09-07T00:00:00Z'
         { ConvertTo-EvidenceContext $context $config $from $to } | Should Throw
     }
-    It 'times out an exact still-running task rather than reading LastTaskResult' {
-        $instance = [pscustomobject]@{ State=4 }
-        $instance | Add-Member ScriptMethod Refresh {}
-        { Wait-EvidenceInstance $instance 0 } | Should Throw
-        $runtimeAst.Extent.Text | Should Not Match 'LastTaskResult'
+    It 'times out the owned process without stopping unrelated processes' {
+        $process = [pscustomobject]@{HasExited=$false;Killed=$false}
+        $process | Add-Member ScriptMethod WaitForExit { param($Milliseconds) $this.Killed }
+        $process | Add-Member ScriptMethod Kill { $this.Killed = $true }
+        { Wait-EvidenceProcess $process 0 } | Should Throw 'timed out'
+        Stop-EvidenceProcess $process
+        $process.Killed | Should Be $true
     }
     It 'bounds untrusted reads and pins file and directory handles against link races' {
         $runtimeAst.Extent.Text | Should Match 'stream.Length>maximum'
         $runtimeAst.Extent.Text | Should Match 'i.Links!=1'
         $runtimeAst.Extent.Text | Should Match '0x00200000u'
         $runtimeAst.Extent.Text | Should Match 'CreateFile\(p,0x80000000,directory\?1u:5u'
-        $runtimeAst.Extent.Text | Should Match 'session.LogonType!=4'
+        $runtimeAst.Extent.Text | Should Match 'session.LogonType!=2'
         $runtimeAst.Extent.Text | Should Match 'session.LogonTime<notBefore'
+        $runtimeAst.Extent.Text | Should Match 'String.Equals\(id,caller'
+    }
+    It 'reads the current native LUID and refuses it as a fresh worker without logging on' {
+        $caller = Get-EvidenceLogonId
+        $caller | Should Match '^\d+:0x[0-9a-f]+$'
+        { [LabEvidence.Direct.SafeReader]::Logon(0, $caller, $true) } | Should Throw
+        { [LabEvidence.Direct.SafeReader]::Logon([DateTime]::UtcNow.AddMinutes(1).ToFileTimeUtc(), '', $true) } | Should Throw
+    }
+    It 'waits for an ordinary short-lived process with no credentials, elevation or capture' {
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo.FileName = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+        $process.StartInfo.Arguments = '-NoProfile -NonInteractive -Command "exit 0"'
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        try {
+            $process.Start() | Should Be $true
+            Wait-EvidenceProcess $process 15
+            $process.ExitCode | Should Be 0
+        } finally {
+            Stop-EvidenceProcess $process
+            $process.Dispose()
+        }
     }
     It 'reads an isolated JSON fixture and rejects oversized native reads' {
         $path = Join-Path $TestDrive 'bounded.json'
@@ -506,6 +546,20 @@ Describe 'Run correlation and sanitized worker context' {
         New-Item -ItemType HardLink -Path $link -Target $path | Out-Null
         { Read-EvidenceJson $link } | Should Throw
     }
+    It 'bounds retries on a locked state file and preserves the last atomic state' {
+        New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
+        Write-EvidenceState @{Value='original'}
+        $path = Join-Path $RuntimeRoot 'state.json'
+        $reader = [IO.File]::Open($path, 'Open', 'Read', 'Read')
+        Mock Start-Sleep {}
+        try {
+            { Write-EvidenceState @{Value='new'} } | Should Throw
+            (Read-EvidenceJson $path).Value | Should Be 'original'
+            Assert-MockCalled Start-Sleep -Times 5 -Exactly -Scope It
+        } finally { $reader.Dispose() }
+        Write-EvidenceState @{Value='new'}
+        (Read-EvidenceJson $path).Value | Should Be 'new'
+    }
 }
 
 Describe 'Owned capture lifecycle with isolated fixture writes' {
@@ -513,35 +567,34 @@ Describe 'Owned capture lifecycle with isolated fixture writes' {
         $script:RuntimeRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('D'))
         New-Item -ItemType Directory -Path $RuntimeRoot | Out-Null
         $script:config = New-TestConfig
-        $script:worker = [pscustomobject]@{ InstanceGuid=[guid]::NewGuid().ToString('D'); State=0; Stopped=$false }
-        $worker | Add-Member ScriptMethod Refresh {}
-        $worker | Add-Member ScriptMethod Stop { $this.Stopped=$true; $this.State=0 }
-        $script:task = [pscustomobject]@{ State=0 }
-        $task | Add-Member ScriptMethod Run { param($Arguments) $script:worker }
-        $script:folder = [pscustomobject]@{}
-        $folder | Add-Member ScriptMethod GetTask { param($Name) $script:task }
+        $script:run = [guid]::NewGuid().ToString('D')
+        $script:worker = [pscustomobject]@{Id=123; HasExited=$true; ExitCode=0; Stopped=$false}
+        $worker | Add-Member ScriptMethod Kill { $this.Stopped=$true; $this.HasExited=$true }
+        $worker | Add-Member ScriptMethod WaitForExit { param($Milliseconds) $this.HasExited }
+        $worker | Add-Member ScriptMethod Dispose {}
         Mock Assert-EvidenceIdentity {}
-        Mock Get-EvidenceFolder { $script:folder }
-        Mock Get-EvidenceInstanceId { '00000000-0000-0000-0000-000000000001' }
+        Mock Read-EvidenceCredential { [pscredential]::new($config.Account, (ConvertTo-SecureString 'fixture' -AsPlainText -Force)) }
+        Mock Start-EvidenceProcess { $script:worker }
         Mock New-EvidenceDirectory { param($Path,$Sid,$UserWritable) New-Item -ItemType Directory -Path $Path -Force | Out-Null }
         Mock Read-EvidenceJson { param($Path) Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
         Mock Start-Capture { $true }
         Mock Stop-Capture {}
         Mock Save-EventLogs {}
         Mock Save-SmbState {}
-        Mock Wait-EvidenceInstance { param($Instance,$Seconds) if ($Seconds -gt 10) { throw 'fixture worker timeout' } }
+        Mock Wait-EvidenceProcess { throw 'fixture worker timeout' }
     }
+
     It 'never stops an unowned trace after failed start' {
         Mock Start-Capture { $false }
-        { Invoke-EvidenceBroker $config } | Should Throw
+        { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Throw
         Assert-MockCalled Stop-Capture -Times 0 -Exactly -Scope It
         $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
         $state.CaptureStatus | Should Be 'StartFailed'
         $state.TraceOwned | Should Be $false
     }
     It 'stops its own trace on a worker timeout and preserves failure' {
-        $worker.State=4
-        { Invoke-EvidenceBroker $config } | Should Throw
+        $worker.HasExited=$false
+        { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Throw
         Assert-MockCalled Stop-Capture -Times 1 -Exactly -Scope It
         $worker.Stopped | Should Be $true
         $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
@@ -553,19 +606,19 @@ Describe 'Owned capture lifecycle with isolated fixture writes' {
     }
     It 'retains failed stop ownership and blocks the next run' {
         Mock Stop-Capture { throw 'fixture stop failure' }
-        { Invoke-EvidenceBroker $config } | Should Throw
+        { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Throw
         $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
         $state.TraceOwned | Should Be $true
         $state.CaptureStatus | Should Be 'StopFailed'
-        { Invoke-EvidenceBroker $config } | Should Throw
+        { Invoke-EvidenceCoordinator $config ([guid]::NewGuid().ToString('D')) '0:0x456' } | Should Throw
         Assert-MockCalled Start-Capture -Times 1 -Exactly -Scope It
     }
     It 'accepts a correlated worker mount failure while completing the capture' {
-        Mock Wait-EvidenceInstance {
+        Mock Wait-EvidenceProcess {
             $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
             $paths = Get-EvidenceRunPaths $state.RunId
-            Write-JsonFile @{ RunId=$state.RunId; WorkerInstanceId=$state.WorkerInstanceId
-                UserSid=$config.ExpectedUserSid; Elevated=$false; LogonType='Batch'; LogonId='0:0x123'
+            Write-JsonFile @{ RunId=$state.RunId; WorkerProcessId=$state.WorkerProcessId
+                UserSid=$config.ExpectedUserSid; Elevated=$false; LogonType=2; LogonId='0:0x123'
                 Status='Completed' } (Join-Path $paths.User 'done.json')
             $now = [DateTime]::UtcNow.ToString('o')
             Write-JsonFile @{ StartUtc=$now; EndUtc=$now; UserSid=$config.ExpectedUserSid
@@ -573,7 +626,7 @@ Describe 'Owned capture lifecycle with isolated fixture writes' {
                 Share=$config.Share; ConnectionMode='UNC'; NonInteractive=$true; MountExitCode=5
             } (Join-Path $paths.User 'reproduction.json')
         }
-        { Invoke-EvidenceBroker $config } | Should Not Throw
+        { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Not Throw
         $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
         $state.Status | Should Be 'Completed'
         $state.MountExitCode | Should Be 5
@@ -582,21 +635,112 @@ Describe 'Owned capture lifecycle with isolated fixture writes' {
         Assert-MockCalled Stop-Capture -Times 1 -Exactly -Scope It
     }
     It 'rejects a completion from an earlier worker run and still stops capture' {
-        Mock Wait-EvidenceInstance {
+        Mock Wait-EvidenceProcess {
             $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
             Write-JsonFile @{ RunId='stale'; Status='Completed' } `
                 (Join-Path (Get-EvidenceRunPaths $state.RunId).User 'done.json')
         }
-        { Invoke-EvidenceBroker $config } | Should Throw
+        { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Throw
         Assert-MockCalled Stop-Capture -Times 1 -Exactly -Scope It
         Assert-MockCalled Save-EventLogs -Times 0 -Exactly -Scope It
     }
     It 'never writes privileged JSON into the user-writable folder' {
-        $broker = $runtimeAst.Find({ param($n)
-            $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-EvidenceBroker'
+        $coordinator = $runtimeAst.Find({ param($n)
+            $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-EvidenceCoordinator'
         },$true).Extent.Text
-        $broker | Should Not Match 'Write-JsonFile[^\r\n]*\$paths.User'
-        $broker | Should Not Match 'Save-DcEvidence|Show-TraceSummary|Invoke-MountAttempt'
-        $broker | Should Match 'Write-JsonFile \$context \(Join-Path \$paths.Capture'
+        $coordinator | Should Not Match 'Write-JsonFile[^\r\n]*\$paths.User'
+        $coordinator | Should Not Match 'Save-DcEvidence|Show-TraceSummary|Invoke-MountAttempt'
+        $coordinator | Should Match 'Write-JsonFile \$context \(Join-Path \$paths.Capture'
+    }
+    It 'does not overlap another coordinator or installer holding the lock' {
+        $lock = [IO.File]::Open((Join-Path $RuntimeRoot 'broker.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+        try { { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Throw }
+        finally { $lock.Dispose() }
+        Assert-MockCalled Start-Capture -Times 0 -Exactly -Scope It
+    }
+    It 'stops owned capture when credential logon fails' {
+        Mock Start-EvidenceProcess { throw 'fixture invalid password' }
+        { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Throw
+        Assert-MockCalled Stop-Capture -Times 1 -Exactly -Scope It
+        (Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json).TraceOwned | Should Be $false
+    }
+    It 'preserves a cleanup failure and blocks subsequent captures' {
+        Mock Stop-EvidenceProcess { throw 'fixture process cleanup failed' }
+        { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Throw
+        $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
+        $state.WorkerCleanupFailed | Should Be $true
+        { Invoke-EvidenceCoordinator $config ([guid]::NewGuid().ToString('D')) '0:0x456' } | Should Throw
+        Assert-MockCalled Start-Capture -Times 1 -Exactly -Scope It
+    }
+}
+
+Describe 'Original caller results and cancellation with no real process launch' {
+    BeforeEach {
+        $script:RuntimeRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('D'))
+        New-Item -ItemType Directory -Path $RuntimeRoot | Out-Null
+        $script:config = New-TestConfig
+        $script:fakeCoordinator = [pscustomobject]@{Id=456; ExitCode=0; Finished=$true; Disposed=$false}
+        $fakeCoordinator | Add-Member ScriptMethod WaitForExit { param($Milliseconds) $this.Finished }
+        $fakeCoordinator | Add-Member ScriptMethod Dispose { $this.Disposed=$true }
+        $script:mismatch = $false
+        $script:missingResult = $false
+        $script:resultStatus = 'Completed'
+        Mock Assert-EvidenceIdentity {}
+        Mock Get-EvidenceLogonId { '0:0x789' }
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Start-EvidenceProcess {
+            param($Role,$Id,$Caller)
+            $script:lastRunId = $Id
+            $paths = Get-EvidenceRunPaths $Id
+            New-Item -ItemType Directory -Path $paths.Capture,$paths.User -Force | Out-Null
+            'fixture worker result' | Set-Content (Join-Path $paths.User 'worker-output.txt')
+            if (-not $script:missingResult) {
+                Write-JsonFile @{
+                    RunId=$(if ($script:mismatch) { 'stale' } else { $Id })
+                    CoordinatorProcessId=456; CallerLogonId=$Caller; Complete=$true
+                    Status=$script:resultStatus; CaptureStatus='Stopped'; WorkerStatus='Completed'; MountExitCode=5
+                    Error='fixture failure'
+                } (Join-Path $paths.Capture 'automation-summary.json')
+            }
+            $script:fakeCoordinator
+        }
+    }
+    It 'displays the exact completed run and worker output in the original normal caller' {
+        { Invoke-EvidenceClient $config } | Should Not Throw
+        Assert-MockCalled Write-Host -Scope It -ParameterFilter { "$Object" -match 'fixture worker result' }
+        Assert-MockCalled Start-EvidenceProcess -Times 1 -Exactly -Scope It -ParameterFilter { $Role -eq 'Coordinator' }
+        $fakeCoordinator.Disposed | Should Be $true
+    }
+    It 'rejects a stale per-run summary before displaying user-controlled output' {
+        $script:mismatch = $true
+        { Invoke-EvidenceClient $config } | Should Throw 'does not match'
+        Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It -ParameterFilter { "$Object" -match 'fixture worker result' }
+    }
+    It 'fails when the coordinator exits without a result, instead of trusting an older global state' {
+        $script:missingResult = $true
+        Write-JsonFile @{RunId='old';Complete=$true;Status='Completed';TraceOwned=$false} (Join-Path $RuntimeRoot 'state.json')
+        { Invoke-EvidenceClient $config } | Should Throw 'without a result'
+    }
+    It 'propagates capture failures after displaying the collected partial evidence' {
+        $script:resultStatus = 'Failed'
+        { Invoke-EvidenceClient $config } | Should Throw 'fixture failure'
+        Assert-MockCalled Write-Host -Scope It -ParameterFilter { "$Object" -match 'fixture worker result' }
+    }
+    It 'bounds caller waiting and leaves coordinator cleanup alone on timeout' {
+        $fakeCoordinator.Finished = $false
+        { Invoke-EvidenceClient $config } | Should Throw 'Coordinator timed out'
+        $fakeCoordinator.Disposed | Should Be $true
+        # This process double intentionally has no Kill method.
+    }
+    It 'propagates cancelled UAC without claiming completion' {
+        Mock Start-EvidenceProcess { throw 'UAC consent was cancelled' }
+        { Invoke-EvidenceClient $config } | Should Throw 'UAC consent was cancelled'
+        Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It -ParameterFilter { "$Object" -match 'Capture complete' }
+    }
+    It 'blocks unresolved ownership before another UAC request' {
+        Write-JsonFile @{TraceOwned=$true} (Join-Path $RuntimeRoot 'state.json')
+        { Invoke-EvidenceClient $config } | Should Throw 'ownership is unresolved'
+        Assert-MockCalled Start-EvidenceProcess -Times 0 -Exactly -Scope It
     }
 }

@@ -28,7 +28,7 @@ function Grant-LocalAdmin {
     # This does NOT guarantee the same LUID, ticket cache or SMB connections
     # between normal and elevated windows. Manual reproduction stays in the
     # affected user's normal window; the automatic worker uses a fresh,
-    # non-elevated batch token and SYSTEM performs the capture.
+    # non-elevated credential-created token and a UAC-elevated coordinator captures.
     #
     # This grants nothing on the file share: Azure Files authorises from the
     # Kerberos PAC (domain groups), which local group membership never enters.

@@ -7,7 +7,8 @@ labuser1's credential if none was supplied. The password is an ordinary Run
 Command parameter: it can be visible in Azure/VM diagnostics or process arguments.
 Use a unique lab password, never a production credential. Do not screen-share setup.
 No password is embedded in repository source or intentionally written to the
-installer log. Windows Task Scheduler stores the fixed worker credential.
+installer log. Setup stores the fixed worker credential using machine DPAPI in
+an administrator/SYSTEM-only file. This is a disposable lab convenience, not a vault.
 
 Stages trusted repository scripts in an administrator-only, run-specific folder
 at C:\Program Files\AzureFilesLabEvidenceBootstrap-<run-id>. Keeps the scripts and
@@ -198,7 +199,7 @@ try {
         try { $stream.Write($data,0,$data.Length) } finally { $stream.Dispose() }
     }
     $config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CONFIG__')) | ConvertFrom-Json
-    $stage = 'Installing files and scheduled tasks'
+    $stage = 'Installing protected files and lab credential'
     Write-InstallLog $stage
     Invoke-StagedEvidenceInstall $config $directory
     Write-InstallLog 'Installation completed.'

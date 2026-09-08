@@ -28,52 +28,59 @@ function Resolve-EvidenceAccount([PSCredential]$Credential) {
             throw 'The supplied account belongs to Domain Admins or Enterprise Admins.'
         }
         # Local Administrators membership supports manual UAC consent in this lab.
-        # The LUA worker must still pass the runtime's effective-token check.
+        # The credential-created worker must still pass the runtime's effective-token check.
     } finally { if ($user) { $user.Dispose() }; $context.Dispose() }
     [pscustomobject]@{ Sid = $sid.Value; Account = $account }
 }
 
-function New-EvidenceTaskDefinition($Scheduler, [string]$Role, [string]$Account) {
-    $definition = $Scheduler.NewTask(0)
-    $definition.RegistrationInfo.Description = 'Fixed-target Azure Files evidence automation; fresh batch worker logon.'
-    $definition.Principal.UserId = $Account
-    $definition.Principal.LogonType = $(if ($Role -eq 'Broker') { 5 } else { 1 })
-    $definition.Principal.RunLevel = $(if ($Role -eq 'Broker') { 1 } else { 0 })
-    $definition.Settings.Enabled = $true
-    $definition.Settings.AllowDemandStart = $true
-    $definition.Settings.AllowHardTerminate = $true
-    $definition.Settings.MultipleInstances = 2 # TASK_INSTANCES_IGNORE_NEW
-    $definition.Settings.ExecutionTimeLimit = $(if ($Role -eq 'Broker') { 'PT10M' } else { 'PT3M' })
-    $definition.Settings.DisallowStartIfOnBatteries = $false
-    $definition.Settings.StopIfGoingOnBatteries = $false
-    $definition.Settings.StartWhenAvailable = $false
-    $definition.Settings.RestartCount = 0
-    $action = $definition.Actions.Create(0)
-    $action.Path = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $action.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Program Files\AzureFilesLabEvidence\Invoke-LabEvidenceAutomation.ps1" -Mode ' + $Role
-    $action.WorkingDirectory = 'C:\Program Files\AzureFilesLabEvidence'
-    $definition
-}
-
-function Get-OptionalEvidenceSchedulerItem($Container, [ValidateSet('Folder','Task')][string]$Kind, [string]$Name) {
-    try {
-        if ($Kind -eq 'Folder') { return $Container.GetFolder($Name) }
-        return $Container.GetTask($Name)
-    } catch [Runtime.InteropServices.COMException], [IO.FileNotFoundException] {
-        # COM interop can map ERROR_FILE_NOT_FOUND to FileNotFoundException.
-        if ((Get-EvidenceHResult $_.Exception) -ne -2147024894) { throw }
-        return $null
+function Assert-NoLegacyEvidenceTasks {
+    # Read-only migration guard, no Scheduler API/service dependency on new installations.
+    # Do not overwrite code that an existing task can still launch as SYSTEM.
+    foreach ($name in @('Broker','Worker')) {
+        if (Test-Path -LiteralPath ("C:\Windows\System32\Tasks\AzureFilesLabEvidence\" + $name)) {
+            throw 'Legacy evidence tasks exist. An administrator must retire only \AzureFilesLabEvidence\Broker and Worker while idle before updating; see EVIDENCE-AUTOMATION.md. No tasks were changed.'
+        }
     }
 }
 
-function Assert-EvidenceTaskSecurity($Task) {
-    $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($Task.GetSecurityDescriptor(7))
-    if ($descriptor.Owner.Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'Unsafe existing task owner.' }
-    foreach ($ace in $descriptor.DiscretionaryAcl) {
-        if ($ace.AceQualifier -eq 'AccessAllowed' -and
-            ($ace.AccessMask -band 0x500D0156) -and $ace.SecurityIdentifier.Value -notin @('S-1-5-18','S-1-5-32-544')) {
-            throw 'Unsafe existing task permissions.'
+function Save-EvidenceCredential([PSCredential]$Credential, [string]$Account) {
+    $directory = Join-Path $InstallRoot 'Credentials'
+    Assert-EvidencePath $directory
+    if (Test-Path -LiteralPath $directory) { Assert-EvidencePrivateAcl $directory }
+    else {
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+        foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                [Security.Principal.SecurityIdentifier]$sid, 'FullControl',
+                'ContainerInherit,ObjectInherit', 'None', 'Allow')))
         }
+        [IO.Directory]::CreateDirectory($directory, $acl) | Out-Null
+    }
+    Assert-EvidencePrivateAcl $directory
+    Add-Type -AssemblyName System.Security
+    $pointer = [IntPtr]::Zero; $bytes = $null
+    $path = Join-Path $directory 'credential.json'
+    $staging = Join-Path $directory ([guid]::NewGuid().ToString('N') + '.new')
+    try {
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Credential.Password)
+        $bytes = New-Object byte[] ($Credential.Password.Length * 2)
+        [Runtime.InteropServices.Marshal]::Copy($pointer, $bytes, 0, $bytes.Length)
+        $protected = [Security.Cryptography.ProtectedData]::Protect($bytes, $null,
+            [Security.Cryptography.DataProtectionScope]::LocalMachine)
+        @{ Account = $Account; Password = [Convert]::ToBase64String($protected) } |
+            ConvertTo-Json | Set-Content -LiteralPath $staging -Encoding UTF8
+        Assert-EvidencePrivateAcl $staging
+        if (Test-Path -LiteralPath $path) {
+            Assert-EvidencePrivateAcl $path
+            [IO.File]::Replace($staging, $path, [NullString]::Value)
+        } else { [IO.File]::Move($staging, $path) }
+        Assert-EvidencePrivateAcl $path
+    } finally {
+        if ($pointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($pointer) }
+        if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
+        if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Force }
     }
 }
 
@@ -85,11 +92,11 @@ function Get-EvidenceCollectorSource([string]$Directory) {
 
 function Protect-EvidenceToolsRoot([string]$Path, [string]$Sid) {
     $acl = New-EvidenceAcl $Sid
-    # Other lab users retain access to the manual collector, not the broker.
+    # Other lab users retain access to the manual collector, not the coordinator.
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
         [Security.Principal.SecurityIdentifier]'S-1-5-32-545', 'ReadAndExecute',
         'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-    [LabEvidence.SafeReader]::ProtectDirectoryOnly($Path, $acl.GetSecurityDescriptorBinaryForm())
+    [LabEvidence.Direct.SafeReader]::ProtectDirectoryOnly($Path, $acl.GetSecurityDescriptorBinaryForm())
 }
 
 function Assert-EvidenceInstallOwner([string]$Path) {
@@ -154,7 +161,7 @@ function Get-TrustedEvidenceConverter([string]$Path = 'C:\LabTools\etl2pcapng.ex
         Assert-EvidenceAcl (Split-Path $Path -Parent)
         Assert-EvidenceAcl $Path
         Initialize-EvidenceNativeReader
-        [LabEvidence.SafeReader]::AssertFile($Path)
+        [LabEvidence.Direct.SafeReader]::AssertFile($Path)
         $Path
     } catch {
         Write-Warning 'Optional ETL converter failed trust/link validation and will not be installed.'
@@ -166,7 +173,7 @@ function Publish-EvidenceDispatcher([string]$Source, [string]$Sid, [string]$Tool
     Assert-EvidenceAcl $Source
     Initialize-EvidenceNativeReader
     # This also rejects existing hard links without opening any file for writing.
-    $content = [LabEvidence.SafeReader]::Read($Source, 2097152)
+    $content = [LabEvidence.Direct.SafeReader]::Read($Source, 2097152)
     Assert-EvidencePath $ToolsRoot
     Assert-EvidenceAcl (Split-Path $ToolsRoot -Parent) -ParentDirectory
     if (-not (Test-Path -LiteralPath $ToolsRoot)) { New-EvidenceDirectory $ToolsRoot $Sid }
@@ -178,14 +185,14 @@ function Publish-EvidenceDispatcher([string]$Source, [string]$Sid, [string]$Tool
     Assert-EvidencePath $destination
     if (Test-Path -LiteralPath $destination) {
         Assert-EvidenceInstallOwner $destination
-        [LabEvidence.SafeReader]::AssertFile($destination)
+        [LabEvidence.Direct.SafeReader]::AssertFile($destination)
     }
     Protect-EvidenceToolsRoot $ToolsRoot $Sid
     Assert-EvidenceAcl $ToolsRoot
     Assert-EvidencePath $destination
     if (Test-Path -LiteralPath $destination) {
         Assert-EvidenceInstallOwner $destination
-        [LabEvidence.SafeReader]::AssertFile($destination)
+        [LabEvidence.Direct.SafeReader]::AssertFile($destination)
     }
     if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }
     [IO.File]::WriteAllText($destination, $content, (New-Object Text.UTF8Encoding($true)))
@@ -203,9 +210,11 @@ function Publish-EvidenceDispatcher([string]$Source, [string]$Sid, [string]$Tool
 }
 
 function Install-EvidenceAutomation {
-    $step = 'validate-sources'
+    $step = 'legacy-migration-check'
     try {
     Write-Host "[evidence-install] step=$step"
+    Assert-NoLegacyEvidenceTasks
+    $step = 'validate-sources'
     $runtimeSource = Join-Path $SourceDirectory 'Invoke-LabEvidenceAutomation.ps1'
     $collectorSource = Get-EvidenceCollectorSource $SourceDirectory
     # Bootstrap validation must precede executing the runtime's validation helpers.
@@ -238,25 +247,8 @@ function Install-EvidenceAutomation {
     $step = 'validate-lab-account'; Write-Host "[evidence-install] step=$step"
     $account = Resolve-EvidenceAccount $LabCredential
     $config = [ordered]@{ StorageAccount = $StorageAccount; Share = $Share; DomainController = $DomainController
-        ExpectedUserSid = $account.Sid; Account = $account.Account
-        TaskFolder = '\AzureFilesLabEvidence'; BrokerTask = 'Broker'; WorkerTask = 'Worker' }
+        ExpectedUserSid = $account.Sid; Account = $account.Account; Version = 2 }
     Assert-EvidenceConfig $config
-    $step = 'inspect-scheduled-tasks'; Write-Host "[evidence-install] step=$step"
-    $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
-    $baseSddl = 'O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)'
-    $brokerSddl = $baseSddl + "(A;;GRGX;;;$($account.Sid))"
-    $workerSddl = $baseSddl + "(A;;GR;;;$($account.Sid))"
-    $folder = Get-OptionalEvidenceSchedulerItem $scheduler 'Folder' $config.TaskFolder
-    if ($folder) {
-        Assert-EvidenceTaskSecurity $folder
-        foreach ($name in @('Broker','Worker')) {
-            $task = Get-OptionalEvidenceSchedulerItem $folder 'Task' $name
-            if ($task) {
-                Assert-EvidenceTaskSecurity $task
-                if ($task.State -in @(2,4)) { throw 'Cannot update automation while a task is running.' }
-            }
-        }
-    }
     $step = 'secure-install-roots'; Write-Host "[evidence-install] step=$step"
     foreach ($root in @($InstallRoot, $RuntimeRoot)) {
         Assert-EvidencePath $root
@@ -277,8 +269,11 @@ function Install-EvidenceAutomation {
     $installLock = [IO.File]::Open((Join-Path $RuntimeRoot 'broker.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     try {
     $step = 'install-protected-files'; Write-Host "[evidence-install] step=$step"
-    if ((Test-Path -LiteralPath $statePath) -and (Read-EvidenceJson $statePath).TraceOwned) {
-        throw 'Unresolved capture ownership must be recovered before reinstalling.'
+    if (Test-Path -LiteralPath $statePath) {
+        $previous = Read-EvidenceJson $statePath
+        if ($previous.TraceOwned -or $previous.WorkerCleanupFailed) {
+            throw 'Unresolved capture/worker ownership must be recovered before reinstalling.'
+        }
     }
     $runs = Join-Path $RuntimeRoot 'Runs'
     if (Test-Path -LiteralPath $runs) { Assert-EvidenceAcl $runs }
@@ -300,19 +295,8 @@ function Install-EvidenceAutomation {
     $configPath = Join-Path $InstallRoot 'config.json'
     if (Test-Path -LiteralPath $configPath) { Assert-EvidenceAcl $configPath; Remove-Item -LiteralPath $configPath -Force }
     $config | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
-    $step = 'register-task-folder'; Write-Host "[evidence-install] step=$step"
-    if (-not $folder) { $folder = $scheduler.GetFolder('\').CreateFolder($config.TaskFolder, $brokerSddl) }
-    $folder.SetSecurityDescriptor($brokerSddl, 0)
-    $broker = New-EvidenceTaskDefinition $scheduler 'Broker' 'SYSTEM'
-    $worker = New-EvidenceTaskDefinition $scheduler 'Worker' $LabCredential.UserName
-    # 0x10 prevents Scheduler from adding an execute ACE for the worker principal.
-    $step = 'register-worker'; Write-Host "[evidence-install] step=$step"
-    $workerTask = $folder.RegisterTaskDefinition('Worker', $worker, 6 -bor 0x10,
-        $LabCredential.UserName, $LabCredential.GetNetworkCredential().Password, 1, $workerSddl)
-    $workerTask.SetSecurityDescriptor($workerSddl, 0x10)
-    $step = 'register-broker'; Write-Host "[evidence-install] step=$step"
-    $brokerTask = $folder.RegisterTaskDefinition('Broker', $broker, 6 -bor 0x10, 'SYSTEM', $null, 5, $brokerSddl)
-    $brokerTask.SetSecurityDescriptor($brokerSddl, 0x10)
+    $step = 'store-lab-credential'; Write-Host "[evidence-install] step=$step"
+    Save-EvidenceCredential $LabCredential $account.Account
     $step = 'publish-dispatcher'; Write-Host "[evidence-install] step=$step"
     Publish-EvidenceDispatcher (Join-Path $InstallRoot 'Get-KerberosEvidence.ps1') $account.Sid
     Write-Output 'AUTO_EVIDENCE_READY'

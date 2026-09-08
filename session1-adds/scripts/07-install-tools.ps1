@@ -257,9 +257,10 @@ $helper = @'
 
   AUTOMATIC LAB CAPTURE (after Install-LabEvidenceAutomation)
       NORMAL labuser1 window: Get-KerberosEvidence.ps1 -StartTrace
-      Captures once, reproduces in a fresh non-elevated batch logon using UNC
+      Captures once, reproduces in a fresh non-elevated credential logon using UNC
       (no drive letter), stops, and returns results to this window.
-      Task Scheduler holds the lab credential; this helper never reads it.
+      Approve one UAC consent. The elevated coordinator reads the protected
+      stored lab credential; Start-Process -Credential is NOT elevation.
 
   MANUAL CAPTURE / EXISTING USER SESSION
   ------------------
@@ -1019,7 +1020,7 @@ klist > klist-after.txt
     Remove-SmbMapping -LocalPath "${DriveLetter}:" -Force -ErrorAction SilentlyContinue
     } else {
         Show-Cmd "klist purge`nklist`nnet use \\$fqdn\$Share /persistent:no`nklist"
-        Write-Host 'UNC-only probe: no drive letter or existing-session reset. Automatic runs use a fresh batch logon.' -ForegroundColor Cyan
+        Write-Host 'UNC-only probe: no drive letter or existing-session reset. Automatic runs use a fresh credential-created logon.' -ForegroundColor Cyan
     }
     klist purge | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'klist purge failed; the intended fresh-ticket reproduction could not be prepared.' }

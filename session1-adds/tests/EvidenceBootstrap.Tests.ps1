@@ -213,11 +213,11 @@ Write-Output 'AUTO_EVIDENCE_READY'
         @'
 param($StorageAccount,$Share,$DomainController,$LabCredential,$SourceDirectory)
 Write-Output 'Before registration'
-throw 'Scheduler registration failed: access denied'
+throw 'Credential storage failed: access denied'
 '@ | Set-Content $installer
         try { Invoke-StagedEvidenceInstall (New-TestEvidenceConfig) $stage; throw 'Expected a failure' }
         catch {
-            $_.Exception.Message | Should Match 'Scheduler registration failed'
+            $_.Exception.Message | Should Match 'Credential storage failed'
             $_.InvocationInfo.ScriptName | Should Be $installer
             $_.InvocationInfo.ScriptLineNumber | Should Be 3
         }
