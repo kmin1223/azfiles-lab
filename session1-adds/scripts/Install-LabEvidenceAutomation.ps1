@@ -55,6 +55,17 @@ function New-EvidenceTaskDefinition($Scheduler, [string]$Role, [string]$Account)
     $definition
 }
 
+function Get-OptionalEvidenceSchedulerItem($Container, [ValidateSet('Folder','Task')][string]$Kind, [string]$Name) {
+    try {
+        if ($Kind -eq 'Folder') { return $Container.GetFolder($Name) }
+        return $Container.GetTask($Name)
+    } catch [Runtime.InteropServices.COMException], [IO.FileNotFoundException] {
+        # COM interop can map ERROR_FILE_NOT_FOUND to FileNotFoundException.
+        if ((Get-EvidenceHResult $_.Exception) -ne -2147024894) { throw }
+        return $null
+    }
+}
+
 function Assert-EvidenceTaskSecurity($Task) {
     $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($Task.GetSecurityDescriptor(7))
     if ($descriptor.Owner.Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'Unsafe existing task owner.' }
@@ -235,20 +246,14 @@ function Install-EvidenceAutomation {
     $baseSddl = 'O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)'
     $brokerSddl = $baseSddl + "(A;;GRGX;;;$($account.Sid))"
     $workerSddl = $baseSddl + "(A;;GR;;;$($account.Sid))"
-    $folder = $null
-    try { $folder = $scheduler.GetFolder($config.TaskFolder) }
-    catch [Runtime.InteropServices.COMException] {
-        if ((Get-EvidenceHResult $_.Exception) -ne -2147024894) { throw }
-    }
+    $folder = Get-OptionalEvidenceSchedulerItem $scheduler 'Folder' $config.TaskFolder
     if ($folder) {
         Assert-EvidenceTaskSecurity $folder
         foreach ($name in @('Broker','Worker')) {
-            try {
-                $task = $folder.GetTask($name)
+            $task = Get-OptionalEvidenceSchedulerItem $folder 'Task' $name
+            if ($task) {
                 Assert-EvidenceTaskSecurity $task
                 if ($task.State -in @(2,4)) { throw 'Cannot update automation while a task is running.' }
-            } catch [Runtime.InteropServices.COMException] {
-                if ((Get-EvidenceHResult $_.Exception) -ne -2147024894) { throw }
             }
         }
     }

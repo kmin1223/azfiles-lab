@@ -33,6 +33,14 @@ update command with the new credential.
 
 ### Installation failures
 
+An `inspect-scheduled-tasks` failure with `FileNotFoundException` and
+`0x80070002` can mean that the automation task folder has not been created yet,
+not that the VM needs rebuilding. Older installers handled only `COMException`
+for this condition. The installer now handles both mappings for folder/task
+lookups and continues with creation when the item is absent. Access denied and
+other errors are not treated as missing items. Update the scripts and rerun
+the update command; a fresh deployment with the old installer can fail too.
+
 The update uses **one VM Run Command**. It does not need an RSA certificate or
 a separate password-encryption exchange. Do not redeploy the resource group
 just because this post-deployment step failed.

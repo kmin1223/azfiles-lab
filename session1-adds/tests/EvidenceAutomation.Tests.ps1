@@ -133,6 +133,76 @@ Describe 'Local administrator membership versus effective token privileges' {
     }
 }
 
+Describe 'Optional Scheduler lookups during initial and partial installation' {
+    BeforeAll {
+        if (-not ('LabEvidenceTests.SchedulerLookup' -as [type])) {
+            Add-Type -TypeDefinition @'
+namespace LabEvidenceTests {
+ public class SchedulerLookup {
+  public System.Exception Failure;
+  public object Result;
+  public object GetFolder(string name) { if(Failure != null) throw Failure; return Result; }
+  public object GetTask(string name) { if(Failure != null) throw Failure; return Result; }
+ }
+}
+'@
+        }
+    }
+    BeforeEach { $script:container = New-Object LabEvidenceTests.SchedulerLookup }
+    It 'accepts missing folders and tasks mapped to FileNotFoundException' {
+        $container.Failure = New-Object IO.FileNotFoundException('fixture missing')
+        foreach ($kind in @('Folder','Task')) {
+            $result = Get-OptionalEvidenceSchedulerItem $container $kind 'missing'
+            ($null -eq $result) | Should Be $true
+        }
+    }
+    It 'also accepts the original COMException mapping for exactly 0x80070002' {
+        $container.Failure = New-Object Runtime.InteropServices.COMException('fixture missing', -2147024894)
+        foreach ($kind in @('Folder','Task')) {
+            $result = Get-OptionalEvidenceSchedulerItem $container $kind 'missing'
+            ($null -eq $result) | Should Be $true
+        }
+    }
+    It 'propagates access denied and other failures rather than treating them as absent' {
+        foreach ($failure in @(
+            (New-Object Runtime.InteropServices.COMException('fixture denied', -2147024891)),
+            (New-Object UnauthorizedAccessException('fixture denied')),
+            (New-Object IO.DirectoryNotFoundException('fixture unexpected path')),
+            (New-Object InvalidOperationException('fixture service failure')))) {
+            $container.Failure = $failure
+            foreach ($kind in @('Folder','Task')) {
+                { Get-OptionalEvidenceSchedulerItem $container $kind 'target' } | Should Throw $failure.Message
+            }
+        }
+    }
+    It 'returns existing items unchanged for the normal security and state checks' {
+        $container.Result = [pscustomobject]@{Name='existing';State=4}
+        foreach ($kind in @('Folder','Task')) {
+            $result = Get-OptionalEvidenceSchedulerItem $container $kind 'existing'
+            $result.Name | Should Be 'existing'
+            $result.State | Should Be 4
+        }
+        $installerAst.Extent.Text | Should Match 'Assert-EvidenceTaskSecurity \$folder'
+        $installerAst.Extent.Text | Should Match 'Assert-EvidenceTaskSecurity \$task'
+        $installerAst.Extent.Text | Should Match 'Cannot update automation while a task is running'
+    }
+    It 'handles native Scheduler not-found results using read-only calls' {
+        $scheduler = $null; $folder = $null
+        try {
+            $scheduler = New-Object -ComObject 'Schedule.Service'
+            $scheduler.Connect()
+            $folder = Get-OptionalEvidenceSchedulerItem $scheduler 'Folder' '\'
+            ($null -eq $folder) | Should Be $false
+            $name = 'AzureFilesLabEvidence-Probe-' + [guid]::NewGuid().ToString('N')
+            ($null -eq (Get-OptionalEvidenceSchedulerItem $scheduler 'Folder' ('\' + $name))) | Should Be $true
+            ($null -eq (Get-OptionalEvidenceSchedulerItem $folder 'Task' $name)) | Should Be $true
+        } finally {
+            if ($folder) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($folder) }
+            if ($scheduler) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($scheduler) }
+        }
+    }
+}
+
 Describe 'Task definitions without live Scheduler mutations' {
     BeforeEach {
         $script:action = [pscustomobject]@{ Path=''; Arguments=''; WorkingDirectory='' }
