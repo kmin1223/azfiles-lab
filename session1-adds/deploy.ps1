@@ -174,8 +174,8 @@ if (-not $AdminPassword) {
         throw 'For this lab, avoid spaces, quotes, backticks, $, % and ! in the password.'
     }
 }
-# Shown in the console + lab-info only when we invented it; a user-supplied
-# password is theirs and stays out of the files.
+# lab-info includes only generated passwords. The private lab-command sheet
+# below includes either generated or supplied passwords for VM sign-in.
 $pwLine = if ($pwGenerated) { " Password        : $plainPw  (all lab accounts: $AdminUsername, labuser1, labuser2)`n" } else { '' }
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -585,9 +585,11 @@ Write-Host "Saved to: $infoFile" -ForegroundColor Yellow
 $cmdFile = Join-Path $LogPath "lab-commands-$stamp.txt"
 try {
     & (Join-Path $scriptRoot 'Get-LabCommands.ps1') -ResourceGroupName $ResourceGroupName `
-        -Prefix $Prefix -DomainController "$dcName.$DomainName" -OutFile $cmdFile | Out-Null
+        -Prefix $Prefix -DomainController "$dcName.$DomainName" `
+        -AdminUsername $AdminUsername -AdminPassword $AdminPassword -OutFile $cmdFile | Out-Null
     Write-Host ''
     Write-Host " Lab commands (real account name filled in): $cmdFile" -ForegroundColor Cyan
+    Write-Host '   PRIVATE: includes the VM password in plaintext; do not screen-share or commit.' -ForegroundColor Yellow
     Write-Host "   view:  Get-Content $cmdFile" -ForegroundColor White
     Write-Host "   again: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor White
 } catch {

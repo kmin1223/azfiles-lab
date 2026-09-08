@@ -12,6 +12,11 @@
 
       ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab
 
+  Deployment includes the VM password in this sheet, including a supplied
+  -AdminPassword. Keep the file private and off the shared presentation screen.
+  Standalone runs cannot retrieve an existing VM password from Azure; supply
+  -AdminPassword to include it, otherwise the sheet says it was not supplied.
+
   Windows referenced below:
       [A] Azure Cloud Shell        deploy, faults, the migration lab
       [B] Client VM  (RDP)         klist / net use / evidence   <- most of it
@@ -20,6 +25,7 @@
 .EXAMPLE
   ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab
   ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab -OutFile ~/lab-commands.txt
+  ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab -AdminPassword (Read-Host 'Lab password' -AsSecureString) -OutFile ~/lab-commands.txt
 #>
 [CmdletBinding()]
 param(
@@ -27,6 +33,8 @@ param(
     [string]$Prefix = 'azflab',
     [string]$Share  = 'labshare',
     [string]$DomainController,
+    [string]$AdminUsername = 'labadmin',
+    [SecureString]$AdminPassword,
     [string]$OutFile
 )
 $ErrorActionPreference = 'Stop'
@@ -66,6 +74,17 @@ foreach ($p in Get-AzPublicIpAddress -ResourceGroupName $ResourceGroupName -Erro
 $dcIp  = if ($ips.DC)  { $ips.DC }  else { '<dc-ip>' }
 $cliIp = if ($ips.Cli) { $ips.Cli } else { '<client-ip>' }
 
+$passwordText = if ($AdminPassword) {
+    [System.Net.NetworkCredential]::new('', $AdminPassword).Password
+} else {
+    'Not supplied. Rerun with -AdminPassword to include the lab password.'
+}
+$passwordNotice = if ($AdminPassword) {
+    'PRIVATE LAB FILE: contains a plaintext password. Do not screen-share or commit.'
+} else {
+    'Azure does not return existing VM passwords.'
+}
+
 $text = @"
 ================================================================================
  LAB COMMANDS - $saName
@@ -74,7 +93,11 @@ $text = @"
 
  [A] Cloud Shell     you are already signed in; no Connect-AzAccount
  [B] Client VM       mstsc /v:$cliIp     sign in as $nb\labuser1
- [C] DC VM           mstsc /v:$dcIp     $nb\labadmin only; optional follow-up
+ [C] DC VM           mstsc /v:$dcIp     $nb\$AdminUsername only; optional follow-up
+
+ VM accounts: $nb\$AdminUsername, $nb\labuser1, $nb\labuser2
+ VM password: $passwordText
+ $passwordNotice
 
  Share: $unc
 
