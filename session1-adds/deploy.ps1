@@ -65,7 +65,7 @@ $scriptRoot = $PSScriptRoot
 # instead of leaving it to Lab 2.
 $legacyMode = [bool]$Legacy
 if ($Modern) {
-    Write-Host "-Modern is now the default and is ignored. Use -Legacy for the RC4 state." -ForegroundColor DarkGray
+    Write-Host "-Modern is now the default and is ignored. Use -Legacy for the RC4 state." -ForegroundColor White
 }
 
 # Stamped so the transcript shows where the time actually went - useful both for
@@ -79,7 +79,7 @@ function Step([string]$msg) {
 # of how you'd do this by hand. Secret VALUES are never shown - remote-script
 # parameters appear as names only.
 function Show-Cmd([string]$Command) {
-    $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  PS> $_" -ForegroundColor DarkCyan }
+    $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  PS> $_" -ForegroundColor Cyan }
 }
 
 # What actually runs inside each Run Command payload - the one-line essence.
@@ -98,7 +98,7 @@ function Show-VmCmd([string]$VmName, [string]$ScriptFile, [hashtable]$Params) {
     $paramNote = if ($Params -and $Params.Count) { " -Parameter @{ $($Params.Keys -join '; ') }" } else { '' }
     Show-Cmd "Invoke-AzVMRunCommand -VMName $VmName -ScriptPath scripts\$ScriptFile$paramNote"
     if ($scriptCore[$ScriptFile]) {
-        Write-Host "      inside: $($scriptCore[$ScriptFile])" -ForegroundColor DarkGray
+        Write-Host "      inside: $($scriptCore[$ScriptFile])" -ForegroundColor White
     }
 }
 
@@ -195,7 +195,7 @@ New-AzResourceGroup -Name $ResourceGroupName -Location $Location
 New-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName ``
     -TemplateFile template\azuredeploy.json -prefix $Prefix
 "@
-Write-Host '      inside: VNet(DNS->DC) + NSG + 2 VMs (static 10.100.0.4/.5) + storage account + share' -ForegroundColor DarkGray
+Write-Host '      inside: VNet(DNS->DC) + NSG + 2 VMs (static 10.100.0.4/.5) + storage account + share' -ForegroundColor White
 New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Force | Out-Null
 $dep = New-AzResourceGroupDeployment `
     -ResourceGroupName $ResourceGroupName `
@@ -305,7 +305,7 @@ function Invoke-VmScript {
 function Start-VmScriptJob {
     param([string]$VmName, [string]$ScriptFile, [hashtable]$Params = @{}, [int]$Retries = 4)
     Show-VmCmd -VmName $VmName -ScriptFile $ScriptFile -Params $Params
-    Write-Host '      (as a background job)' -ForegroundColor DarkGray
+    Write-Host '      (as a background job)' -ForegroundColor White
     Start-Job -Name "job-$VmName-$ScriptFile" -ScriptBlock {
         param($rg, $vmName, $path, $p, $retries)
         Import-Module Az.Compute -ErrorAction SilentlyContinue
@@ -584,11 +584,11 @@ try {
         -Prefix $Prefix -DomainController "$dcName.$DomainName" -OutFile $cmdFile | Out-Null
     Write-Host ''
     Write-Host " Lab commands (real account name filled in): $cmdFile" -ForegroundColor Cyan
-    Write-Host "   view:  Get-Content $cmdFile" -ForegroundColor DarkGray
-    Write-Host "   again: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor DarkGray
+    Write-Host "   view:  Get-Content $cmdFile" -ForegroundColor White
+    Write-Host "   again: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor White
 } catch {
     Write-Warning "Could not generate the lab-command sheet: $($_.Exception.Message)"
-    Write-Host "  Run it yourself: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor DarkGray
+    Write-Host "  Run it yourself: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor White
 }
 
 # --------------- POST-DEPLOY: diagnostic tooling (off the critical path)
