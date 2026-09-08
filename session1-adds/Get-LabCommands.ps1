@@ -12,10 +12,9 @@
 
       ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab
 
-  Deployment includes the VM password in this sheet, including a supplied
-  -AdminPassword. Keep the file private and off the shared presentation screen.
-  Standalone runs cannot retrieve an existing VM password from Azure; supply
-  -AdminPassword to include it, otherwise the sheet says it was not supplied.
+  Deployment includes the VM password in this private sheet. Do not screen-share
+  or commit it. Standalone runs need -AdminPassword to include the password;
+  Azure cannot retrieve the existing password.
 
   Windows referenced below:
       [A] Azure Cloud Shell        deploy, faults, the migration lab
@@ -25,7 +24,6 @@
 .EXAMPLE
   ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab
   ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab -OutFile ~/lab-commands.txt
-  ./Get-LabCommands.ps1 -ResourceGroupName azfiles-lab -AdminPassword (Read-Host 'Lab password' -AsSecureString) -OutFile ~/lab-commands.txt
 #>
 [CmdletBinding()]
 param(
@@ -55,14 +53,9 @@ $realm  = if ($ad -and $ad.DomainName) { $ad.DomainName.ToUpper() } else { 'CONT
 $source = $sa.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
 # Legacy storage metadata can hold a NetBIOS name instead of a DNS root.
 # deploy.ps1 supplies the authoritative forest DNS name; standalone runs only
-# Prefer ForestName because Legacy DomainName can be NetBIOS-only.
-$forestDns = if ($ad -and $ad.ForestName -match '^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$') {
-    $ad.ForestName
-} elseif ($ad -and $ad.DomainName -match '^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$') {
-    $ad.DomainName
-}
-if (-not $DomainController -and $forestDns) {
-    $DomainController = "$Prefix-dc.$forestDns"
+# infer a target when the stored domain is a dotted DNS name.
+if (-not $DomainController -and $ad -and $ad.DomainName -match '^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$') {
+    $DomainController = "$Prefix-dc.$($ad.DomainName)"
 }
 $dcArgument = if ($DomainController) { " -DomainController '$($DomainController.Replace("'", "''"))'" } else { '' }
 
@@ -114,32 +107,22 @@ $text = @"
 
     Expect: Server = cifs/$fqdn, encryption type AES-256.
 
-[B] optional automatic evidence - ONE command in the NORMAL labuser1 window
-    # Requires AUTO_EVIDENCE_READY from deployment/upgrade.
-    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-    # Approve ONE UAC consent for the elevated capture coordinator.
-    # Stored credentials create a fresh non-elevated labuser1 interactive (2) logon.
-    # No Z: mapping, logout, password prompt or separate StopTrace is needed.
-    # Read the printed run folder: user\ holds mount/tickets/DC evidence;
-    # capture\ holds the trace and collector-side events/state.
-    # This tests fresh authentication, NOT the existing RDP/app logon session.
-
-[B] manual capture of the EXISTING affected session (real-case alternative)
+[B] baseline evidence - two windows, three steps in this order
     # 1. ELEVATED PowerShell (UAC -> Yes)
-    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace -Manual$dcArgument
+    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace$dcArgument
     # 2. NORMAL PowerShell - the mount must happen in YOUR session
     C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $saName -Share $Share
     # 3. back in the ELEVATED window
     C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace
 
-[B] the KDC's own record is collected remotely (automatic worker / manual StopTrace)
-    Open user\dc-summary.txt (automatic) or dc-summary.txt (manual), then inspect the time-bounded
+[B] the KDC's own record is collected remotely at StopTrace
+    Open dc-summary.txt in the capture folder, then inspect the time-bounded
     DC Security exports (4768/4769/4771, XML/JSON/CSV) for the reproduced request.
     No separate DC sign-in is needed. Without a reliable DNS target above,
     the collector uses its installed DC configuration/domain discovery.
     Missing/denied/empty DC evidence is not proof that the KDC is healthy.
     Sign out/in after new group membership; use -DcCredential if needed
-    (manual DC credentials are not stored; the automatic worker uses the stored lab credential).
+    (the collector does not store credentials).
     Retry only DC collection for an existing capture:
     C:\LabTools\Get-KerberosEvidence.ps1 -CollectDc -Path '<capture-folder>'$dcArgument
 
@@ -155,18 +138,29 @@ $text = @"
 [A] step 0 - plant the 2023 defect (~3 min; start it during the RC4 slides)
     ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Legacy
 
-    Review completion and the machine-account probe. The automatic evidence
-    command below independently tests a fresh labuser1 logon under Legacy.
-[B] C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
+    Read the output: it mounts fine on RC4. That is the point.
 
 [A] step 1 - comply with the 2026 mandate
     ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Enforce
 
-[B] steps 2-3 - fresh-session reproduction AND collection, in the NORMAL window
-    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-    Expected planted-fault symptom: 1396; inspect the actual response/token.
-    Read user\reproduction.json and user\klist-after.txt in the printed folder.
-    Your original window's klist is NOT the worker's ticket cache.
+[B] step 2 - retest. DROP THE SMB SESSION FIRST, or nothing is proven
+    net use * /delete /y
+    net use $unc /delete /y
+    net use Z: /delete /y
+    klist purge
+    #   ELEVATED window - Get-SmbConnection needs it:
+    Get-SmbConnection | Where-Object ServerName -like '*file.core.windows.net'
+    #   back in the normal window:
+    net use Z: $unc
+
+    Expect: System error 1396.
+    Mount succeeds but klist is empty? You reused the old session - sign out/in.
+
+[B] step 3 - collect evidence, then read it
+    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace$dcArgument          # elevated
+    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $saName -Share $Share
+    C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace           # elevated
+    klist
 
 [B]     Read dc-summary.txt and correlate the DC exports with this request.
         A matching 4769 success proves issuance, not that every KDC/key path is healthy.
@@ -177,21 +171,19 @@ $text = @"
 [A] step 4 - repair. The ORDER is the lesson
     ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Repair
 
-[B]     C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-        Check fresh AES-256 issuance and Session Setup/share-connection success.
-        File write/read is a separate verification, not implied by net use.
+[B]     net use * /delete /y ; klist purge ; net use Z: $unc ; klist
+        -> AES-256-CTS-HMAC-SHA1-96
 
 
 --------------------------------------------------------------------------------
- LAB 3 - ticket issued, session denied
+ LAB 3 - a perfect ticket, and Access Denied
 --------------------------------------------------------------------------------
 [A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault CipherMismatch
-[B] C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-    # Read the worker's klist-after.txt, not this window's cache.
+[B] net use * /delete /y ; klist purge ; net use Z: $unc
+[B] klist                                    # the cifs ticket IS there
     Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers
     # storage side: portal -> storage account -> File shares -> Security
 [A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault CipherMismatch -Repair
-[B] C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
 
 
 --------------------------------------------------------------------------------
@@ -202,28 +194,22 @@ $text = @"
     ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault Block445 -Repair
     ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault NoShareAccess
     ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault NoShareAccess -Repair
-[B] After EACH fault and EACH repair:
-    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-    Test-NetConnection $fqdn -Port 445
+[B] Test-NetConnection $fqdn -Port 445
 
 [A] 5  the other 1396 - key drift
     ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault PasswordMismatch
-[B] C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace    # inspect actual 1396 / inner KRB error
+[B] klist purge ; net use Z: $unc                      # -> 1396
 [B] Connect-AzAccount                                  # this one runs IN the VM
     Debug-AzStorageAccountAuth -StorageAccountName $saName -ResourceGroupName $ResourceGroupName -Verbose
     #   CheckADObjectPasswordIsCorrect fails
 [A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault PasswordMismatch -Repair
-[B] C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
 
 [A] 6  broken SPN
     ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault SpnBroken
-[B] C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-    # Separate optional klist-get probe in this window (not the captured net use):
-    klist purge ; klist get cifs/$fqdn                 # expected klist failure, not net use's code
+[B] klist purge ; klist get cifs/$fqdn                 # -> 0xc000018b
 [C] setspn -L $saName
     setspn -F -Q cifs/$fqdn
 [A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault SpnBroken -Repair
-[B] C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
 
 
 --------------------------------------------------------------------------------
@@ -233,17 +219,10 @@ $text = @"
     klist purge                             # tickets only - NOT the SMB session
     klist get cifs/$fqdn                     # force one ticket, no mount
     Get-SmbConnection | ? ServerName -like '*file.core.windows.net'   # elevated
-    C:\LabTools\Get-KerberosEvidence.ps1 -Analyze -Path '<printed-run-folder>\capture'
+    C:\LabTools\Get-KerberosEvidence.ps1 -Analyze     # re-read the last capture
 
-    Automatic retest: -StartTrace opens a fresh worker logon; no mapping reset.
-    Manual retest: mapping deletion and purge alone do not prove SMB session teardown.
-    Preserve manual mode for actual application/RDP-session issues, user GPO,
-    and faults affecting Windows logon itself (such as client clock skew).
-
-[A] Existing VM / interrupted deployment: install or update automatic evidence
-    ./Update-LabEvidenceAutomation.ps1 -ResourceGroupName $ResourceGroupName -Prefix $Prefix -StorageAccount $saName -Share $Share$dcArgument
-    # One-time labuser1 password prompt at setup; ONE UAC consent, no password prompts per capture.
-    # Dedicated disposable password only; protected local credential storage is not a vault.
+    Retest reset, in this order:
+    net use $unc /delete /y ; net use Z: /delete /y ; klist purge
 
 [A] teardown
     Remove-AzResourceGroup -Name $ResourceGroupName -Force

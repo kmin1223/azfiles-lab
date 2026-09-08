@@ -14,7 +14,6 @@
     7. Final kerb key rotation + AD password sync (1396 guard) + NTFS ACLs
        (one Run Command - each round-trip costs ~60s fixed overhead)
     9. Verify the client actually mounts the share
-   10. Install one-command evidence scripts (UAC capture + fresh labuser1 logon)
 
   Timing design:
     * the client's domain join and reboot run in the background while the
@@ -175,7 +174,7 @@ if (-not $AdminPassword) {
     }
 }
 # lab-info includes only generated passwords. The private lab-command sheet
-# below includes either generated or supplied passwords for VM sign-in.
+# includes either generated or supplied passwords for VM sign-in.
 $pwLine = if ($pwGenerated) { " Password        : $plainPw  (all lab accounts: $AdminUsername, labuser1, labuser2)`n" } else { '' }
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -563,10 +562,6 @@ $pwLine Transcript      : $logFile
 
  Diagnostics are installed after this summary on the CLIENT VM (Az + AzFilesHybrid).
  The DC has no Azure tooling; its read-only Security evidence access is prepared.
- After AUTO_EVIDENCE_READY, normal labuser1 can capture/reproduce/stop with:
-   C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
- Approve one UAC consent; stored credentials create a fresh non-elevated interactive (2)
- logon and UNC connection, not the RDP session. No per-capture password prompt.
  Run these diagnostic commands on the CLIENT VM only, after tools installation:
    Connect-AzAccount
    Debug-AzStorageAccountAuth -StorageAccountName $saName ``
@@ -602,12 +597,13 @@ try {
 # This step burned two deployments by sitting in the middle of the run: the
 # PowerShell Gallery fallback can take 20-30+ minutes on a B-series VM, and a
 # Run Command can neither be cancelled nor share the VM with another one.
-# It runs after environment verification and saving the summary. The following
-# automation setup stages its own collector; the converter is optional.
-# AzFilesHybrid is only needed for Debug-AzStorageAccountAuth.
+# So it now runs LAST, after the environment is complete and verified and the
+# summary above is already on disk. Nothing later depends on it: the fault labs
+# use klist/net use/setspn, and AzFilesHybrid is only needed once attendees
+# reach the Debug-AzStorageAccountAuth part - a good half hour into the session.
 Step 'Post-deploy: installing diagnostics on the client (bundle path, ~2-4 min)'
-Write-Host '  The lab environment is READY; diagnostic tooling and automatic evidence setup follow.' -ForegroundColor Yellow
-Write-Host '  If interrupted before automatic evidence setup, finish with Update-LabEvidenceAutomation.ps1 later.' -ForegroundColor Yellow
+Write-Host '  The lab environment is READY - this last step is optional tooling.' -ForegroundColor Yellow
+Write-Host '  Safe to Ctrl+C: once issued, the VM finishes the install on its own.' -ForegroundColor Yellow
 $toolParams = @{ DomainController = "$dcName.$DomainName" }
 if ($ModuleBundleUri) { $toolParams['ModuleBundleUri'] = $ModuleBundleUri }
 try {
@@ -626,18 +622,4 @@ try {
     Write-Warning '  The lab itself is unaffected. Rerun scripts\07-install-tools.ps1 on the client later.'
 }
 
-Step 'Post-deploy: configuring automatic evidence for labuser1'
-try {
-    $evidenceCredential = [PSCredential]::new("$($ad.NetBiosDomainName)\labuser1", $AdminPassword)
-    & (Join-Path $scriptRoot 'Update-LabEvidenceAutomation.ps1') `
-        -ResourceGroupName $ResourceGroupName -VMName $cliName -StorageAccount $saName `
-        -DomainController "$dcName.$DomainName" -LabCredential $evidenceCredential
-    Write-Host '  AUTO_EVIDENCE_READY - normal labuser1: C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace' -ForegroundColor Green
-} catch {
-    Write-Warning 'Automatic evidence setup failed. The deployed lab remains available; the one-command collector is NOT ready.'
-    Write-Warning 'Run ./Update-LabEvidenceAutomation.ps1 -ResourceGroupName <lab-rg> in Cloud Shell to retry setup.'
-    throw
-} finally {
-    $evidenceCredential = $null
-    try { Stop-Transcript | Out-Null } catch { }
-}
+try { Stop-Transcript | Out-Null } catch { }

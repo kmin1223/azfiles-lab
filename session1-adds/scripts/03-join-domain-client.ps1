@@ -27,8 +27,8 @@ function Grant-LocalAdmin {
     # UAC policy, elevation needs consent rather than another password.
     # This does NOT guarantee the same LUID, ticket cache or SMB connections
     # between normal and elevated windows. Manual reproduction stays in the
-    # affected user's normal window; the automatic worker uses a fresh,
-    # non-elevated credential-created token and a UAC-elevated coordinator captures.
+    # affected user's normal window; capture starts and stops in the original
+    # elevated window.
     #
     # This grants nothing on the file share: Azure Files authorises from the
     # Kerberos PAC (domain groups), which local group membership never enters.

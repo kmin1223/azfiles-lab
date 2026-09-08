@@ -255,20 +255,13 @@ $helper = @'
 <#
   Get-KerberosEvidence.ps1 - capture the raw evidence for one mount attempt.
 
-  AUTOMATIC LAB CAPTURE (after Install-LabEvidenceAutomation)
-      NORMAL labuser1 window: Get-KerberosEvidence.ps1 -StartTrace
-      Captures once, reproduces in a fresh non-elevated credential logon using UNC
-      (no drive letter), stops, and returns results to this window.
-      Approve one UAC consent. The elevated coordinator reads the protected
-      stored lab credential; Start-Process -Credential is NOT elevation.
-
-  MANUAL CAPTURE / EXISTING USER SESSION
+  TWO WAYS TO RUN IT
   ------------------
   1) Split (what you do on a real case). The trace needs admin rights, but the
      MOUNT must happen in the affected user's own, non-elevated session - that
      is the session whose ticket cache and drive mappings you are diagnosing.
 
-        ELEVATED window :  Get-KerberosEvidence.ps1 -StartTrace -Manual [-DomainController <dc-fqdn>]
+        ELEVATED window :  Get-KerberosEvidence.ps1 -StartTrace [-DomainController <dc-fqdn>]
         NORMAL window   :  Get-KerberosEvidence.ps1 -Reproduce -StorageAccount <sa>
         ELEVATED window :  Get-KerberosEvidence.ps1 -StopTrace
 
@@ -292,17 +285,11 @@ $helper = @'
       DC selection: explicit -DomainController, run config, installed config,
       then computer-domain discovery (a candidate, not proof of the issuing DC).
       -DcCredential on Stop/All optionally supplies read credentials in memory.
-      Manual capture saves no credentials. No backend collection is required.
+      No credentials are saved. Azure Files backend collection remains manual.
       Reproduce resets mappings and purges this logon session's tickets.
       Use one reproduction per capture; original state is saved before reset.
 
-  AUTOMATIC OUTPUT -> C:\ProgramData\AzureFilesLabEvidence\<printed run path>\
-      user\                      fresh labuser1 mount, tickets and DC reads
-      capture\                   protected trace and collector-side events
-      Use the returned run path; the manual .current-run.txt is not updated.
-      The original window's ticket cache is not the worker's cache.
-
-  MANUAL OUTPUT -> C:\LabTools\evidence\<timestamp>\
+  OUTPUT  ->  C:\LabTools\evidence\<timestamp>\
       trace.etl / trace.pcapng    network capture of the whole attempt
       trace-summary.txt           the capture as readable text (needs tshark)
       klist-before/after.txt      ticket cache either side of the mount
@@ -317,7 +304,7 @@ $helper = @'
       dc-summary.txt             collection status + candidate event table
       dc-<name>\security.*       bounded DC events: original XML, JSON and CSV
       dc-collection.json         per-DC status, count, truncation and errors
-      azure-files-handoff.txt    target, context and UTC interval for case handoff
+      azure-files-handoff.txt    target and UTC interval for manual backend lookup
       *-collector.txt            elevated Stop snapshots (separate from reproduce)
 
   No events is not proof of no KDC request; check cache, actual KDC, clocks,
@@ -331,8 +318,6 @@ param(
     [string]$StorageAccount,
 
     [Parameter(ParameterSetName = 'Start', Mandatory)][switch]$StartTrace,
-    [Parameter(ParameterSetName = 'Start')][switch]$Manual,
-    [Parameter(ParameterSetName = 'Library', Mandatory)][switch]$Library,
     [Parameter(ParameterSetName = 'Reproduce', Mandatory)][switch]$Reproduce,
     [Parameter(ParameterSetName = 'Stop', Mandatory)][switch]$StopTrace,
     [Parameter(ParameterSetName = 'Analyze', Mandatory)][switch]$Analyze,
@@ -350,7 +335,6 @@ param(
 
 $root    = 'C:\LabTools\evidence'
 $pointer = Join-Path $root '.current-run.txt'
-$ConverterPath = 'C:\LabTools\etl2pcapng.exe'
 $ErrorActionPreference = 'Stop'
 
 function Write-JsonFile($Value, [string]$File) {
@@ -515,7 +499,7 @@ function Save-DcEvidence([string]$Out) {
         '4769 success = ticket issuance, not Azure Files acceptance.'
         'No matching events: check cached tickets, responding DC, clock offsets, time window, auditing/KdcExtraLogLevel and retention.'
         'Collection Failed is different from a successful query with no events.'
-        'Client/DC evidence only. See azure-files-handoff.txt for the case context.'
+        'Azure Files backend logs are NOT collected. See azure-files-handoff.txt.'
     )
     $summary | Set-Content (Join-Path $Out 'dc-summary.txt') -Encoding UTF8
     $summary | ForEach-Object { Write-Host $_ }
@@ -527,8 +511,8 @@ function Save-DcEvidence([string]$Out) {
         "User: $($context.Account); SID: $($context.UserSid); LUID: $($context.LogonId)"
         "Reproduction UTC: $($context.StartUtc) through $($context.EndUtc)"
         "Mount exit code: $($context.MountExitCode); output: mount-result.txt"
-        'Read the failing SMB operation, outer status and inner authentication token where visible.'
-        'Encrypted commands may be unreadable. Correlate client events and non-secret configuration; do not infer a unique cause from one code.'
+        'Determine the failing SMB operation/status from the trace and backend records.'
+        'Find the matching backend Activity ID, then inspect XSMB logs. Do not equate Activity ID with SMB MessageId/SessionId.'
     ) | Set-Content (Join-Path $Out 'azure-files-handoff.txt') -Encoding UTF8
 }
 
@@ -575,7 +559,7 @@ function Start-Capture([string]$Out) {
 netsh trace start capture=yes overwrite=yes maxsize=512 ``
       tracefile="$Out\trace.etl"
 "@
-    $started = & "$env:SystemRoot\System32\netsh.exe" trace start capture=yes overwrite=yes maxsize=512 tracefile="$Out\trace.etl" 2>&1
+    $started = netsh trace start capture=yes overwrite=yes maxsize=512 tracefile="$Out\trace.etl" 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning 'netsh trace failed to start:'
         Write-Host ($started -join "`n") -ForegroundColor DarkYellow
@@ -590,42 +574,21 @@ function Stop-Capture([string]$Out) {
 netsh trace stop
 etl2pcapng.exe "$Out\trace.etl" "$Out\trace.pcapng"   # for Wireshark
 "@
-    $stopOutput = & "$env:SystemRoot\System32\netsh.exe" trace stop 2>&1
+    $stopOutput = netsh trace stop 2>&1
     $stopOutput | Out-File "$Out\trace-stop.txt" -Encoding utf8
     if ($LASTEXITCODE -ne 0) { throw "Trace stop failed. Run pointer retained for recovery; see $Out\trace-stop.txt." }
-    Convert-EvidenceTrace $Out
-}
-
-function Convert-EvidenceTrace([string]$Out) {
-    $conversion = [ordered]@{ Status = 'NotStarted'; ConverterPath = $ConverterPath; ExitCode = $null }
-    if (-not (Test-Path -LiteralPath "$Out\trace.etl" -PathType Leaf)) {
-        $conversion.Status = 'MissingEtl'
-        Write-Warning "Trace ETL is unavailable at $Out\trace.etl; inspect trace-stop.txt."
-    } elseif (-not (Test-Path -LiteralPath $ConverterPath -PathType Leaf)) {
-        $conversion.Status = 'MissingConverter'
-        Write-Warning "etl2pcapng converter is unavailable at $ConverterPath; original ETL retained."
-    } else {
-        $result = & {
-            # In Windows PowerShell, redirected native stderr is an error stream.
-            # Retain it as diagnostics; the exit code/output file determine conversion status.
-            $ErrorActionPreference = 'Continue'
-            $LASTEXITCODE = $null
-            $output = & $ConverterPath "$Out\trace.etl" "$Out\trace.pcapng" 2>&1
-            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
-        }
-        $conversionExit = $result.ExitCode
-        $conversion.ExitCode = $conversionExit
-        $result.Output | Out-File "$Out\conversion-output.txt" -Encoding utf8
+    if ((Test-Path "$Out\trace.etl") -and (Test-Path 'C:\LabTools\etl2pcapng.exe')) {
+        & 'C:\LabTools\etl2pcapng.exe' "$Out\trace.etl" "$Out\trace.pcapng" | Out-Null
+        $conversionExit = $LASTEXITCODE
         $pcap = Get-Item "$Out\trace.pcapng" -ErrorAction SilentlyContinue
         if ($conversionExit -eq 0 -and $pcap -and $pcap.Length -gt 0) {
-            $conversion.Status = 'Completed'
             Write-Host ("pcapng ready: {0} ({1:N0} KB)" -f $pcap.FullName, ($pcap.Length / 1KB)) -ForegroundColor Green
         } else {
-            $conversion.Status = 'Failed'
-            Write-Warning "Conversion failed or produced an empty file (exit $conversionExit). Original ETL retained; inspect conversion-output.txt."
+            Write-Warning "Conversion failed or produced an empty file (exit $conversionExit). Original ETL retained."
         }
+    } else {
+        Write-Warning "ETL or etl2pcapng converter unavailable; keep $Out\trace.etl for analysis. DC collection is independent."
     }
-    Write-JsonFile $conversion "$Out\conversion.json"
 }
 
 # Events that are routine against Azure Files and say nothing about a failure.
@@ -637,7 +600,6 @@ $benign = @{
 # The opposite list: events that ARE about your failure, and what to read in them.
 $meaningful = @{
     31001 = 'SSPI failed while building the Session Setup token - read Security status'
-    31010 = 'Share access failed - correlate the target share and Session Setup result'
 }
 # Status codes that Windows fails to name in the event text. 0x80090322 is
 # logged as "Unknown NTSTATUS Error code" because it is a SECURITY_STATUS, not
@@ -933,52 +895,8 @@ Get-WinEvent -FilterHashtable @{LogName='<channel>'; StartTime=<repro-start>; En
     Save-Log $Out 'Microsoft-Windows-SMBClient/Security'     'smbclient-security.txt'     @('TimeCreated','Id','Message')
 }
 
-function Invoke-NonInteractiveUncMount {
-    param(
-        [Parameter(Mandatory)]
-        [ValidatePattern('^\\\\[a-z0-9]{3,24}\.file\.core\.windows\.net\\[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$')]
-        [string]$Unc,
-        [ValidateRange(1,120)][int]$TimeoutSeconds = 120
-    )
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo.FileName = "$env:SystemRoot\System32\net.exe"
-    $process.StartInfo.Arguments = "use $Unc /persistent:no"
-    $process.StartInfo.UseShellExecute = $false
-    $process.StartInfo.CreateNoWindow = $true
-    $process.StartInfo.RedirectStandardInput = $true
-    $process.StartInfo.RedirectStandardOutput = $true
-    $process.StartInfo.RedirectStandardError = $true
-    $process.StartInfo.StandardOutputEncoding = [Console]::OutputEncoding
-    $process.StartInfo.StandardErrorEncoding = [Console]::OutputEncoding
-    try {
-        if (-not $process.Start()) { throw 'Could not start the UNC connection probe.' }
-        # EOF prevents a credential prompt from hanging an unattended worker.
-        $process.StandardInput.Close()
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
-        if ($timedOut) {
-            $process.Kill()
-            if (-not $process.WaitForExit(5000)) { throw 'The timed-out UNC probe did not terminate.' }
-        }
-        if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) {
-            throw 'UNC probe output streams did not close after process exit.'
-        }
-        [pscustomobject]@{
-            ExitCode = $process.ExitCode
-            TimedOut = $timedOut
-            Output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
-        }
-    } finally {
-        $process.Dispose()
-    }
-}
-
 # The mount itself, plus the state that only exists in THIS logon session.
-function Invoke-MountAttempt([string]$Out, [switch]$NoDriveMapping, [switch]$NonInteractive) {
-    if ($NonInteractive -and -not $NoDriveMapping) {
-        throw 'NonInteractive reproduction requires NoDriveMapping.'
-    }
+function Invoke-MountAttempt([string]$Out) {
     if (Test-Path (Join-Path $Out 'reproduction.json')) {
         throw 'This capture already has a reproduction. Stop it and start a new capture; evidence will not be overwritten.'
     }
@@ -1006,16 +924,12 @@ function Invoke-MountAttempt([string]$Out, [switch]$NoDriveMapping, [switch]$Non
         Spn = "cifs/$fqdn"
         Share = $Share
         MountExitCode = $null
-        MountTimedOut = $false
-        ConnectionMode = $(if ($NoDriveMapping) { 'UNC' } else { 'DriveMapping' })
-        NonInteractive = [bool]$NonInteractive
         Error = ''
     }
     Write-JsonFile $context (Join-Path $Out 'reproduction.json')
     net use 2>&1 | Out-File "$Out\mappings-original.txt" -Encoding utf8
-    Write-Warning 'Reproduce purges tickets in THIS logon session. Original state has been saved.'
+    Write-Warning 'Reproduce resets the selected mappings and purges tickets in THIS logon session. Original state has been saved.'
     try {
-    if (-not $NoDriveMapping) {
     # A dead mapping can hold the drive letter while 'net use' lists nothing,
     # which surfaces as "System error 85 - the local device name is already in
     # use". Clear both the letter and the UNC path before trying.
@@ -1039,10 +953,6 @@ klist > klist-after.txt
         }
     }
     Remove-SmbMapping -LocalPath "${DriveLetter}:" -Force -ErrorAction SilentlyContinue
-    } else {
-        Show-Cmd "klist purge`nklist`nnet use \\$fqdn\$Share /persistent:no`nklist"
-        Write-Host 'UNC-only probe: no drive letter or existing-session reset. Automatic runs use a fresh credential-created logon.' -ForegroundColor Cyan
-    }
     klist purge | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'klist purge failed; the intended fresh-ticket reproduction could not be prepared.' }
     klist > "$Out\klist-before.txt"
@@ -1050,25 +960,14 @@ klist > klist-after.txt
     Write-Host 'Attempting the mount...'
     # /persistent:no - a remembered mapping outlives the lab and keeps the
     # drive letter reserved, which later shows up as "System error 85".
-    if ($NonInteractive) {
-        $result = Invoke-NonInteractiveUncMount -Unc "\\$fqdn\$Share"
-        $mount = $result.Output
-        $context.MountExitCode = $result.ExitCode
-        $context.MountTimedOut = $result.TimedOut
-    } elseif ($NoDriveMapping) {
-        $mount = cmd /c "net use \\$fqdn\$Share /persistent:no 2>&1"
-        $context.MountExitCode = $LASTEXITCODE
-    } else {
-        $mount = cmd /c "net use ${DriveLetter}: \\$fqdn\$Share /persistent:no 2>&1"
-        $context.MountExitCode = $LASTEXITCODE
-    }
+    $mount = cmd /c "net use ${DriveLetter}: \\$fqdn\$Share /persistent:no 2>&1"
+    $context.MountExitCode = $LASTEXITCODE
     $mount | Out-File "$Out\mount-result.txt" -Encoding utf8
     Write-Host ($mount -join "`n")
 
     Start-Sleep -Seconds 2
     klist > "$Out\klist-after.txt"
     Save-SmbState $Out
-    if ($context.MountTimedOut) { throw 'UNC connection probe exceeded 120 seconds; partial output and tickets were retained.' }
     } catch {
         $context.Error = $_.Exception.Message
         throw
@@ -1085,7 +984,7 @@ klist > klist-after.txt
 function Save-SmbState([string]$Out, [string]$Suffix = '') {
     Show-Cmd @"
 Get-SmbConnection          # needs an ELEVATED window
-Get-SmbClientConfiguration # configured client policy, not the negotiated cipher
+Get-SmbClientConfiguration # negotiated dialect / encryption / signing
 "@
     try {
         Get-SmbConnection -ErrorAction Stop | Format-List * |
@@ -1135,23 +1034,9 @@ function Complete-EvidenceRun([string]$Out) {
     Write-Host "Done. Read $Out\dc-summary.txt; raw data and collection errors are retained." -ForegroundColor Green
 }
 
-if ($Library) { return }
-
 switch ($PSCmdlet.ParameterSetName) {
 
     'Start' {
-        $automation = 'C:\Program Files\AzureFilesLabEvidence\Invoke-LabEvidenceAutomation.ps1'
-        if (-not $Manual -and (Test-Path -LiteralPath $automation)) {
-            if ($PSBoundParameters.Keys | Where-Object { $_ -notin @('StartTrace','Verbose','Debug','ErrorAction','WarningAction','InformationAction') }) {
-                throw 'Automatic capture uses the deployment-fixed identity, target and DC. Use -StartTrace -Manual for custom parameters.'
-            }
-            & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -File $automation -Mode Client
-            if ($LASTEXITCODE -ne 0) { throw "Automatic evidence collection failed (exit $LASTEXITCODE)." }
-            return
-        }
-        if (-not $Manual -and -not (Test-Admin)) {
-            throw 'Automatic evidence is not installed. Run Update-LabEvidenceAutomation.ps1 from the lab repository in Cloud Shell once, or use -StartTrace -Manual in an elevated window.'
-        }
         Assert-Admin 'Starting a network trace'
         if (Test-Path $pointer) { throw 'A collector run is already recorded. Finish it with -StopTrace before starting another.' }
         $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
