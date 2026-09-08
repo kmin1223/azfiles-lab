@@ -343,8 +343,28 @@ function Start-EvidenceProcess([string]$Role, [string]$Id, [string]$Caller, [PSC
     }
 }
 
-function Wait-EvidenceProcess($Process, [int]$Seconds) {
-    if (-not $Process.WaitForExit($Seconds * 1000)) { throw 'Evidence worker timed out.' }
+function Wait-EvidenceProcess($Process, [int]$Seconds, [string]$TimeoutMessage = 'Evidence worker timed out.') {
+    # Windows PowerShell 5.1 Start-Process may otherwise lose ExitCode after waiting.
+    $null = $Process.Handle
+    if (-not $Process.WaitForExit($Seconds * 1000)) { throw $TimeoutMessage }
+}
+
+function Assert-EvidenceWorkerCompletion($Done, $State, $Config, $ExitCode) {
+    $checks = [ordered]@{
+        ProcessExitCode = ($null -ne $ExitCode -and $ExitCode -eq 0)
+        RunId = ($Done.RunId -eq $State.RunId)
+        WorkerProcessId = ($Done.WorkerProcessId -eq $State.WorkerProcessId)
+        UserSid = ($Done.UserSid -eq $Config.ExpectedUserSid)
+        Elevated = ($Done.Elevated -is [bool] -and $Done.Elevated -eq $false)
+        LogonType = ($Done.LogonType -eq 2)
+        LogonId = ($Done.LogonId -match '^\d+:0x[0-9a-fA-F]+$' -and $Done.LogonId -ine $State.CallerLogonId)
+        Status = ($Done.Status -eq 'Completed')
+    }
+    $failed = @($checks.Keys | Where-Object { -not $checks[$_] })
+    if ($failed.Count) {
+        $exitText = $(if ($null -eq $ExitCode) { 'unavailable' } else { [string]$ExitCode })
+        throw "Worker completion validation failed (process exit: $exitText; failed checks: $($failed -join ', ')). Inspect user\done.json, user\worker-output.txt and capture\worker-stderr.txt."
+    }
 }
 
 function Stop-EvidenceProcess($Process) {
@@ -448,7 +468,7 @@ function Invoke-EvidenceCoordinator($Config, [string]$Id, [string]$Caller) {
         $state = [ordered]@{ RunId = $Id; CoordinatorProcessId = $PID; CallerLogonId = $Caller; WorkerProcessId = 0
             Status = 'StartingCapture'; StartUtc = [DateTime]::UtcNow.ToString('o'); EndUtc = $null
             TraceOwned = $true; CaptureStatus = 'Starting'; WorkerStatus = 'NotStarted'
-            WorkerStartUtc = $null; WorkerCleanupFailed = $false
+            WorkerStartUtc = $null; WorkerExitCode = $null; WorkerCleanupFailed = $false
             MountExitCode = $null; ExpectedAccount = $Config.Account; ExpectedLogonType = 'Interactive (2), credential-created'
             Error = ''; Complete = $false }
         # A killed coordinator must leave a conservative recovery marker, even during netsh startup.
@@ -465,12 +485,9 @@ function Invoke-EvidenceCoordinator($Config, [string]$Id, [string]$Caller) {
         $state.WorkerProcessId = $worker.Id
         Write-EvidenceState $state
         Wait-EvidenceProcess $worker 180
+        $state.WorkerExitCode = $worker.ExitCode
         $done = Read-EvidenceJson (Join-Path $paths.User 'done.json')
-        if ($worker.ExitCode -ne 0 -or $done.RunId -ne $state.RunId -or $done.WorkerProcessId -ne $state.WorkerProcessId -or
-            $done.UserSid -ne $Config.ExpectedUserSid -or $done.Elevated -ne $false -or
-            $done.LogonType -ne 2 -or $done.LogonId -eq $Caller -or $done.Status -ne 'Completed') {
-            throw 'Worker failed or did not provide completion for this exact run/PID. Inspect user\done.json and worker-output.txt.'
-        }
+        Assert-EvidenceWorkerCompletion $done $state $Config $state.WorkerExitCode
         $context = ConvertTo-EvidenceContext (Read-EvidenceJson (Join-Path $paths.User 'reproduction.json')) `
             $Config ([DateTime]::Parse($state.StartUtc).ToUniversalTime()) ([DateTime]::UtcNow)
         if ($context.LogonId -ine $done.LogonId) { throw 'Worker token and reproduction LUID do not match.' }
@@ -538,9 +555,7 @@ function Invoke-EvidenceClient($Config) {
     Write-Host "Run: $id; evidence: $($paths.Root)"
     $coordinator = Start-EvidenceProcess 'Coordinator' $id $caller
     try {
-        if (-not $coordinator.WaitForExit(660000)) {
-            throw 'Coordinator timed out; cleanup may still be running. Do not kill it or start another trace; inspect protected state.json.'
-        }
+        Wait-EvidenceProcess $coordinator 660 'Coordinator timed out; cleanup may still be running. Do not kill it or start another trace; inspect protected state.json.'
         $summary = Join-Path $paths.Capture 'automation-summary.json'
         if (-not (Test-Path -LiteralPath $summary)) {
             throw 'Coordinator exited without a result for this run. Check its window and protected state.json (concurrent capture, UAC/logon or setup failure).'
@@ -549,14 +564,15 @@ function Invoke-EvidenceClient($Config) {
         if (-not (Test-EvidenceCompletion $state $id $coordinator.Id $caller)) {
             throw 'Coordinator result does not match this run/PID/caller.'
         }
-        if ($coordinator.ExitCode -ne 0 -and $state.Status -eq 'Completed') {
-            throw 'Coordinator exited unsuccessfully despite its completion record.'
+        if (($null -eq $coordinator.ExitCode -or $coordinator.ExitCode -ne 0) -and $state.Status -eq 'Completed') {
+            $exitText = $(if ($null -eq $coordinator.ExitCode) { 'unavailable' } else { [string]$coordinator.ExitCode })
+            throw "Coordinator process exit is $exitText despite its completion record."
         }
     } finally { $coordinator.Dispose() }
     Write-Host "Capture: $($state.CaptureStatus); worker: $($state.WorkerStatus); mount exit: $($state.MountExitCode)"
     Write-Host "Evidence: $($paths.Root)"
     if (-not (Test-Path -LiteralPath (Join-Path $paths.Capture 'trace.pcapng'))) {
-        Write-Warning 'No converted PCAPNG is available. Preserve capture\trace.etl; inspect capture\trace-stop.txt.'
+        Write-Warning 'No converted PCAPNG is available. Preserve capture\trace.etl; inspect capture\conversion.json and capture\trace-stop.txt.'
     }
     # User-controlled text is displayed only under the caller's non-elevated identity.
     foreach ($name in @('worker-output.txt','mount-result.txt','reproduction.json','dc-summary.txt','done.json')) {
@@ -566,7 +582,7 @@ function Invoke-EvidenceClient($Config) {
             catch { Write-Warning "Cannot display ${name}: $($_.Exception.Message)" }
         }
     }
-    foreach ($name in @('worker-stdout.txt','worker-stderr.txt')) {
+    foreach ($name in @('worker-stdout.txt','worker-stderr.txt','conversion.json')) {
         $path = Join-Path $paths.Capture $name
         if (Test-Path -LiteralPath $path) {
             try { Write-Host ([LabEvidence.Direct.SafeReader]::Read($path, 1048576)) }

@@ -593,18 +593,39 @@ etl2pcapng.exe "$Out\trace.etl" "$Out\trace.pcapng"   # for Wireshark
     $stopOutput = & "$env:SystemRoot\System32\netsh.exe" trace stop 2>&1
     $stopOutput | Out-File "$Out\trace-stop.txt" -Encoding utf8
     if ($LASTEXITCODE -ne 0) { throw "Trace stop failed. Run pointer retained for recovery; see $Out\trace-stop.txt." }
-    if ((Test-Path "$Out\trace.etl") -and (Test-Path -LiteralPath $ConverterPath)) {
-        & $ConverterPath "$Out\trace.etl" "$Out\trace.pcapng" | Out-Null
-        $conversionExit = $LASTEXITCODE
+    Convert-EvidenceTrace $Out
+}
+
+function Convert-EvidenceTrace([string]$Out) {
+    $conversion = [ordered]@{ Status = 'NotStarted'; ConverterPath = $ConverterPath; ExitCode = $null }
+    if (-not (Test-Path -LiteralPath "$Out\trace.etl" -PathType Leaf)) {
+        $conversion.Status = 'MissingEtl'
+        Write-Warning "Trace ETL is unavailable at $Out\trace.etl; inspect trace-stop.txt."
+    } elseif (-not (Test-Path -LiteralPath $ConverterPath -PathType Leaf)) {
+        $conversion.Status = 'MissingConverter'
+        Write-Warning "etl2pcapng converter is unavailable at $ConverterPath; original ETL retained."
+    } else {
+        $result = & {
+            # In Windows PowerShell, redirected native stderr is an error stream.
+            # Retain it as diagnostics; the exit code/output file determine conversion status.
+            $ErrorActionPreference = 'Continue'
+            $LASTEXITCODE = $null
+            $output = & $ConverterPath "$Out\trace.etl" "$Out\trace.pcapng" 2>&1
+            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+        }
+        $conversionExit = $result.ExitCode
+        $conversion.ExitCode = $conversionExit
+        $result.Output | Out-File "$Out\conversion-output.txt" -Encoding utf8
         $pcap = Get-Item "$Out\trace.pcapng" -ErrorAction SilentlyContinue
         if ($conversionExit -eq 0 -and $pcap -and $pcap.Length -gt 0) {
+            $conversion.Status = 'Completed'
             Write-Host ("pcapng ready: {0} ({1:N0} KB)" -f $pcap.FullName, ($pcap.Length / 1KB)) -ForegroundColor Green
         } else {
-            Write-Warning "Conversion failed or produced an empty file (exit $conversionExit). Original ETL retained."
+            $conversion.Status = 'Failed'
+            Write-Warning "Conversion failed or produced an empty file (exit $conversionExit). Original ETL retained; inspect conversion-output.txt."
         }
-    } else {
-        Write-Warning "ETL or etl2pcapng converter unavailable; keep $Out\trace.etl for analysis. DC collection is independent."
     }
+    Write-JsonFile $conversion "$Out\conversion.json"
 }
 
 # Events that are routine against Azure Files and say nothing about a failure.

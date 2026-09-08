@@ -52,12 +52,35 @@ Domain Admins and Enterprise Admins are rejected. A deny-only Administrators
 SID does not mean elevation; the worker checks the enabled token role using
 `WindowsPrincipal.IsInRole(Administrator)`.
 
-This implementation has local Windows PowerShell 5.1/Pester coverage, including
-synthetic DPAPI round trips and read-only native token inspection. **It has not
-yet been validated on the deployed VM.** The first VM check must confirm the
-actual UAC policy, Secondary Logon, type-2 fresh LUID, non-elevated token, UNC
-attempt, DC access and successful capture cleanup. A policy/token mismatch is
-a failure, not a reason to weaken the guards.
+Local Windows PowerShell 5.1 coverage includes real `Start-Process -PassThru`
+exits, synthetic DPAPI round trips and read-only native token inspection.
+The first reported VM run created a non-elevated type-2 worker, connected to the
+UNC share and collected DC events, but the coordinator rejected completion.
+**A complete VM run with the corrected completion handling is still required.**
+A policy/token mismatch is a failure, not a reason to weaken the guards.
+
+### Completed worker reported as failed
+
+Windows PowerShell 5.1 can return a `Process` object from `Start-Process
+-PassThru` whose `ExitCode` is `$null` after `WaitForExit`, even when the process
+exited with zero. Both waits now retain the process handle before waiting.
+An unavailable exit code is still an error; it is never converted to zero or
+ignored in favor of `done.json`. Run/PID/SID/LUID and reproduction checks remain.
+
+`capture\automation-summary.json` records `WorkerExitCode`. A rejected completion
+names the failed checks and reports the process exit separately from
+`MountExitCode`. A nonzero mount exit can be valid fault evidence; a nonzero
+worker process exit is a collector failure.
+
+Missing PCAPNG is a separate issue. `capture\trace-stop.txt` records trace stop,
+not the converter result. `capture\conversion.json` reports `MissingEtl`,
+`MissingConverter`, `Failed` or `Completed`, with the converter path and exit
+code. When conversion runs, `capture\conversion-output.txt` retains its output
+and errors. The original window displays the conversion status. Preserve the
+ETL; do not weaken converter trust checks or redeploy the lab to hide this gap.
+The installer can skip a missing converter or one whose existing file/path
+fails trust/link validation; these are different from a converter that ran and
+failed.
 
 ## Setup and existing VMs
 

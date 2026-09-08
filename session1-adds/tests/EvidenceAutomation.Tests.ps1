@@ -533,6 +533,55 @@ Describe 'Run correlation and sanitized worker context' {
             $process.Dispose()
         }
     }
+    It 'retains real Start-Process exit codes in Windows PowerShell, including nonzero exits' {
+        foreach ($expectedExit in @(0,23)) {
+            $process = Microsoft.PowerShell.Management\Start-Process `
+                -FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+                -ArgumentList "-NoProfile -NonInteractive -Command `"Start-Sleep -Milliseconds 800; exit $expectedExit`"" `
+                -PassThru -WindowStyle Hidden `
+                -RedirectStandardOutput (Join-Path $TestDrive "exit-$expectedExit.stdout") `
+                -RedirectStandardError (Join-Path $TestDrive "exit-$expectedExit.stderr")
+            try {
+                Wait-EvidenceProcess $process 30
+                ($null -eq $process.ExitCode) | Should Be $false
+                $process.ExitCode | Should Be $expectedExit
+            } finally {
+                Stop-EvidenceProcess $process
+                $process.Dispose()
+            }
+        }
+    }
+    It 'acquires the process handle before waiting and preserves caller-specific timeout guidance' {
+        $process = [pscustomobject]@{Retained=$false}
+        $process | Add-Member ScriptProperty Handle { $this.Retained=$true; [IntPtr]123 }
+        $process | Add-Member ScriptMethod WaitForExit {
+            param($Milliseconds)
+            if (-not $this.Retained) { throw 'fixture handle was not retained' }
+            $false
+        }
+        { Wait-EvidenceProcess $process 0 'Coordinator timed out; leave cleanup alone.' } |
+            Should Throw 'Coordinator timed out; leave cleanup alone.'
+        $process.Retained | Should Be $true
+    }
+    It 'retains a clean exit when an isolated child owns the real kill-on-close job' {
+        $child = ". '$($runtimeFile.Replace("'", "''"))' -Mode Library; " +
+            'Initialize-EvidenceNativeReader; $script:WorkerJob=[LabEvidence.Direct.SafeReader]::OwnWorkerProcessTree(); exit 0'
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+        $process = Microsoft.PowerShell.Management\Start-Process `
+            -FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+            -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded" `
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $TestDrive 'owned-job.stdout') `
+            -RedirectStandardError (Join-Path $TestDrive 'owned-job.stderr')
+        try {
+            Wait-EvidenceProcess $process 30
+            ($null -eq $process.ExitCode) | Should Be $false
+            $process.ExitCode | Should Be 0
+        } finally {
+            Stop-EvidenceProcess $process
+            $process.Dispose()
+        }
+    }
     It 'reads an isolated JSON fixture and rejects oversized native reads' {
         $path = Join-Path $TestDrive 'bounded.json'
         '{"Value":42}' | Set-Content -LiteralPath $path
@@ -559,6 +608,45 @@ Describe 'Run correlation and sanitized worker context' {
         } finally { $reader.Dispose() }
         Write-EvidenceState @{Value='new'}
         (Read-EvidenceJson $path).Value | Should Be 'new'
+    }
+}
+
+Describe 'Worker completion diagnostics without weakening correlation' {
+    BeforeEach {
+        $script:config = New-TestConfig
+        $script:state = [pscustomobject]@{
+            RunId=[guid]::NewGuid().ToString('D'); WorkerProcessId=888; CallerLogonId='0:0x456'
+        }
+        $script:done = [pscustomobject]@{
+            RunId=$state.RunId; WorkerProcessId=888; UserSid=$config.ExpectedUserSid
+            Elevated=$false; LogonType=2; LogonId='0:0x123'; Status='Completed'
+        }
+    }
+    It 'accepts a correlated completion only with a confirmed zero process exit' {
+        { Assert-EvidenceWorkerCompletion $done $state $config 0 } | Should Not Throw
+        { Assert-EvidenceWorkerCompletion $done $state $config $null } |
+            Should Throw 'process exit: unavailable; failed checks: ProcessExitCode'
+        { Assert-EvidenceWorkerCompletion $done $state $config 23 } |
+            Should Throw 'process exit: 23; failed checks: ProcessExitCode'
+    }
+    It 'names each failed field rather than reporting every failure as a missing completion' {
+        $invalid = [ordered]@{
+            RunId='old'; WorkerProcessId=999; UserSid='S-1-5-18'; Elevated=$true
+            LogonType=4; LogonId=$state.CallerLogonId; Status='Failed'
+        }
+        foreach ($field in $invalid.Keys) {
+            $changed = $done.PSObject.Copy()
+            $changed.$field = $invalid[$field]
+            { Assert-EvidenceWorkerCompletion $changed $state $config 0 } |
+                Should Throw "failed checks: $field"
+        }
+    }
+    It 'rejects incomplete or malformed token reports' {
+        $done.Elevated = 'false'
+        { Assert-EvidenceWorkerCompletion $done $state $config 0 } | Should Throw 'Elevated'
+        $done.Elevated = $false; $done.LogonId = ''
+        { Assert-EvidenceWorkerCompletion $done $state $config 0 } | Should Throw 'LogonId'
+        { Assert-EvidenceWorkerCompletion $null $state $config 0 } | Should Throw 'RunId'
     }
 }
 
@@ -629,6 +717,7 @@ Describe 'Owned capture lifecycle with isolated fixture writes' {
         { Invoke-EvidenceCoordinator $config $run '0:0x456' } | Should Not Throw
         $state = Get-Content "$RuntimeRoot\state.json" -Raw | ConvertFrom-Json
         $state.Status | Should Be 'Completed'
+        $state.WorkerExitCode | Should Be 0
         $state.MountExitCode | Should Be 5
         $state.CaptureStatus | Should Be 'Stopped'
         Assert-MockCalled Save-EventLogs -Times 1 -Exactly -Scope It
@@ -726,6 +815,12 @@ Describe 'Original caller results and cancellation with no real process launch' 
         $script:resultStatus = 'Failed'
         { Invoke-EvidenceClient $config } | Should Throw 'fixture failure'
         Assert-MockCalled Write-Host -Scope It -ParameterFilter { "$Object" -match 'fixture worker result' }
+    }
+    It 'rejects unavailable or nonzero coordinator exits despite a completed summary' {
+        $fakeCoordinator.ExitCode = $null
+        { Invoke-EvidenceClient $config } | Should Throw 'process exit is unavailable'
+        $fakeCoordinator.ExitCode = 23
+        { Invoke-EvidenceClient $config } | Should Throw 'process exit is 23'
     }
     It 'bounds caller waiting and leaves coordinator cleanup alone on timeout' {
         $fakeCoordinator.Finished = $false

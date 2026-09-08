@@ -11,7 +11,7 @@ $source = $assignment.Right.Expression.Value
 $helperAst = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 $functions = @('Write-JsonFile','Get-DcTargets','Initialize-EvidenceRun','Convert-DcEvent',
-    'Save-DcEvidence','Save-Log','Save-SmbState','Complete-EvidenceRun','Start-Capture','Stop-Capture')
+    'Save-DcEvidence','Save-Log','Save-SmbState','Complete-EvidenceRun','Start-Capture','Stop-Capture','Convert-EvidenceTrace')
 foreach ($definition in $helperAst.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
@@ -167,6 +167,64 @@ Describe 'Collector lifecycle wiring' {
         $start = $helperAst.FindAll({ param($n) $n -is [Management.Automation.Language.SwitchStatementAst] }, $true)[0].Clauses |
             Where-Object { $_.Item1.Value -eq 'Start' } | ForEach-Object { $_.Item2.Extent.Text }
         $start.IndexOf('Start-Capture $out') | Should BeLessThan $start.IndexOf('Set-Content -Path $pointer')
+    }
+
+    Context 'Optional ETL conversion diagnostics without a live trace' {
+        BeforeEach {
+            $script:out = Join-Path $TestDrive ([guid]::NewGuid().ToString('D'))
+            New-Item -ItemType Directory -Path $out | Out-Null
+            $script:ConverterPath = 'Invoke-FixtureConverter'
+            $script:converterExit = 0
+            $script:converterCreatesFile = $true
+            $script:converterWritesError = $false
+            function Invoke-FixtureConverter($Source,$Destination) {
+                if ($script:converterCreatesFile) { [IO.File]::WriteAllBytes($Destination, [byte[]](1,2,3,4)) }
+                if ($script:converterWritesError) { Write-Error 'fixture converter stderr' }
+                Set-Variable -Name LASTEXITCODE -Value $script:converterExit -Scope 1
+                'fixture converter output'
+            }
+            Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq $script:ConverterPath }
+            Mock Write-Host {}
+            Mock Write-Warning {}
+        }
+        It 'records a missing ETL distinctly from a missing converter' {
+            Convert-EvidenceTrace $out
+            (Get-Content "$out\conversion.json" -Raw | ConvertFrom-Json).Status | Should Be 'MissingEtl'
+            'fixture ETL' | Set-Content "$out\trace.etl"
+            Mock Test-Path { $false } -ParameterFilter { $LiteralPath -eq $script:ConverterPath }
+            Convert-EvidenceTrace $out
+            $result = Get-Content "$out\conversion.json" -Raw | ConvertFrom-Json
+            $result.Status | Should Be 'MissingConverter'
+            $result.ConverterPath | Should Be $ConverterPath
+            Test-Path "$out\trace.etl" | Should Be $true
+        }
+        It 'records successful conversion with its exit code and output' {
+            'fixture ETL' | Set-Content "$out\trace.etl"
+            Convert-EvidenceTrace $out
+            $result = Get-Content "$out\conversion.json" -Raw | ConvertFrom-Json
+            $result.Status | Should Be 'Completed'
+            $result.ExitCode | Should Be 0
+            (Get-Content "$out\conversion-output.txt" -Raw) | Should Match 'fixture converter output'
+        }
+        It 'preserves native-style stderr and reports failure without changing trace-stop ownership' {
+            'fixture ETL' | Set-Content "$out\trace.etl"
+            $script:converterExit = 7; $script:converterWritesError = $true
+            { Convert-EvidenceTrace $out } | Should Not Throw
+            $result = Get-Content "$out\conversion.json" -Raw | ConvertFrom-Json
+            $result.Status | Should Be 'Failed'
+            $result.ExitCode | Should Be 7
+            (Get-Content "$out\conversion-output.txt" -Raw) | Should Match 'fixture converter stderr'
+            Test-Path "$out\trace.etl" | Should Be $true
+        }
+        It 'does not declare success with no output file or an unavailable exit code' {
+            'fixture ETL' | Set-Content "$out\trace.etl"
+            $script:converterCreatesFile = $false
+            Convert-EvidenceTrace $out
+            (Get-Content "$out\conversion.json" -Raw | ConvertFrom-Json).Status | Should Be 'Failed'
+            $script:converterCreatesFile = $true; $script:converterExit = $null
+            Convert-EvidenceTrace $out
+            (Get-Content "$out\conversion.json" -Raw | ConvertFrom-Json).Status | Should Be 'Failed'
+        }
     }
     It 'does not stop another trace while starting' {
         $start = $helperAst.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-Capture' }, $true)
