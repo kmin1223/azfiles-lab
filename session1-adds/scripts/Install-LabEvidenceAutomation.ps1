@@ -84,6 +84,59 @@ function Protect-EvidenceToolsRoot([string]$Path, [string]$Sid) {
     [LabEvidence.SafeReader]::ProtectDirectoryOnly($Path, $acl.GetSecurityDescriptorBinaryForm())
 }
 
+function Assert-EvidenceInstallOwner([string]$Path) {
+    Assert-EvidencePath $Path
+    $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin @('S-1-5-18','S-1-5-32-544',
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) {
+        throw "Unsafe existing lab-owned path owner: $Path"
+    }
+}
+
+function Open-EvidenceToolsRoot([string]$Path) {
+    if (-not ('LabEvidence.InstallDirectoryGuard' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace LabEvidence {
+ public static class InstallDirectoryGuard {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern SafeFileHandle CreateFile(string p,uint a,uint s,IntPtr sa,uint d,uint f,IntPtr t);
+  public static SafeFileHandle Open(string path) {
+   // Refuse existing write/delete handles and prevent new ones during root normalization.
+   var handle=CreateFile(path,0x80000000,1,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
+   if(handle.IsInvalid) {
+    int error=Marshal.GetLastWin32Error(); handle.Dispose();
+    throw new System.ComponentModel.Win32Exception(error);
+   }
+   return handle;
+  }
+ }
+}
+'@
+    }
+    [LabEvidence.InstallDirectoryGuard]::Open($Path)
+}
+
+function Format-EvidenceInstallFailure($Record, [string]$Step, [PSCredential]$Credential) {
+    $exception = $Record.Exception
+    while ($exception.InnerException) { $exception = $exception.InnerException }
+    $text = '[evidence-install] FAILED step={0}; line={1}; id={2}; type={3}; HRESULT={4}: {5}' -f `
+        $Step, $Record.InvocationInfo.ScriptLineNumber, $Record.FullyQualifiedErrorId,
+        $exception.GetType().Name, $exception.HResult, $exception.Message
+    $secret = $null
+    try {
+        if ($Credential) {
+            $secret = $Credential.GetNetworkCredential().Password
+            if ($secret) { $text = $text.Replace($secret, '[REDACTED]') }
+        }
+        $text = $text -replace '[\x00-\x1f\x7f]', ' '
+        if ($text.Length -gt 1000) { $text = $text.Substring(0, 1000) + ' [truncated]' }
+        $text
+    } finally { $secret = $null }
+}
+
 function Get-TrustedEvidenceConverter([string]$Path = 'C:\LabTools\etl2pcapng.exe') {
     try {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -109,15 +162,23 @@ function Publish-EvidenceDispatcher([string]$Source, [string]$Sid, [string]$Tool
     Assert-EvidencePath $ToolsRoot
     Assert-EvidenceAcl (Split-Path $ToolsRoot -Parent) -ParentDirectory
     if (-not (Test-Path -LiteralPath $ToolsRoot)) { New-EvidenceDirectory $ToolsRoot $Sid }
-    Assert-EvidenceAcl $ToolsRoot
+    Assert-EvidenceInstallOwner $ToolsRoot
+    $guard = Open-EvidenceToolsRoot $ToolsRoot
+    try {
+    Assert-EvidenceInstallOwner $ToolsRoot
     $destination = Join-Path $ToolsRoot 'Get-KerberosEvidence.ps1'
     Assert-EvidencePath $destination
     if (Test-Path -LiteralPath $destination) {
-        Assert-EvidenceAcl $destination
-        [LabEvidence.SafeReader]::Read($destination, 2097152) | Out-Null
+        Assert-EvidenceInstallOwner $destination
+        [LabEvidence.SafeReader]::AssertFile($destination)
     }
     Protect-EvidenceToolsRoot $ToolsRoot $Sid
     Assert-EvidenceAcl $ToolsRoot
+    Assert-EvidencePath $destination
+    if (Test-Path -LiteralPath $destination) {
+        Assert-EvidenceInstallOwner $destination
+        [LabEvidence.SafeReader]::AssertFile($destination)
+    }
     if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }
     [IO.File]::WriteAllText($destination, $content, (New-Object Text.UTF8Encoding($true)))
     $fileAcl = New-Object Security.AccessControl.FileSecurity
@@ -130,9 +191,13 @@ function Publish-EvidenceDispatcher([string]$Source, [string]$Sid, [string]$Tool
     }
     Set-Acl -LiteralPath $destination -AclObject $fileAcl
     Assert-EvidenceAcl $destination
+    } finally { $guard.Dispose() }
 }
 
 function Install-EvidenceAutomation {
+    $step = 'validate-sources'
+    try {
+    Write-Host "[evidence-install] step=$step"
     $runtimeSource = Join-Path $SourceDirectory 'Invoke-LabEvidenceAutomation.ps1'
     $collectorSource = Get-EvidenceCollectorSource $SourceDirectory
     # Bootstrap validation must precede executing the runtime's validation helpers.
@@ -158,14 +223,17 @@ function Install-EvidenceAutomation {
             $path = Split-Path $path -Parent
         }
     }
+    $step = 'load-protected-runtime'; Write-Host "[evidence-install] step=$step"
     . $runtimeSource -Mode Library
     $identity = Get-EvidenceIdentity
     if (-not $identity.Admin) { throw 'Installation requires an administrator.' }
+    $step = 'validate-lab-account'; Write-Host "[evidence-install] step=$step"
     $account = Resolve-EvidenceAccount $LabCredential
     $config = [ordered]@{ StorageAccount = $StorageAccount; Share = $Share; DomainController = $DomainController
         ExpectedUserSid = $account.Sid; Account = $account.Account
         TaskFolder = '\AzureFilesLabEvidence'; BrokerTask = 'Broker'; WorkerTask = 'Worker' }
     Assert-EvidenceConfig $config
+    $step = 'inspect-scheduled-tasks'; Write-Host "[evidence-install] step=$step"
     $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
     $baseSddl = 'O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)'
     $brokerSddl = $baseSddl + "(A;;GRGX;;;$($account.Sid))"
@@ -187,6 +255,7 @@ function Install-EvidenceAutomation {
             }
         }
     }
+    $step = 'secure-install-roots'; Write-Host "[evidence-install] step=$step"
     foreach ($root in @($InstallRoot, $RuntimeRoot)) {
         Assert-EvidencePath $root
         Assert-EvidenceAcl (Split-Path $root -Parent) -ParentDirectory
@@ -205,6 +274,7 @@ function Install-EvidenceAutomation {
     }
     $installLock = [IO.File]::Open((Join-Path $RuntimeRoot 'broker.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     try {
+    $step = 'install-protected-files'; Write-Host "[evidence-install] step=$step"
     if ((Test-Path -LiteralPath $statePath) -and (Read-EvidenceJson $statePath).TraceOwned) {
         throw 'Unresolved capture ownership must be recovered before reinstalling.'
     }
@@ -228,19 +298,24 @@ function Install-EvidenceAutomation {
     $configPath = Join-Path $InstallRoot 'config.json'
     if (Test-Path -LiteralPath $configPath) { Assert-EvidenceAcl $configPath; Remove-Item -LiteralPath $configPath -Force }
     $config | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
+    $step = 'register-task-folder'; Write-Host "[evidence-install] step=$step"
     if (-not $folder) { $folder = $scheduler.GetFolder('\').CreateFolder($config.TaskFolder, $brokerSddl) }
     $folder.SetSecurityDescriptor($brokerSddl, 0)
     $broker = New-EvidenceTaskDefinition $scheduler 'Broker' 'SYSTEM'
     $worker = New-EvidenceTaskDefinition $scheduler 'Worker' $LabCredential.UserName
     # 0x10 prevents Scheduler from adding an execute ACE for the worker principal.
+    $step = 'register-worker'; Write-Host "[evidence-install] step=$step"
     $workerTask = $folder.RegisterTaskDefinition('Worker', $worker, 6 -bor 0x10,
         $LabCredential.UserName, $LabCredential.GetNetworkCredential().Password, 1, $workerSddl)
     $workerTask.SetSecurityDescriptor($workerSddl, 0x10)
+    $step = 'register-broker'; Write-Host "[evidence-install] step=$step"
     $brokerTask = $folder.RegisterTaskDefinition('Broker', $broker, 6 -bor 0x10, 'SYSTEM', $null, 5, $brokerSddl)
     $brokerTask.SetSecurityDescriptor($brokerSddl, 0x10)
+    $step = 'publish-dispatcher'; Write-Host "[evidence-install] step=$step"
     Publish-EvidenceDispatcher (Join-Path $InstallRoot 'Get-KerberosEvidence.ps1') $account.Sid
     Write-Output 'AUTO_EVIDENCE_READY'
     } finally { $installLock.Dispose() }
+    } catch { throw (Format-EvidenceInstallFailure $_ $step $LabCredential) }
 }
 
 if (-not $Library) { Install-EvidenceAutomation }

@@ -1,22 +1,18 @@
 <#
 .SYNOPSIS
-Install or refresh protected evidence tasks on an existing lab client.
+Install or refresh evidence automation with one Azure VM Run Command.
 .DESCRIPTION
-Uses the existing Az login; never connects automatically. An omitted credential
-is prompted once. Only an ephemeral RSA public key and OAEP-SHA256 ciphertext
-cross Azure Run Command; the password is never an argument or staged file.
-Trust depends on the authenticated Azure control plane and the VM administrators.
-The VM decrypts in memory and passes a PSCredential to the installer in process.
-Managed password strings cannot be guaranteed zeroed; byte buffers are cleared.
+For this disposable lab only. Uses the existing Az login and prompts once for
+labuser1's credential if none was supplied. The password is an ordinary Run
+Command parameter: it can be visible in Azure/VM diagnostics or process arguments.
+Use a unique lab password, never a production credential. Do not screen-share setup.
+No password is embedded in repository source or intentionally written to the
+installer log. Windows Task Scheduler stores the fixed worker credential.
 
-Cleanup runs on success and failure. A disconnected client can leave a bootstrap
-directory and certificate. The one-hour certificate expiry does NOT delete its
-private key. If cleanup cannot complete, an administrator must inspect only the
-reported GUID directory under C:\Program Files\AzureFilesLabEvidenceBootstrap
-and the LocalMachine\My certificate whose subject and friendly name both equal
-AzureFilesLabEvidenceBootstrap-<GUID> (subject prefixed CN=), then remove those
-three staged scripts, that directory, and that certificate WITH its private key.
-Never broadly purge certificates, directories, Run Commands, or existing tasks.
+Stages trusted repository scripts in an administrator-only, run-specific folder
+under C:\Program Files\AzureFilesLabEvidenceBootstrap. Keeps the scripts and
+install.log for troubleshooting. No certificates, encryption handshake, extra
+cleanup Run Commands, redeployment, or storage-key rotation are performed.
 #>
 [CmdletBinding()]
 param(
@@ -65,253 +61,160 @@ function Get-EvidenceHelperSource {
 
 function ConvertTo-EvidenceSourceBase64 {
     param([string]$Source)
-    # A BOM is needed for non-ASCII script text read by Windows PowerShell 5.1.
     $encoding = New-Object System.Text.UTF8Encoding($true)
     return [Convert]::ToBase64String([byte[]]($encoding.GetPreamble() + $encoding.GetBytes($Source)))
 }
 
+function Remove-EvidencePassword {
+    param([string]$Text, [string]$Password)
+    if ([string]::IsNullOrEmpty($Password)) { return $Text }
+    $escaped = ConvertTo-Json -InputObject $Password -Compress
+    $Text.Replace($Password, '[REDACTED]').Replace($escaped.Substring(1, $escaped.Length - 2), '[REDACTED]')
+}
+
 function Read-EvidenceBootstrapMarker {
-    param($Result, [string]$Marker, [string]$RunId)
-    $messages = @()
-    foreach ($entry in @($Result.Value)) {
-        if ($entry.Code -match '(?i)failed|error') { throw 'Remote bootstrap reported an unsuccessful status.' }
-        if ($entry.Code -match 'StdErr' -and -not [string]::IsNullOrWhiteSpace([string]$entry.Message)) {
-            throw 'Remote bootstrap reported an error.'
-        }
-        if ($entry.Code -match 'StdOut') { $messages += [string]$entry.Message }
+    param($Result, [string]$RunId)
+    $messages = @($Result.Value | ForEach-Object { [string]$_.Message }) -join "`n"
+    $failures = @([regex]::Matches($messages, '(?m)^AUTO_EVIDENCE_FAILED:([^\r\n]+)\r?$'))
+    if ($failures.Count -eq 1) {
+        $failure = $failures[0].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop
+        if ($failure.RunId -cne $RunId) { throw 'Remote failure record belongs to another run.' }
+        throw "Stage '$($failure.Stage)': $($failure.Message) [$($failure.Script):$($failure.Line); $($failure.ErrorId)]. VM log: $($failure.LogPath)"
     }
-    $matches = @([regex]::Matches(($messages -join "`n"), '(?m)^' + [regex]::Escape($Marker) + '([^\r\n]+)\r?$'))
-    if ($matches.Count -ne 1) { throw 'Remote bootstrap did not return exactly one expected marker.' }
-    try { $payload = $matches[0].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop }
-    catch { throw 'Remote bootstrap marker is invalid.' }
-    if ($payload.RunId -cne $RunId) { throw 'Remote bootstrap marker belongs to another run.' }
+    foreach ($entry in @($Result.Value)) {
+        if ($entry.Code -match '(?i)failed|error' -or
+            ($entry.Code -match 'StdErr' -and -not [string]::IsNullOrWhiteSpace([string]$entry.Message))) {
+            throw "Remote installation failed: $messages"
+        }
+    }
+    $stdout = @($Result.Value | Where-Object Code -match 'StdOut' | ForEach-Object Message) -join "`n"
+    $matches = @([regex]::Matches($stdout, '(?m)^AUTO_EVIDENCE_READY:([^\r\n]+)\r?$'))
+    if ($failures.Count -or $matches.Count -ne 1) {
+        throw "Remote installation did not return one readiness record. Output: $messages"
+    }
+    $payload = $matches[0].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop
+    if ($payload.RunId -cne $RunId) { throw 'Remote readiness record belongs to another run.' }
     return $payload
 }
 
-function Protect-EvidenceBootstrapPassword {
-    param([PSCredential]$Credential, $PublicKey)
-    $rsa = $null; $bytes = $null; $cipher = $null
-    try {
-        $parameters = New-Object System.Security.Cryptography.RSAParameters
-        $parameters.Modulus = [Convert]::FromBase64String($PublicKey.Modulus)
-        $parameters.Exponent = [Convert]::FromBase64String($PublicKey.Exponent)
-        if ($parameters.Modulus.Length -ne 512 -or
-            [Convert]::ToBase64String($parameters.Exponent) -cne 'AQAB' -or
-            ($parameters.Modulus[0] -band 128) -eq 0) {
-            throw 'Unexpected bootstrap RSA key.'
-        }
-        # .NET Framework RSA.Create() returns CSP, which cannot do OAEP-SHA256.
-        $rsa = if ($PSVersionTable.PSVersion.Major -le 5) {
-            New-Object Security.Cryptography.RSACng
-        } else { [Security.Cryptography.RSA]::Create() }
-        $rsa.ImportParameters($parameters)
-        $bytes = [Text.Encoding]::UTF8.GetBytes($Credential.GetNetworkCredential().Password)
-        if ($bytes.Length -gt 446) { throw 'Password exceeds the 446-byte RSA bootstrap limit; use a shorter lab password.' }
-        $cipher = $rsa.Encrypt($bytes, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
-        return [Convert]::ToBase64String($cipher)
-    } finally {
-        if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
-        if ($cipher) { [Array]::Clear($cipher, 0, $cipher.Length) }
-        if ($rsa) { $rsa.Dispose() }
+function New-EvidenceBootstrapScript {
+    param([string]$RunId, [hashtable]$Sources, $Config)
+    if ($RunId -cnotmatch '^[a-f0-9]{32}$') { throw 'Invalid bootstrap run ID.' }
+    $expected = @('Install-LabEvidenceAutomation.ps1', 'Invoke-LabEvidenceAutomation.ps1', 'Get-KerberosEvidence.ps1')
+    if ($Sources.Count -ne 3 -or @($Sources.Keys | Where-Object { $_ -cnotin $expected }).Count) {
+        throw 'Unexpected bootstrap sources.'
     }
-}
-
-function Get-EvidenceBootstrapRemoteCommon {
-    # This is source text only. It is never run on the management host.
+    Assert-EvidenceBootstrapConfig $Config.StorageAccount $Config.Share $Config.DomainController
+    if ([string]::IsNullOrWhiteSpace($Config.UserName)) { throw 'A credential username is required.' }
+    $encodedSources = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Sources | ConvertTo-Json -Compress)))
+    $encodedConfig = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Config | ConvertTo-Json -Compress)))
     return @'
+param([Parameter(Mandatory)][string]$LabPassword)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $root = 'C:\Program Files\AzureFilesLabEvidenceBootstrap'
 $runId = '__RUN_ID__'
 $directory = Join-Path $root $runId
-$certificateName = 'AzureFilesLabEvidenceBootstrap-' + $runId
+$logPath = $null
+$stage = 'Preparing staging directory'
 $sourceNames = @('Install-LabEvidenceAutomation.ps1', 'Invoke-LabEvidenceAutomation.ps1', 'Get-KerberosEvidence.ps1')
-function Assert-SafeDirectory {
-    param([string]$Path, [switch]$Private)
+
+function Remove-InstallPassword([string]$Text) {
+    if ([string]::IsNullOrEmpty($LabPassword)) { return $Text }
+    $escaped = ConvertTo-Json -InputObject $LabPassword -Compress
+    $Text.Replace($LabPassword, '[REDACTED]').Replace($escaped.Substring(1, $escaped.Length - 2), '[REDACTED]')
+}
+function Write-InstallLog([string]$Text) {
+    if ($logPath) { (Remove-InstallPassword $Text) | Out-File -LiteralPath $logPath -Append -Encoding UTF8 }
+}
+function Assert-SafeDirectory([string]$Path, [switch]$Private) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unsafe bootstrap directory.' }
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Unsafe directory: $Path" }
     $acl = Get-Acl -LiteralPath $Path
-    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    $trusted = @('S-1-5-18', 'S-1-5-32-544')
+    $trusted = @('S-1-5-18','S-1-5-32-544')
     if (-not $Private) { $trusted += 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' }
-    if ($owner -notin $trusted) { throw 'Unsafe directory owner.' }
-    if ($Private -and -not $acl.AreAccessRulesProtected) { throw 'Bootstrap ACL must be protected.' }
-    # Creating sibling folders alone (the normal C:\ ACL) cannot replace these
-    # existing, administrator-owned components.
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) { throw "Unsafe directory owner: $Path" }
+    if ($Private -and -not $acl.AreAccessRulesProtected) { throw "Staging ACL must be protected: $Path" }
     $writeMask = [Security.AccessControl.FileSystemRights]'WriteData,WriteAttributes,WriteExtendedAttributes,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership'
-    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-        if ($rule.AccessControlType -ne 'Allow') { continue }
-        if ($rule.IdentityReference.Value -in @('S-1-5-18', 'S-1-5-32-544')) { continue }
+    foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted) { continue }
         if (-not $Private -and ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
-        if ($Private -or ($rule.FileSystemRights -band $writeMask)) {
-            if (-not $Private -and $rule.IdentityReference.Value -eq 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') { continue }
-            throw 'Unsafe directory permissions.'
-        }
+        if ($Private -or ($rule.FileSystemRights -band $writeMask)) { throw "Unsafe directory permissions: $Path" }
     }
 }
-function Assert-SafeParents {
+function New-PrivateDirectory([string]$Path) {
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true,$false)
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]$sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
+    }
+    [IO.Directory]::CreateDirectory($Path,$acl) | Out-Null
+    Assert-SafeDirectory $Path -Private
+}
+function Invoke-StagedEvidenceInstall($Config, [string]$Directory) {
+    $securePassword = ConvertTo-SecureString $LabPassword -AsPlainText -Force
+    $credential = New-Object Management.Automation.PSCredential($Config.UserName,$securePassword)
+    $ready = $false
+    try {
+        & (Join-Path $Directory 'Install-LabEvidenceAutomation.ps1') `
+            -StorageAccount $Config.StorageAccount -Share $Config.Share -DomainController $Config.DomainController `
+            -LabCredential $credential -SourceDirectory $Directory *>&1 | ForEach-Object {
+                if ($_ -is [Management.Automation.ErrorRecord]) { throw $_ }
+                Write-InstallLog ([string]$_)
+                if ([string]$_ -match '^AUTO_EVIDENCE_READY(?:\s|$)') { $ready = $true }
+            }
+        if (-not $ready) { throw 'Installer finished without AUTO_EVIDENCE_READY.' }
+    } finally {
+        $credential = $null
+        $securePassword.Dispose()
+    }
+}
+try {
     Assert-SafeDirectory 'C:\'
     Assert-SafeDirectory 'C:\Program Files'
     if (Test-Path -LiteralPath $root) { Assert-SafeDirectory $root -Private }
-}
-function New-PrivateDirectory {
-    param([string]$Path)
-    $acl = New-Object Security.AccessControl.DirectorySecurity
-    $acl.SetAccessRuleProtection($true, $false)
-    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
-    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
-        $identity = New-Object Security.Principal.SecurityIdentifier($sid)
-        $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $acl.AddAccessRule($rule)
-    }
-    # Framework overload applies the protected ACL as the directory is created.
-    $null = [IO.Directory]::CreateDirectory($Path, $acl)
-    Assert-SafeDirectory $Path -Private
-}
-function Remove-BootstrapArtifacts {
-    param([string]$Thumbprint)
-    $failed = $false
-    try {
-        Assert-SafeParents
-        if (Test-Path -LiteralPath $directory) {
-            Assert-SafeDirectory $directory -Private
-            $entries = @(Get-ChildItem -LiteralPath $directory -Force)
-            foreach ($item in $entries) {
-                if ($item.Name -notin $sourceNames -or $item.PSIsContainer -or
-                    ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unexpected bootstrap file.' }
-            }
-            foreach ($name in $sourceNames) {
-                $path = Join-Path $directory $name
-                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
-            }
-            # Non-recursive: never delete unexpected contents or follow directories.
-            [IO.Directory]::Delete($directory, $false)
-        }
-    } catch { $failed = $true }
-    try {
-        $certificates = @(Get-ChildItem Cert:\LocalMachine\My | Where-Object {
-            $_.Subject -ceq ('CN=' + $certificateName) -and $_.FriendlyName -ceq $certificateName -and
-            (-not $Thumbprint -or $_.Thumbprint -ceq $Thumbprint)
-        })
-        foreach ($certificate in $certificates) {
-            Remove-Item -LiteralPath ('Cert:\LocalMachine\My\' + $certificate.Thumbprint) -DeleteKey -Force -ErrorAction Stop
-        }
-    } catch { $failed = $true }
-    if ($failed) { throw 'Bootstrap cleanup incomplete; inspect only this run directory and tagged certificate.' }
-}
-'@
-}
-
-function New-EvidenceBootstrapScript {
-    param(
-        [ValidateSet('Stage', 'Install', 'Cleanup')] [string]$Phase,
-        [string]$RunId, [hashtable]$Sources, $Config,
-        [string]$Thumbprint, [string]$Ciphertext
-    )
-    if ($RunId -cnotmatch '^[a-f0-9]{32}$') { throw 'Invalid bootstrap run ID.' }
-    if ($Thumbprint -and $Thumbprint -cnotmatch '^[A-F0-9]{40}$') { throw 'Invalid certificate thumbprint.' }
-    $common = (Get-EvidenceBootstrapRemoteCommon).Replace('__RUN_ID__', $RunId)
-    if ($Phase -eq 'Cleanup') {
-        return $common + "`n" + @'
-try {
-    Remove-BootstrapArtifacts '__THUMBPRINT__'
-    Write-Output ('BOOTSTRAP_CLEAN:' + (@{RunId=$runId} | ConvertTo-Json -Compress))
-} catch { throw 'Bootstrap cleanup failed.' }
-'@.Replace('__THUMBPRINT__', $Thumbprint)
-    }
-    if ($Phase -eq 'Stage') {
-        $expected = @('Install-LabEvidenceAutomation.ps1', 'Invoke-LabEvidenceAutomation.ps1', 'Get-KerberosEvidence.ps1')
-        if ($Sources.Count -ne 3 -or @($Sources.Keys | Where-Object { $_ -notin $expected }).Count) { throw 'Unexpected bootstrap sources.' }
-        $encodedSources = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Sources | ConvertTo-Json -Compress)))
-        return $common + "`n" + @'
-$certificate = $null
-$ready = $false
-try {
-    Assert-SafeParents
-    if (-not (Test-Path -LiteralPath $root)) { New-PrivateDirectory $root }
-    if (Test-Path -LiteralPath $directory) { throw 'Bootstrap run directory already exists.' }
+    else { New-PrivateDirectory $root }
+    if (Test-Path -LiteralPath $directory) { throw 'Run directory already exists.' }
     New-PrivateDirectory $directory
+    $logPath = Join-Path $directory 'install.log'
+    Write-InstallLog ("Run $runId started at " + [DateTime]::UtcNow.ToString('o'))
+    $stage = 'Staging repository scripts'
+    Write-InstallLog $stage
     $sources = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__SOURCES__')) | ConvertFrom-Json
     foreach ($name in $sourceNames) {
-        $path = Join-Path $directory $name
         $data = [Convert]::FromBase64String($sources.$name)
-        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $stream.Write($data, 0, $data.Length) } finally { $stream.Dispose() }
+        $stream = [IO.File]::Open((Join-Path $directory $name),'CreateNew','Write','None')
+        try { $stream.Write($data,0,$data.Length) } finally { $stream.Dispose() }
     }
-    $certificate = New-SelfSignedCertificate -Subject ('CN=' + $certificateName) -FriendlyName $certificateName `
-        -CertStoreLocation Cert:\LocalMachine\My -Provider 'Microsoft Software Key Storage Provider' `
-        -KeyAlgorithm RSA -KeyLength 4096 -KeyExportPolicy NonExportable -KeyUsage KeyEncipherment `
-        -Type Custom -TextExtension @('2.5.29.37={text}1.3.6.1.4.1.311.80.1') -NotAfter (Get-Date).AddHours(1)
-    $public = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($certificate)
-    try { $parameters = $public.ExportParameters($false) } finally { $public.Dispose() }
-    $marker = @{
-        RunId=$runId; Thumbprint=$certificate.Thumbprint
-        Modulus=[Convert]::ToBase64String($parameters.Modulus)
-        Exponent=[Convert]::ToBase64String($parameters.Exponent)
-    } | ConvertTo-Json -Compress
-    Write-Output ('BOOTSTRAP_PUBLIC:' + $marker)
-    $ready = $true
-} catch { throw 'Bootstrap staging failed.' }
-finally {
-    if ($certificate) { $certificate.Dispose() }
-    if (-not $ready) { Remove-BootstrapArtifacts '' }
-}
-'@.Replace('__SOURCES__', $encodedSources)
-    }
-    Assert-EvidenceBootstrapConfig $Config.StorageAccount $Config.Share $Config.DomainController
-    if (-not $Thumbprint) { throw 'An exact certificate thumbprint is required.' }
-    try { $cipherBytes = [Convert]::FromBase64String($Ciphertext) } catch { throw 'Invalid encrypted payload.' }
-    if ($cipherBytes.Length -ne 512 -or [Convert]::ToBase64String($cipherBytes) -cne $Ciphertext) { throw 'Invalid encrypted payload length or encoding.' }
-    if ([string]::IsNullOrWhiteSpace($Config.UserName)) { throw 'A credential username is required.' }
-    $encodedConfig = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Config | ConvertTo-Json -Compress)))
-    return $common + "`n" + @'
-$certificate = $null; $privateKey = $null; $passwordBytes = $null; $encryptedBytes = $null
-$securePassword = $null; $credential = $null; $passwordText = $null; $installed = $false
-try {
-    Assert-SafeParents
-    Assert-SafeDirectory $directory -Private
-    $entries = @(Get-ChildItem -LiteralPath $directory -Force)
-    if ($entries.Count -ne 3) { throw 'Unexpected bootstrap contents.' }
-    foreach ($item in $entries) {
-        if ($item.Name -notin $sourceNames -or $item.PSIsContainer -or
-            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unsafe bootstrap source.' }
-    }
-    $certificate = Get-Item -LiteralPath 'Cert:\LocalMachine\My\__THUMBPRINT__'
-    if ($certificate.Subject -cne ('CN=' + $certificateName) -or
-        $certificate.FriendlyName -cne $certificateName -or -not $certificate.HasPrivateKey -or
-        $certificate.NotAfter -le (Get-Date)) { throw 'Invalid bootstrap certificate.' }
-    $privateKey = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($certificate)
-    $encryptedBytes = [Convert]::FromBase64String('__CIPHERTEXT__')
-    $passwordBytes = $privateKey.Decrypt($encryptedBytes, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
-    $utf8 = New-Object Text.UTF8Encoding($false, $true)
-    $passwordText = $utf8.GetString($passwordBytes)
-    $securePassword = New-Object Security.SecureString
-    foreach ($character in $passwordText.ToCharArray()) { $securePassword.AppendChar($character) }
-    $securePassword.MakeReadOnly()
-    $passwordText = $null; $character = $null
     $config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CONFIG__')) | ConvertFrom-Json
-    $credential = New-Object Management.Automation.PSCredential($config.UserName, $securePassword)
-    # Capture all installer streams locally: never relay credential-bearing errors.
-    $output = @(& (Join-Path $directory 'Install-LabEvidenceAutomation.ps1') `
-        -StorageAccount $config.StorageAccount -Share $config.Share -DomainController $config.DomainController `
-        -LabCredential $credential -SourceDirectory $directory *>&1)
-    if (@($output | Where-Object { $_ -is [Management.Automation.ErrorRecord] }).Count -or
-        -not @($output | Where-Object { [string]$_ -match '^AUTO_EVIDENCE_READY(?:\s|$)' }).Count) {
-        throw 'Installer did not confirm readiness.'
+    $stage = 'Installing files and scheduled tasks'
+    Write-InstallLog $stage
+    Invoke-StagedEvidenceInstall $config $directory
+    Write-InstallLog 'Installation completed.'
+    Write-Output ('AUTO_EVIDENCE_READY:' + (@{RunId=$runId; LogPath=$logPath} | ConvertTo-Json -Compress))
+} catch {
+    $failure = $_
+    $message = Remove-InstallPassword $failure.Exception.Message
+    $record = [ordered]@{
+        RunId=$runId; Stage=$stage; Message=$message
+        Script=$(if ($failure.InvocationInfo.ScriptName) { Split-Path $failure.InvocationInfo.ScriptName -Leaf } else { '<RunCommand>' })
+        Line=$failure.InvocationInfo.ScriptLineNumber; ErrorId=(Remove-InstallPassword $failure.FullyQualifiedErrorId); LogPath=$logPath
     }
-    $installed = $true
-} catch { throw 'Bootstrap installation failed; remote credential details withheld.' }
-finally {
-    $output = $null; $credential = $null; $passwordText = $null
-    if ($passwordBytes) { [Array]::Clear($passwordBytes, 0, $passwordBytes.Length) }
-    if ($encryptedBytes) { [Array]::Clear($encryptedBytes, 0, $encryptedBytes.Length) }
-    if ($securePassword) { $securePassword.Dispose() }
-    if ($privateKey) { $privateKey.Dispose() }
-    if ($certificate) { $certificate.Dispose() }
-    Remove-BootstrapArtifacts '__THUMBPRINT__'
-}
-if ($installed) { Write-Output ('AUTO_EVIDENCE_READY:' + (@{RunId=$runId} | ConvertTo-Json -Compress)) }
-'@.Replace('__THUMBPRINT__', $Thumbprint).Replace('__CIPHERTEXT__', $Ciphertext).Replace('__CONFIG__', $encodedConfig)
+    try {
+        Write-InstallLog ($record | ConvertTo-Json)
+        Write-InstallLog $failure.ScriptStackTrace
+    } catch {
+        $record.Message += ' [Writing install.log also failed.]'
+    }
+    # Run Command returns only the output tail. Keep the failure record compact and last.
+    if ($record.Message.Length -gt 1200) { $record.Message = $record.Message.Substring(0,1200) + '... (see VM log)' }
+    if ($record.ErrorId.Length -gt 160) { $record.ErrorId = $record.ErrorId.Substring(0,160) }
+    Write-Output ('AUTO_EVIDENCE_FAILED:' + ($record | ConvertTo-Json -Compress))
+    exit 1
+} finally { $LabPassword = $null }
+'@.Replace('__RUN_ID__',$RunId).Replace('__SOURCES__',$encodedSources).Replace('__CONFIG__',$encodedConfig)
 }
 
 function Invoke-EvidenceAutomationBootstrap {
@@ -328,7 +231,7 @@ function Invoke-EvidenceAutomationBootstrap {
     if (-not $vm) { throw 'The requested lab client VM was not found.' }
     $accounts = @(Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction Stop | Where-Object {
         if ($StorageAccount) { $_.StorageAccountName -ceq $StorageAccount }
-        else { $_.StorageAccountName.StartsWith($Prefix, [StringComparison]::Ordinal) -and -not $_.StorageAccountName.StartsWith("${Prefix}ads", [StringComparison]::Ordinal) }
+        else { $_.StorageAccountName.StartsWith($Prefix,[StringComparison]::Ordinal) -and -not $_.StorageAccountName.StartsWith("${Prefix}ads",[StringComparison]::Ordinal) }
     })
     if ($accounts.Count -ne 1) { throw 'Specify StorageAccount: exactly one matching non-AD lab storage account is required.' }
     $account = $accounts[0]
@@ -343,49 +246,31 @@ function Invoke-EvidenceAutomationBootstrap {
     Assert-EvidenceBootstrapConfig $StorageAccount $Share $DomainController
     if (-not $LabCredential) {
         if ([string]::IsNullOrWhiteSpace([string]$ad.NetBiosDomainName)) { throw 'Supply LabCredential: the storage account has no NetBIOS domain metadata.' }
-        $LabCredential = Get-Credential -UserName ($ad.NetBiosDomainName + '\labuser1') -Message 'Lab evidence task identity (stored by Windows Task Scheduler)'
+        $LabCredential = Get-Credential -UserName ($ad.NetBiosDomainName + '\labuser1') -Message 'Disposable lab password (ordinary Azure Run Command parameter)'
         if (-not $LabCredential) { throw 'Lab credential entry was cancelled.' }
     }
     $sources = @{}
-    foreach ($name in @('Install-LabEvidenceAutomation.ps1', 'Invoke-LabEvidenceAutomation.ps1')) {
+    foreach ($name in @('Install-LabEvidenceAutomation.ps1','Invoke-LabEvidenceAutomation.ps1')) {
         $sources[$name] = ConvertTo-EvidenceSourceBase64 ([IO.File]::ReadAllText((Join-Path $SourceDirectory $name)))
     }
     $sources['Get-KerberosEvidence.ps1'] = ConvertTo-EvidenceSourceBase64 (Get-EvidenceHelperSource (Join-Path $SourceDirectory '07-install-tools.ps1'))
     $config = @{StorageAccount=$StorageAccount; Share=$Share; DomainController=$DomainController; UserName=$LabCredential.UserName}
     $runId = [guid]::NewGuid().ToString('N')
-    $thumbprint = ''
-    $started = $false
-    $complete = $false
-    $operation = 'staging'
+    $script = New-EvidenceBootstrapScript -RunId $runId -Sources $sources -Config $config
+    $parameters = @{LabPassword=$LabCredential.GetNetworkCredential().Password}
+    Write-Warning 'Lab-only setup: password is an ordinary Run Command parameter and may be visible in Azure/VM diagnostics. Do not share this setup screen.'
+    Write-Host "Installing evidence automation on $VMName (one Run Command; run $runId)."
     try {
-        $stage = New-EvidenceBootstrapScript -Phase Stage -RunId $runId -Sources $sources
-        $started = $true
-        $result = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName -CommandId 'RunPowerShellScript' -ScriptString $stage -ErrorAction Stop
-        $publicKey = Read-EvidenceBootstrapMarker $result 'BOOTSTRAP_PUBLIC:' $runId
-        if ($publicKey.Thumbprint -cnotmatch '^[A-F0-9]{40}$') { throw 'Invalid bootstrap certificate identity.' }
-        $thumbprint = $publicKey.Thumbprint
-        $operation = 'password encryption (maximum 446 UTF-8 bytes)'
-        $ciphertext = Protect-EvidenceBootstrapPassword $LabCredential $publicKey
-        $operation = 'installation'
-        $install = New-EvidenceBootstrapScript -Phase Install -RunId $runId -Config $config -Thumbprint $thumbprint -Ciphertext $ciphertext
-        $result = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName -CommandId 'RunPowerShellScript' -ScriptString $install -ErrorAction Stop
-        $null = Read-EvidenceBootstrapMarker $result 'AUTO_EVIDENCE_READY:' $runId
-        $complete = $true
-        Write-Output "AUTO_EVIDENCE_READY $VMName (bootstrap $runId)"
+        $result = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName `
+            -CommandId 'RunPowerShellScript' -ScriptString $script -Parameter $parameters -ErrorAction Stop
+        $ready = Read-EvidenceBootstrapMarker $result $runId
+        Write-Output "AUTO_EVIDENCE_READY $VMName; VM log: $($ready.LogPath)"
     } catch {
-        # Do not print Azure/installer ErrorRecords or bound credential arguments.
-        throw "Evidence bootstrap $operation failed (run $runId). Credential details withheld."
+        $detail = Remove-EvidencePassword $_.Exception.Message $parameters.LabPassword
+        throw "Evidence installation failed on $VMName (run $runId). $detail"
     } finally {
-        $ciphertext = $null; $install = $null; $LabCredential = $null
-        if ($started -and -not $complete) {
-            try {
-                $cleanup = New-EvidenceBootstrapScript -Phase Cleanup -RunId $runId -Thumbprint $thumbprint
-                $result = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName -CommandId 'RunPowerShellScript' -ScriptString $cleanup -ErrorAction Stop
-                $null = Read-EvidenceBootstrapMarker $result 'BOOTSTRAP_CLEAN:' $runId
-            } catch {
-                Write-Warning "Bootstrap cleanup unconfirmed for run $runId. Inspect its exact protected directory and tagged LocalMachine certificate; expiry does not delete the private key. See this script's cleanup guidance."
-            }
-        }
+        $parameters.Clear()
+        $LabCredential = $null
     }
 }
 

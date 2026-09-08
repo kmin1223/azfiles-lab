@@ -31,6 +31,31 @@ New `deploy.ps1` runs pass the existing deployment credential in memory, so no
 second setup prompt is needed. If the password changes later, rerun this
 update command with the new credential.
 
+### Installation failures
+
+The update uses **one VM Run Command**. It does not need an RSA certificate or
+a separate password-encryption exchange. Do not redeploy the resource group
+just because this post-deployment step failed.
+
+Failures report the stage, actual error message, script/line, error ID, and a
+VM-local log path. Staged scripts and `install.log` remain in the run-specific
+administrator-only folder:
+
+```text
+C:\Program Files\AzureFilesLabEvidenceBootstrap\<run-id>\install.log
+```
+
+An error before that directory is created is returned directly without a log
+path. An Azure transport interruption might also prevent a structured response.
+Only a matching readiness record counts as completed installation; ARM request
+success alone does not.
+
+The older `Credential details withheld` message did not identify the actual
+failure. After updating the repository, rerun only the update command above.
+The installer repairs inherited write permissions on its known LabTools root
+when safe to do so, publishes the trusted helper, and preserves existing
+evidence subfolders. It still refuses unsafe ownership and linked paths.
+
 ## What is isolated
 
 A protected SYSTEM task starts the machine-wide network trace. A separate
@@ -109,13 +134,20 @@ rights. Administrators/SYSTEM still control this machine and its stored task
 credentials; this is a dedicated lab convenience, not a production credential
 vault or an arbitrary-user impersonation service.
 
-The setup wrapper stages trusted repository sources using Azure VM Run Command
-and encrypts the password with a temporary VM-local RSA public key before
-transport. Only ciphertext crosses the new Run Command script/parameter
-boundary; the VM decrypts it in memory and registers the task in-process.
-No new plaintext password file or process-command-line argument is created.
-The temporary certificate and staging directory are removed during cleanup;
-an interrupted transport can require the explicitly reported cleanup.
+**Disposable lab only:** the setup wrapper passes the password as an ordinary
+Azure VM Run Command parameter, like the lab's other deployment steps. Azure
+control-plane transport uses HTTPS, but the parameter is **not a secret
+parameter**: it may appear in Azure/VM diagnostics or process arguments.
+Use a unique lab password, never a production credential, and do not share the
+setup screen.
 
-This does not change the lab deployment's existing password/report handling.
-Treat deployment logs, existing `lab-info` files, and all evidence as sensitive.
+The VM builds a PSCredential and registers the task in-process. The wrapper does
+not embed the password in repository scripts or intentionally save it in
+`install.log`; matching password text is redacted from its diagnostic output.
+This is not a guarantee that Azure or the VM agent will redact the parameter.
+There is no new certificate or credential file to manage.
+
+Existing deployment logs and `lab-info` files retain their previous password
+handling. Treat them and all evidence as sensitive. Old RSA-bootstrap artifacts
+are not broadly deleted by this update; only inspect/remove a confirmed old
+run's artifacts if cleanup was previously interrupted.

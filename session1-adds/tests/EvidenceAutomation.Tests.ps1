@@ -151,6 +151,7 @@ Describe 'Trusted staged collector and dispatcher publication' {
         $script:helper = Join-Path $stage 'Get-KerberosEvidence.ps1'
         "'updated dispatcher'" | Set-Content -LiteralPath $helper
         Mock Assert-EvidenceAcl {}
+        Mock Assert-EvidenceInstallOwner {}
         Mock Protect-EvidenceToolsRoot {}
         Mock Set-Acl {}
     }
@@ -181,6 +182,30 @@ Describe 'Trusted staged collector and dispatcher publication' {
         }
         $runtimeAst.Extent.Text | Should Match 'SetFileSecurity\(path,0x80000004u,descriptor\)'
     }
+    It 'normalizes inherited root permissions before requiring a protected root ACL' {
+        $script:rootProtected = $false
+        $destination = Join-Path $tools 'Get-KerberosEvidence.ps1'
+        "'mutable old dispatcher, never executed'" | Set-Content -LiteralPath $destination
+        Mock Assert-EvidenceAcl {
+            param($Path)
+            if ($Path -eq $tools -and -not $script:rootProtected) { throw 'fixture inherited Users Modify' }
+        }
+        Mock Protect-EvidenceToolsRoot { $script:rootProtected = $true }
+        { Publish-EvidenceDispatcher $helper 'S-1-5-21-1-2-3-1100' $tools } | Should Not Throw
+        (Get-Content -LiteralPath $destination -Raw) | Should Match 'updated dispatcher'
+        Assert-MockCalled Assert-EvidenceInstallOwner -Scope It -ParameterFilter { $Path -eq $tools }
+        $publish = $installerAst.Find({ param($n)
+            $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Publish-EvidenceDispatcher'
+        },$true).Extent.Text
+        $publish | Should Not Match '::Read\(\$destination'
+        $publish.IndexOf('Protect-EvidenceToolsRoot') | Should BeLessThan $publish.IndexOf('Assert-EvidenceAcl $ToolsRoot')
+    }
+    It 'still refuses untrusted owners before normalizing inherited permissions' {
+        Mock Assert-EvidenceInstallOwner { throw 'fixture untrusted owner' }
+        { Publish-EvidenceDispatcher $helper 'S-1-5-21-1-2-3-1100' $tools } | Should Throw
+        Assert-MockCalled Protect-EvidenceToolsRoot -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-Acl -Times 0 -Exactly -Scope It
+    }
     It 'rejects an existing hard-linked dispatcher before changing the root or file' {
         $original = Join-Path $TestDrive 'other-helper.ps1'
         "'old helper'" | Set-Content -LiteralPath $original
@@ -210,6 +235,81 @@ Describe 'Trusted staged collector and dispatcher publication' {
         (Get-TrustedEvidenceConverter $converter) | Should Be $converter
         New-Item -ItemType HardLink -Path (Join-Path $stage 'converter-alias.exe') -Target $converter | Out-Null
         @(Get-TrustedEvidenceConverter $converter).Count | Should Be 0
+    }
+}
+
+Describe 'Bounded installer failure diagnostics' {
+    It 'includes stage, numeric source line and error ID without exposing the credential' {
+        $secret = 'fixture-password-do-not-print'
+        $credential = [pscredential]::new('CONTOSO\labuser1', (ConvertTo-SecureString $secret -AsPlainText -Force))
+        try { throw "fixture registration failure: $secret" } catch {
+            $record = $_
+            $message = Format-EvidenceInstallFailure $record 'register-worker' $credential
+        }
+        $message | Should Match 'FAILED step=register-worker; line=\d+; id='
+        $message | Should Match '\[REDACTED\]'
+        $message | Should Not Match $secret
+        $credential.GetNetworkCredential().Password | Should Be $secret
+        $installerAst.Extent.Text | Should Match 'catch \{ throw \(Format-EvidenceInstallFailure \$_ \$step \$LabCredential\) \}'
+    }
+    It 'bounds diagnostics and strips control characters without printing invocation source' {
+        try { throw ("fixture`r`n" + ('x' * 2000)) } catch {
+            $message = Format-EvidenceInstallFailure $_ 'publish-dispatcher' $null
+        }
+        $message.Length | Should BeLessThan 1020
+        $message | Should Not Match '[\r\n]'
+        $message | Should Match '\[truncated\]$'
+        $formatter = $installerAst.Find({ param($n)
+            $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Format-EvidenceInstallFailure'
+        },$true).Extent.Text
+        $formatter | Should Not Match 'PositionMessage|InvocationInfo.Line'
+    }
+}
+
+Describe 'Isolated inherited root ACL normalization' {
+    It 'changes only the fixture root DACL while a real directory guard is held' {
+        $root = Join-Path $TestDrive 'native-acl-root'
+        New-Item -ItemType Directory -Path $root | Out-Null
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $ownerSid = $identity.User
+        $identity.Dispose()
+        $fixtureAcl = New-Object Security.AccessControl.DirectorySecurity
+        $fixtureAcl.SetAccessRuleProtection($true, $false)
+        $fixtureAcl.SetOwner($ownerSid)
+        foreach ($entry in @(@($ownerSid.Value,'FullControl'), @('S-1-5-18','FullControl'),
+                @('S-1-5-32-544','FullControl'), @('S-1-5-32-545','Modify'))) {
+            $fixtureAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                [Security.Principal.SecurityIdentifier]$entry[0], $entry[1],
+                'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        }
+        $guard = $null
+        try {
+            Set-Acl -LiteralPath $root -AclObject $fixtureAcl -ErrorAction Stop
+            $evidence = Join-Path $root 'existing-evidence'
+            New-Item -ItemType Directory -Path $evidence | Out-Null
+            $artifact = Join-Path $evidence 'trace.txt'
+            'existing evidence' | Set-Content -LiteralPath $artifact
+            $evidenceAcl = (Get-Acl -LiteralPath $evidence).Sddl
+            $artifactAcl = (Get-Acl -LiteralPath $artifact).Sddl
+            Initialize-EvidenceNativeReader
+            $guard = Open-EvidenceToolsRoot $root
+            Protect-EvidenceToolsRoot $root 'S-1-5-21-1-2-3-1100'
+            $normalized = Get-Acl -LiteralPath $root
+            $normalized.AreAccessRulesProtected | Should Be $true
+            $users = @($normalized.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) |
+                Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' })
+            $users.Count | Should Be 1
+            ($users[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) | Should Be 0
+            ($users[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) |
+                Should Be ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+            (Get-Acl -LiteralPath $evidence).Sddl | Should Be $evidenceAcl
+            (Get-Acl -LiteralPath $artifact).Sddl | Should Be $artifactAcl
+            (Get-Content -LiteralPath $artifact -Raw).Trim() | Should Be 'existing evidence'
+        } finally {
+            if ($guard) { $guard.Dispose() }
+            # DACL-only restoration needs no SACL/owner privilege under a non-admin test runner.
+            [LabEvidence.SafeReader]::ProtectDirectoryOnly($root, $fixtureAcl.GetSecurityDescriptorBinaryForm())
+        }
     }
 }
 
