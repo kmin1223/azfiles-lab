@@ -23,20 +23,12 @@ function Grant-RdpToDomainUsers {
 }
 
 function Grant-LocalAdmin {
-    # The lab users must be local admins ON THE CLIENT - and this is about
-    # correctness, not convenience.
-    #
-    # Several lab steps need elevation (netsh trace in the evidence collector,
-    # Set-SmbClientConfiguration, restarting LanmanWorkstation). If the lab user
-    # is NOT a local admin, UAC asks for labadmin's credentials, and the elevated
-    # process then runs in labadmin's OWN logon session - with its own Kerberos
-    # ticket cache. The evidence collector would purge labadmin's tickets, mount
-    # as labadmin and report labadmin's klist: the wrong user's evidence, quietly.
-    #
-    # As a local admin the user elevates with a plain consent click, keeping the
-    # same logon session and the same ticket cache. (It also means nobody has to
-    # hand-type a generated password into the UAC secure desktop, which blocks
-    # clipboard paste over RDP.)
+    # Keep local admin membership for manual lab commands: with the default
+    # UAC policy, elevation needs consent rather than another password.
+    # This does NOT guarantee the same LUID, ticket cache or SMB connections
+    # between normal and elevated windows. Manual reproduction stays in the
+    # affected user's normal window; the automatic worker uses a fresh,
+    # non-elevated batch token and SYSTEM performs the capture.
     #
     # This grants nothing on the file share: Azure Files authorises from the
     # Kerberos PAC (domain groups), which local group membership never enters.

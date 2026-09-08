@@ -14,7 +14,7 @@ function Resolve-EvidenceAccount([PSCredential]$Credential) {
         [Security.Principal.SecurityIdentifier])
     $account = $sid.Translate([Security.Principal.NTAccount]).Value
     if ($sid.Value -notmatch '^S-1-5-21-\d+-\d+-\d+-\d{4,}$' -or
-        $account -notmatch '^[^\\/@\s]+\\labuser1$') { throw 'Supply the fixed non-administrator labuser1 account.' }
+        $account -notmatch '^[^\\/@\s]+\\labuser1$') { throw 'Supply the fixed domain labuser1 account.' }
     Add-Type -AssemblyName System.DirectoryServices.AccountManagement
     $domain = $account.Split('\')[0]
     $context = New-Object DirectoryServices.AccountManagement.PrincipalContext('Domain', $domain)
@@ -24,14 +24,11 @@ function Resolve-EvidenceAccount([PSCredential]$Credential) {
             $context, [DirectoryServices.AccountManagement.IdentityType]::Sid, $sid.Value)
         if (-not $user) { throw 'Cannot verify the supplied domain user.' }
         $groups = @($user.GetAuthorizationGroups() | ForEach-Object { $_.Sid.Value })
-        if (@($groups | Where-Object { $_ -match '^S-1-5-21-.*-(512|519)$' -or $_ -eq 'S-1-5-32-544' }).Count) {
-            throw 'The supplied account is an administrator.'
+        if (Test-EvidenceDomainAdministrator $groups) {
+            throw 'The supplied account belongs to Domain Admins or Enterprise Admins.'
         }
-        Import-Module "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.LocalAccounts" -ErrorAction Stop
-        $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)
-        if (@($members | Where-Object { $_.SID.Value -eq $sid.Value -or $_.SID.Value -in $groups }).Count) {
-            throw 'The supplied account belongs to local Administrators.'
-        }
+        # Local Administrators membership supports manual UAC consent in this lab.
+        # The LUA worker must still pass the runtime's effective-token check.
     } finally { if ($user) { $user.Dispose() }; $context.Dispose() }
     [pscustomobject]@{ Sid = $sid.Value; Account = $account }
 }

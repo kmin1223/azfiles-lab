@@ -11,7 +11,7 @@ foreach ($tree in @($runtimeAst,$installerAst)) {
         param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
     }, $true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
 }
-# Collector stand-ins: never load or invoke native capture, Scheduler, identities or services.
+# Collector stand-ins: never invoke capture, Scheduler mutations, logons or services.
 function Test-Admin { $false }
 function Start-Capture($Out) { throw 'Unmocked capture' }
 function Stop-Capture($Out) { throw 'Unmocked stop' }
@@ -73,6 +73,63 @@ Describe 'Automatic evidence validation and boundaries' {
         $task = [pscustomobject]@{}
         $task | Add-Member ScriptMethod GetSecurityDescriptor { param($Flags) 'O:BAG:BAD:P(A;;GA;;;WD)' }
         { Assert-EvidenceTaskSecurity $task } | Should Throw
+    }
+}
+
+Describe 'Local administrator membership versus effective token privileges' {
+    BeforeEach {
+        $script:config = New-TestConfig
+        $script:token = [pscustomobject]@{
+            User = [pscustomobject]@{Value=$config.ExpectedUserSid}
+            Groups = @(
+                [pscustomobject]@{Value='S-1-5-32-544'},
+                [pscustomobject]@{Value='S-1-5-21-1-2-3-513'})
+        }
+    }
+    It 'accepts the fixed local administrator with a filtered token in both roles' {
+        Mock Get-EvidenceIdentity { ConvertTo-EvidenceIdentity $token $false }
+        (Get-EvidenceIdentity).Admin | Should Be $false
+        { Assert-EvidenceIdentity $config 'Client' } | Should Not Throw
+        { Assert-EvidenceIdentity $config 'Worker' } | Should Not Throw
+    }
+    It 'rejects an enabled administrator token including when UAC is disabled' {
+        Mock Get-EvidenceIdentity { ConvertTo-EvidenceIdentity $token $true }
+        (Get-EvidenceIdentity).Admin | Should Be $true
+        { Assert-EvidenceIdentity $config 'Client' } | Should Throw
+        { Assert-EvidenceIdentity $config 'Worker' } | Should Throw
+    }
+    It 'still rejects Domain Admins and Enterprise Admins even with filtered tokens' {
+        foreach ($rid in @(512,519)) {
+            $token.Groups = @([pscustomobject]@{Value="S-1-5-21-1-2-3-$rid"})
+            (ConvertTo-EvidenceIdentity $token $false).Admin | Should Be $true
+            (Test-EvidenceDomainAdministrator @("S-1-5-21-1-2-3-$rid")) | Should Be $true
+        }
+    }
+    It 'gets the actual token role from Windows without creating or elevating a logon' {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+            $expected = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or
+                (Test-EvidenceDomainAdministrator @($identity.Groups | ForEach-Object Value))
+            # Invoke the source body directly; Pester 3 retains this Describe's mocks.
+            $definition = $runtimeAst.Find({ param($n)
+                $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-EvidenceIdentity'
+            },$true)
+            $actual = & ($definition.Body.GetScriptBlock())
+            $actual.Sid | Should Be $identity.User.Value
+            $actual.Admin | Should Be $expected
+        } finally { $identity.Dispose() }
+    }
+    It 'uses the same domain-group rule at installation and keeps the existing UAC convenience' {
+        (Test-EvidenceDomainAdministrator @('S-1-5-32-544','S-1-5-21-1-2-3-513')) | Should Be $false
+        $resolve = $installerAst.Find({ param($n)
+            $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Resolve-EvidenceAccount'
+        },$true).Extent.Text
+        $resolve | Should Match 'if \(Test-EvidenceDomainAdministrator \$groups\)'
+        $resolve | Should Not Match 'Get-LocalGroupMember|S-1-5-32-544'
+        $join = Get-Content (Join-Path $scripts '03-join-domain-client.ps1') -Raw
+        $join | Should Match 'Add-LocalGroupMember -Group ''Administrators'''
+        $join | Should Not Match 'Remove-LocalGroupMember'
     }
 }
 

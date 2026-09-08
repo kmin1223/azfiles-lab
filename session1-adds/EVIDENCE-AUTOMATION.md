@@ -56,10 +56,17 @@ The installer repairs inherited write permissions on its known LabTools root
 when safe to do so, publishes the trusted helper, and preserves existing
 evidence subfolders. It still refuses unsafe ownership and linked paths.
 
+If an older installer reports `The supplied account is an administrator`,
+update the scripts and rerun the update command. The lab deliberately adds
+`labuser1` to the client's local Administrators group for manual UAC consent.
+The installer now allows that membership; it does not remove it, change UAC,
+or require signing out. Domain Admins and Enterprise Admins remain rejected.
+The client and worker must still pass the effective-token check at run time.
+
 ## What is isolated
 
 A protected SYSTEM task starts the machine-wide network trace. A separate
-fixed task logs on as **non-admin `labuser1` with a password-based batch
+fixed task logs on as **`labuser1` with a non-elevated, password-based batch
 logon**, giving the attempt a new logon session/LUID. That worker purges only
 its own Kerberos cache and runs:
 
@@ -71,6 +78,16 @@ The probe uses UNC only, not `Z:`. Standard input is closed so failed
 authentication cannot wait indefinitely for a credential prompt. The probe
 has a timeout, and the broker stops its owned capture even if reproduction
 fails. Concurrent automated runs are rejected rather than sharing evidence.
+
+The worker uses Task Scheduler `TASK_RUNLEVEL_LUA` (least privilege), not
+`TASK_RUNLEVEL_HIGHEST`. With UAC enabled, a local administrator can run with a
+filtered token. The Administrators SID can remain in that token as deny-only;
+its presence alone does not mean the process is elevated.
+The runtime uses `WindowsPrincipal.IsInRole(Administrator)` to check the
+effective token. If the worker has administrator rights, it stops before
+mounting. UAC must remain enabled for this local-administrator lab setup.
+See [Task Scheduler security contexts](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)
+and [WindowsPrincipal.IsInRole](https://learn.microsoft.com/en-us/dotnet/api/system.security.principal.windowsprincipal.isinrole).
 
 Existing SMB connections and drive mappings in the original RDP logon are not
 the reproduction context and are not disconnected. Read the **worker's**
@@ -128,9 +145,12 @@ Do not overlap manual and automatic captures.
 ## Credential and privilege boundary
 
 Windows Task Scheduler stores the worker credential for the fixed lab task.
-The user can invoke the fixed broker but cannot edit the task definition or
-protected code/configuration. The worker is not granted local administrator
-rights. Administrators/SYSTEM still control this machine and its stored task
+The non-elevated user can invoke the fixed broker but cannot edit the task
+definition or protected code/configuration from that token. The lab retains
+local administrator membership for manual UAC consent; this is not an account
+that can never elevate, and UAC is not a security boundary against that user.
+The worker runs without enabled administrator rights. Administrators/SYSTEM
+still control this machine and its stored task
 credentials; this is a dedicated lab convenience, not a production credential
 vault or an arbitrary-user impersonation service.
 

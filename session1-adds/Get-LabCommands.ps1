@@ -117,7 +117,7 @@ $text = @"
 [B] optional automatic evidence - ONE command in the NORMAL labuser1 window
     # Requires AUTO_EVIDENCE_READY from deployment/upgrade.
     C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
-    # SYSTEM captures; a new non-admin labuser1 batch logon connects via UNC.
+    # SYSTEM captures; a new non-elevated labuser1 batch logon connects via UNC.
     # No Z: mapping, logout, password prompt or separate StopTrace is needed.
     # Read the printed run folder: user\ holds mount/tickets/DC evidence;
     # capture\ holds the trace and collector-side events/state.

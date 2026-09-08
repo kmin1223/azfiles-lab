@@ -204,15 +204,26 @@ function Write-EvidenceState($State) {
     else { [IO.File]::Move($staging, $path) }
 }
 
+function Test-EvidenceDomainAdministrator([string[]]$GroupSids) {
+    @($GroupSids | Where-Object { $_ -match '^S-1-5-21-\d+-\d+-\d+-(512|519)$' }).Count -gt 0
+}
+
+function ConvertTo-EvidenceIdentity($Identity, [bool]$AdministratorEnabled) {
+    $groups = @($Identity.Groups | ForEach-Object Value)
+    [pscustomobject]@{
+        Sid = $Identity.User.Value
+        # UAC may retain Administrators as deny-only. Its presence is not elevation.
+        Admin = ($AdministratorEnabled -or (Test-EvidenceDomainAdministrator $groups))
+    }
+}
+
 function Get-EvidenceIdentity {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $groups = @($identity.Groups | ForEach-Object Value)
-    [pscustomobject]@{
-        Sid = $identity.User.Value
-        Admin = ((New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator) -or
-            'S-1-5-32-544' -in $groups -or @($groups | Where-Object { $_ -match '^S-1-5-21-.*-(512|519)$' }).Count -gt 0)
-    }
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        ConvertTo-EvidenceIdentity $identity ($principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator))
+    } finally { $identity.Dispose() }
 }
 
 function Assert-EvidenceIdentity($Config, [string]$Role) {
@@ -220,7 +231,7 @@ function Assert-EvidenceIdentity($Config, [string]$Role) {
     if ($Role -eq 'Broker') {
         if ($identity.Sid -ne 'S-1-5-18') { throw 'The evidence broker requires SYSTEM.' }
     } elseif ($identity.Sid -ne $Config.ExpectedUserSid -or $identity.Admin) {
-        throw 'Evidence automation requires the configured non-administrator labuser1.'
+        throw 'Evidence automation requires the configured labuser1 with a non-elevated token, not Domain/Enterprise Admin. Use a normal PowerShell window; local administrators require UAC enabled.'
     }
 }
 
@@ -448,7 +459,7 @@ function Invoke-EvidenceClient($Config) {
     if (-not (Test-Path -LiteralPath (Join-Path $paths.Capture 'trace.pcapng'))) {
         Write-Warning 'No converted PCAPNG is available. Preserve capture\trace.etl; inspect capture\trace-stop.txt.'
     }
-    # User-controlled text is displayed only under the caller's non-administrator identity.
+    # User-controlled text is displayed only under the caller's non-elevated identity.
     foreach ($name in @('worker-output.txt','mount-result.txt','reproduction.json','dc-summary.txt','done.json')) {
         $path = Join-Path $paths.User $name
         if (Test-Path -LiteralPath $path) {

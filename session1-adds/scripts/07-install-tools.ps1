@@ -257,7 +257,7 @@ $helper = @'
 
   AUTOMATIC LAB CAPTURE (after Install-LabEvidenceAutomation)
       NORMAL labuser1 window: Get-KerberosEvidence.ps1 -StartTrace
-      Captures once, reproduces in a fresh non-admin batch logon using UNC
+      Captures once, reproduces in a fresh non-elevated batch logon using UNC
       (no drive letter), stops, and returns results to this window.
       Task Scheduler holds the lab credential; this helper never reads it.
 

@@ -565,7 +565,7 @@ $pwLine Transcript      : $logFile
  The DC has no Azure tooling; its read-only Security evidence access is prepared.
  After AUTO_EVIDENCE_READY, normal labuser1 can capture/reproduce/stop with:
    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
- This uses a fresh non-admin batch logon and UNC connection, not the RDP session.
+ This uses a fresh non-elevated batch logon and UNC connection, not the RDP session.
  Run these diagnostic commands on the CLIENT VM only, after tools installation:
    Connect-AzAccount
    Debug-AzStorageAccountAuth -StorageAccountName $saName ``
