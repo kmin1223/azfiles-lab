@@ -84,6 +84,20 @@ Describe 'Private manual command sheets' {
         $text | Should Not Match 'AUTO_EVIDENCE_READY|StartTrace -Manual|Update-LabEvidenceAutomation'
         $text | Should Match 'Do not screen-share or commit'
     }
+    It 'keeps Lab 1 focused on mounting and tickets while retaining Lab 2 evidence commands' {
+        $file = Join-Path $TestDrive 'lab1-commands.txt'
+        & $commands -ResourceGroupName fixture -OutFile $file | Out-Null
+        $text = Get-Content $file -Raw
+        $lab1 = [regex]::Match($text, '(?s) LAB 1 -.*?(?= LAB 2 -)').Value
+        $lab1 | Should Match 'klist get cifs/azflabfixture'
+        $lab1 | Should Match 'net use Z:'
+        $lab1 | Should Match 'echo hello'
+        $lab1 | Should Not Match 'Get-KerberosEvidence|baseline evidence|dc-summary|Get-WinEvent|optional administrator follow-up'
+        $lab2 = [regex]::Match($text, '(?s) LAB 2 -.*?(?= LAB 3 -)').Value
+        $lab2 | Should Match 'Get-KerberosEvidence.ps1 -StartTrace'
+        $lab2 | Should Match 'Get-KerberosEvidence.ps1 -Reproduce'
+        $lab2 | Should Match 'Get-KerberosEvidence.ps1 -StopTrace'
+    }
     It 'does not claim to retrieve a password for standalone runs' {
         $file = Join-Path $TestDrive 'no-password.txt'
         & $commands -ResourceGroupName fixture -OutFile $file | Out-Null
@@ -98,6 +112,8 @@ Describe 'Private manual command sheets' {
         ([regex]::Matches($text, $reset)).Count | Should Be 2
         $text | Should Match 'net use \* /delete /y ; klist purge ; net use Z:'
         $text | Should Match 'Open handles can keep an SMB session alive'
+        $text | Should Not Match 'Get-SmbConnection|back in the normal window'
+        $text | Should Match 'net use \* /delete /y\r?\n\s+klist purge\r?\n\s+net use Z:'
     }
     It 'fills salt comparison commands with deployment values and preserves runtime variables' {
         $file = Join-Path $TestDrive 'salt-commands.txt'

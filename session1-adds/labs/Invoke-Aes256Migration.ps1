@@ -17,9 +17,9 @@
 
   Steps, in lab order:
     Status   Show the current state: encryption type, DomainName, kerb key age.
-    Legacy   Regress to the 2023-vintage state (RC4 + NetBIOS DomainName), then
-             prove it still mounts - the defect is planted and invisible.
-             Takes ~3 min; run it while the RC4-retirement slides are up.
+    Legacy   Apply the 2023-vintage state (RC4 + NetBIOS DomainName) and sync
+             the Kerberos key to AD. Reports configuration completion only;
+             no client mount or ticket verification. Use -Verbose for details.
     Enforce  The naive migration - flip the AD object to AES-256 only.
              Expected result: mounts start failing with 1396.
     Repair   The correct fix, in the order that actually matters:
@@ -70,9 +70,12 @@ $saName = $sa.StorageAccountName
 $dcName = "$Prefix-dc"
 $adProps = $sa.AzureFilesIdentityBasedAuth.ActiveDirectoryProperties
 
-# Every command this lab runs is echoed BEFORE it runs, so you can follow what
-# the script does and reuse the commands yourself. Secrets are masked.
+# Legacy keeps command details in the verbose stream. Secrets are masked.
 function Show-Cmd([string]$Where, [string]$Command) {
+    if ($Step -eq 'Legacy') {
+        Write-Verbose "$Where`n$($Command.Trim())"
+        return
+    }
     Write-Host ''
     Write-Host "  .-- commands ($Where) " -ForegroundColor DarkCyan
     $Command.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  | $_" -ForegroundColor Gray }
@@ -163,8 +166,12 @@ Set-ADAccountPassword -Identity `$comp.DistinguishedName -Server `$pdc -Reset ``
 $replicationScript
 Write-Output "AD password re-synced to the new kerb1 key on `$pdc"
 "@
-    Invoke-OnDc -Script $dcScript -Display ($dcScript -replace [regex]::Escape($kerb.Replace("'","''")), '<kerb1-key>') |
-        Write-Host
+    $result = Invoke-OnDc -Script $dcScript -Display ($dcScript -replace [regex]::Escape($kerb.Replace("'","''")), '<kerb1-key>')
+    if ($Step -eq 'Legacy') {
+        Write-Verbose $result
+    } else {
+        $result | Write-Host
+    }
 }
 
 switch ($Step) {
@@ -250,66 +257,8 @@ property alone changes nothing until the key is regenerated and pushed to AD.
     }
 
     'Legacy' {
-        Write-Host @"
-Building the '2023 vintage' state - this is what a customer hands you:
-  * AD object drops to RC4
-  * ActiveDirectoryDomainName gets the NETBIOS name instead of the DNS root
-  * kerb key regenerated and pushed to AD
-RC4 is unsalted, so the wrong DomainName is completely invisible - the share
-mounts perfectly. That is exactly why the defect can sit there for years.
-"@ -ForegroundColor Yellow
         Set-AdProperties -DomainNameValue $adProps.NetBiosDomainName
         Sync-KerbKeyToAd -SetRc4
-
-        # Prove RC4 still works in this environment before the lab depends on it.
-        # Recent Windows builds and hardening baselines disable RC4 outright; if
-        # that is the case here, better to find out now than mid-Enforce.
-        Write-Host "`nVerifying the legacy state actually mounts (RC4)..." -ForegroundColor Yellow
-        $cliName = "$Prefix-cli"
-        # Run Command executes as SYSTEM, so this probe authenticates as the
-        # MACHINE account - fine for "does RC4 still work here", but it is not
-        # the lab user's evidence.
-        # It mounts by UNC with NO drive letter, and disconnects afterwards: a
-        # letter mapped by SYSTEM lives in session 0 and would block the lab
-        # user from using that letter for the rest of the session (System error
-        # 85, with nothing in their own 'net use' to explain it).
-        $verifyScript = @"
-`$unc = '\\$saName.file.core.windows.net\labshare'
-net use * /delete /y 2>&1 | Out-Null
-net use `$unc /delete /y 2>&1 | Out-Null
-klist purge 2>&1 | Out-Null
-`$r = net use `$unc /persistent:no 2>&1
-if (`$LASTEXITCODE -eq 0) {
-    Write-Output 'LEGACY_MOUNT_OK (probed as the machine account)'
-    klist | Select-String 'cifs/|Encryption Type' | ForEach-Object { Write-Output `$_.ToString().Trim() }
-} else {
-    Write-Output "LEGACY_MOUNT_FAILED: `$r"
-}
-net use `$unc /delete /y 2>&1 | Out-Null
-"@
-        Show-Cmd -Where "runs on the client, $cliName" -Command $verifyScript
-        $tmp = New-TemporaryFile
-        Set-Content -Path $tmp -Value $verifyScript
-        try {
-            $res = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $cliName `
-                -CommandId 'RunPowerShellScript' -ScriptPath $tmp
-            $out = ($res.Value | Where-Object Code -like '*StdOut*').Message
-        } finally { Remove-Item $tmp -Force }
-        $out | Write-Host
-
-        if ($out -match 'LEGACY_MOUNT_OK') {
-            Write-Host @"
-
-Legacy state is live and mounting on RC4 - the defect is planted and invisible.
-Next: -Step Enforce (the 2026 mandate) and watch it break with 1396.
-"@ -ForegroundColor Green
-        } else {
-            Write-Warning @"
-RC4 did not mount in this environment - it is probably disabled by the OS build
-or a hardening baseline. The 'invisible defect' half of the lab cannot run here.
-Fall back to: -Step Enforce (to see the AES-256 failure) or -Step Repair (to
-return to the supported configuration and demo the correct order of operations).
-"@
-        }
+        Write-Host 'Legacy configuration applied successfully. Mount verification was not run.' -ForegroundColor Green
     }
 }

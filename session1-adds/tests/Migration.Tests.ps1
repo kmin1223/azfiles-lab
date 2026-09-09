@@ -57,19 +57,20 @@ Describe 'Migration remote-call batching' {
                 $operations.Add('dc-call')
                 $payload = Get-Content -LiteralPath $ScriptPath -Raw
                 $output = @(& ([scriptblock]::Create($payload))) -join "`n"
-            } elseif ($VMName -eq 'azflab-cli') {
-                $operations.Add('client-verify')
-                $output = 'LEGACY_MOUNT_OK (mock)'
             } else { throw 'Unexpected VM' }
             [pscustomobject]@{ Value = @([pscustomobject]@{ Code = 'ComponentStatus/StdOut/succeeded'; Message = $output }) }
         }
     }
 
-    It 'batches Legacy RC4 and password writes into one DC call before client verification' {
+    It 'applies Legacy in one DC call without client verification and reports configuration success only' {
         & $migrationFile -ResourceGroupName azfiles-lab -Step Legacy
-        ($operations -join ',') | Should Be 'metadata,rotate,wait:15,key-read,dc-call,encryption:RC4,password,client-verify'
+        ($operations -join ',') | Should Be 'metadata,rotate,wait:15,key-read,dc-call,encryption:RC4,password'
         Assert-MockCalled Invoke-AzVMRunCommand -Times 1 -Exactly -Scope It -ParameterFilter { $VMName -eq 'azflab-dc' }
-        Assert-MockCalled Invoke-AzVMRunCommand -Times 1 -Exactly -Scope It -ParameterFilter { $VMName -eq 'azflab-cli' }
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It -ParameterFilter { $VMName -eq 'azflab-cli' }
+        Assert-MockCalled Write-Host -Times 1 -Exactly -Scope It
+        Assert-MockCalled Write-Host -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Object -eq 'Legacy configuration applied successfully. Mount verification was not run.'
+        }
         Assert-MockCalled repadmin -Times 0 -Exactly -Scope It
         Assert-MockCalled Set-ADComputer -Times 1 -Exactly -Scope It -ParameterFilter {
             $Server -eq 'azflab-dc.contoso.local' -and $KerberosEncryptionType -eq 'RC4'
@@ -101,11 +102,39 @@ Describe 'Migration remote-call batching' {
         $properties.DomainName | Should Be 'contoso.local'
     }
 
-    It 'does not verify the client after a failed DC update' {
+    It 'does not report success after a failed DC update' {
         Mock Set-ADComputer { throw 'Mock AD update failure' }
         { & $migrationFile -ResourceGroupName azfiles-lab -Step Legacy } | Should Throw
         Assert-MockCalled Set-ADAccountPassword -Times 0 -Exactly -Scope It
         Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It -ParameterFilter { $VMName -eq 'azflab-cli' }
+        Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It
+    }
+
+    It 'stops on an Azure settings failure without rotating keys or reporting success' {
+        Mock Set-AzStorageAccount { throw 'Mock Azure update failure' }
+        { & $migrationFile -ResourceGroupName azfiles-lab -Step Legacy } | Should Throw
+        Assert-MockCalled New-AzStorageAccountKey -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It
+        Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not report success when the DC completion marker is missing' {
+        Mock Invoke-AzVMRunCommand {
+            [pscustomobject]@{ Value = @([pscustomobject]@{ Code = 'ComponentStatus/StdOut/succeeded'; Message = 'partial output' }) }
+        }
+        { & $migrationFile -ResourceGroupName azfiles-lab -Step Legacy } | Should Throw
+        Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It
+    }
+
+    It 'keeps detailed Legacy commands available through verbose output without exposing keys' {
+        Mock Write-Verbose {}
+        & $migrationFile -ResourceGroupName azfiles-lab -Step Legacy -Verbose
+        Assert-MockCalled Write-Verbose -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Message -like '*Set-ADAccountPassword*' -and $Message -like '*<kerb1-key>*'
+        }
+        Assert-MockCalled Write-Verbose -Times 0 -Exactly -Scope It -ParameterFilter {
+            $Message -like '*mock_key*'
+        }
     }
 
     It 'surfaces replication failures instead of reporting completion' {
@@ -123,6 +152,6 @@ Describe 'Migration remote-call batching' {
 
     It 'keeps Rollback as the Legacy alias' {
         & $migrationFile -ResourceGroupName azfiles-lab -Step Rollback
-        ($operations -join ',') | Should Be 'metadata,rotate,wait:15,key-read,dc-call,encryption:RC4,password,client-verify'
+        ($operations -join ',') | Should Be 'metadata,rotate,wait:15,key-read,dc-call,encryption:RC4,password'
     }
 }

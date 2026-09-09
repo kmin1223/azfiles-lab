@@ -115,38 +115,14 @@ $text = @"
 
     Expect: Server = cifs/$fqdn, encryption type AES-256.
 
-[B] baseline evidence - two windows, three steps in this order
-    # 1. ELEVATED PowerShell (UAC -> Yes)
-    C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace$dcArgument
-    # 2. NORMAL PowerShell - the mount must happen in YOUR session
-    C:\LabTools\Get-KerberosEvidence.ps1 -Reproduce -StorageAccount $saName -Share $Share
-    # 3. back in the ELEVATED window
-    C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace
-
-[B] the KDC's own record is collected remotely at StopTrace
-    Open dc-summary.txt in the capture folder, then inspect the time-bounded
-    DC Security exports (4768/4769/4771, XML/JSON/CSV) for the reproduced request.
-    No separate DC sign-in is needed. Without a reliable DNS target above,
-    the collector uses its installed DC configuration/domain discovery.
-    Missing/denied/empty DC evidence is not proof that the KDC is healthy.
-    Sign out/in after new group membership; use -DcCredential if needed
-    (the collector does not store credentials).
-    Retry only DC collection for an existing capture:
-    C:\LabTools\Get-KerberosEvidence.ps1 -CollectDc -Path '<capture-folder>'$dcArgument
-
-[C] optional administrator follow-up if remote DC collection is unavailable
-    Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 100 |
-      Where-Object Message -match '$saName' |
-      Select-Object -First 3 | Format-List TimeCreated, Message
-
-
 --------------------------------------------------------------------------------
  LAB 2 - AES-256 migration  (the centrepiece)
 --------------------------------------------------------------------------------
-[A] step 0 - plant the 2023 defect (~3 min; start it during the RC4 slides)
+[A] step 0 - plant the 2023 defect (start it during the RC4 slides)
     & '$migrationScriptPath' -ResourceGroupName $ResourceGroupName -Step Legacy
 
-    Read the output: it mounts fine on RC4. That is the point.
+    Wait for configuration success before Enforce. Legacy does not test the mount.
+    Add -Verbose only if you want to see the commands being applied.
 
 [A] step 1 - comply with the 2026 mandate
     & '$migrationScriptPath' -ResourceGroupName $ResourceGroupName -Step Enforce
@@ -154,9 +130,6 @@ $text = @"
 [B] step 2 - retest. DROP THE SMB SESSION FIRST, or nothing is proven
     net use * /delete /y
     klist purge
-    #   ELEVATED window - Get-SmbConnection needs it:
-    Get-SmbConnection | Where-Object ServerName -like '*file.core.windows.net'
-    #   back in the normal window:
     net use Z: $unc
 
     Expect: System error 1396.
@@ -244,7 +217,6 @@ $text = @"
 [B] klist                                   # the ticket cache
     klist purge                             # tickets only - NOT the SMB session
     klist get cifs/$fqdn                     # force one ticket, no mount
-    Get-SmbConnection | ? ServerName -like '*file.core.windows.net'   # elevated
     C:\LabTools\Get-KerberosEvidence.ps1 -Analyze     # re-read the last capture
 
     Retest reset, in this order:

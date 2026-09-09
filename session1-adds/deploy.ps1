@@ -558,7 +558,7 @@ $pwLine Transcript      : $logFile
  The account is deployed in the SUPPORTED configuration (AES-256, DNS-root
  domain name). Lab 2 starts by regressing it to the 2023-vintage state:
    ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Legacy
- (takes ~3 min - kick it off while the RC4-retirement slides are running)
+ (configuration only; no mount test - start it during the RC4-retirement slides)
 
  Diagnostics are installed after this summary on the CLIENT VM (Az + AzFilesHybrid).
  The DC has no Azure tooling; its read-only Security evidence access is prepared.
