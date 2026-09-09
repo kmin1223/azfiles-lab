@@ -6,6 +6,8 @@
 .DESCRIPTION
   The workbook has to say <sa>. This doesn't - it reads your resource group and
   prints commands you can paste as they are.
+  Cloud Shell script commands include absolute paths, so they also work after
+  reconnecting from a different directory, as long as the checkout remains there.
 
   deploy.ps1 calls this at the end and saves the result next to the lab-info
   file, so it survives a Cloud Shell disconnect. Run it again any time:
@@ -36,6 +38,9 @@ param(
     [string]$OutFile
 )
 $ErrorActionPreference = 'Stop'
+
+$migrationScriptPath = (Join-Path (Join-Path $PSScriptRoot 'labs') 'Invoke-Aes256Migration.ps1').Replace("'", "''")
+$faultScriptPath = (Join-Path (Join-Path $PSScriptRoot 'faults') 'Invoke-Fault.ps1').Replace("'", "''")
 
 # The lab account, not the extra one Test-Coexistence.ps1 may have created.
 $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName |
@@ -94,6 +99,9 @@ $text = @"
 
  Share: $unc
 
+ Cloud Shell script paths are absolute; no directory change is needed after reconnecting.
+ Keep the checkout in the same location and confirm the active Azure subscription.
+
 
 --------------------------------------------------------------------------------
  LAB 1 - first mount and tickets
@@ -136,12 +144,12 @@ $text = @"
  LAB 2 - AES-256 migration  (the centrepiece)
 --------------------------------------------------------------------------------
 [A] step 0 - plant the 2023 defect (~3 min; start it during the RC4 slides)
-    ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Legacy
+    & '$migrationScriptPath' -ResourceGroupName $ResourceGroupName -Step Legacy
 
     Read the output: it mounts fine on RC4. That is the point.
 
 [A] step 1 - comply with the 2026 mandate
-    ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Enforce
+    & '$migrationScriptPath' -ResourceGroupName $ResourceGroupName -Step Enforce
 
 [B] step 2 - retest. DROP THE SMB SESSION FIRST, or nothing is proven
     net use * /delete /y
@@ -163,7 +171,7 @@ $text = @"
 [B]     Read dc-summary.txt and correlate the DC exports with this request.
         A matching 4769 success proves issuance, not that every KDC/key path is healthy.
 [A]     For this planted defect, check the derived-key salt metadata:
-    ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Status
+    & '$migrationScriptPath' -ResourceGroupName $ResourceGroupName -Step Status
         -> ActiveDirectoryDomainName reads $nb (NetBIOS), not the DNS root.
 
 [A] Cloud Shell - read the storage account's salt input metadata (Slide 16)
@@ -187,7 +195,7 @@ $text = @"
     Matching metadata alone does not prove matching keys or successful authentication.
 
 [A] step 4 - repair. The ORDER is the lesson
-    ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Repair
+    & '$migrationScriptPath' -ResourceGroupName $ResourceGroupName -Step Repair
 
 [B]     net use * /delete /y ; klist purge ; net use Z: $unc ; klist
         -> AES-256-CTS-HMAC-SHA1-96
@@ -196,38 +204,38 @@ $text = @"
 --------------------------------------------------------------------------------
  LAB 3 - a perfect ticket, and Access Denied
 --------------------------------------------------------------------------------
-[A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault CipherMismatch
+[A] & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault CipherMismatch
 [B] net use * /delete /y ; klist purge ; net use Z: $unc
 [B] klist                                    # the cifs ticket IS there
     Get-SmbClientConfiguration | Select-Object -ExpandProperty EncryptionCiphers
     # storage side: portal -> storage account -> File shares -> Security
-[A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault CipherMismatch -Repair
+[A] & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault CipherMismatch -Repair
 
 
 --------------------------------------------------------------------------------
  LABS 4-6 - if time allows
 --------------------------------------------------------------------------------
 [A] 4  blocked 445 / share permission
-    ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault Block445
-    ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault Block445 -Repair
-    ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault NoShareAccess
-    ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault NoShareAccess -Repair
+    & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault Block445
+    & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault Block445 -Repair
+    & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault NoShareAccess
+    & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault NoShareAccess -Repair
 [B] Test-NetConnection $fqdn -Port 445
 
 [A] 5  the other 1396 - key drift
-    ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault PasswordMismatch
+    & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault PasswordMismatch
 [B] klist purge ; net use Z: $unc                      # -> 1396
 [B] Connect-AzAccount                                  # this one runs IN the VM
     Debug-AzStorageAccountAuth -StorageAccountName $saName -ResourceGroupName $ResourceGroupName -Verbose
     #   CheckADObjectPasswordIsCorrect fails
-[A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault PasswordMismatch -Repair
+[A] & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault PasswordMismatch -Repair
 
 [A] 6  broken SPN
-    ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault SpnBroken
+    & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault SpnBroken
 [B] klist purge ; klist get cifs/$fqdn                 # -> 0xc000018b
 [C] setspn -L $saName
     setspn -F -Q cifs/$fqdn
-[A] ./faults/Invoke-Fault.ps1 -ResourceGroupName $ResourceGroupName -Fault SpnBroken -Repair
+[A] & '$faultScriptPath' -ResourceGroupName $ResourceGroupName -Fault SpnBroken -Repair
 
 
 --------------------------------------------------------------------------------

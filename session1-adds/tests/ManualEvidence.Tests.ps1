@@ -119,4 +119,44 @@ Describe 'Private manual command sheets' {
             $errors.Count | Should Be 0
         }
     }
+    It 'uses quoted absolute script paths from the generator location, not the current directory' {
+        $fixtureRoot = (New-Item -ItemType Directory -Path (Join-Path $TestDrive "trainer's lab `$copy")).FullName
+        $generator = Join-Path $fixtureRoot 'Get-LabCommands.ps1'
+        Copy-Item -LiteralPath $commands -Destination $generator
+        $file = Join-Path $TestDrive 'absolute-commands.txt'
+        Push-Location $TestDrive
+        try {
+            & $generator -ResourceGroupName fixture -OutFile $file | Out-Null
+        } finally {
+            Pop-Location
+        }
+        $text = Get-Content $file -Raw
+        $text | Should Not Match '\./(?:labs|faults)/|\$PSScriptRoot|\$migrationScriptPath|\$faultScriptPath'
+        $calls = [regex]::Matches($text, "(?m)^(?:\[A\] )?[ \t]*(& '[^\r\n]+' -ResourceGroupName[^\r\n]*)")
+        $calls.Count | Should Be 14
+        $migration = Join-Path (Join-Path $fixtureRoot 'labs') 'Invoke-Aes256Migration.ps1'
+        $fault = Join-Path (Join-Path $fixtureRoot 'faults') 'Invoke-Fault.ps1'
+        $migrationCount = 0
+        $faultCount = 0
+        foreach ($call in $calls) {
+            $tokens = $null; $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseInput(
+                $call.Groups[1].Value, [ref]$tokens, [ref]$errors)
+            $errors.Count | Should Be 0
+            $commandAst = $ast.EndBlock.Statements[0].PipelineElements[0]
+            $commandAst.InvocationOperator.ToString() | Should Be 'Ampersand'
+            $path = $commandAst.CommandElements[0].Value
+            [IO.Path]::IsPathRooted($path) | Should Be $true
+            if ($call.Groups[1].Value -match ' -Step ') {
+                $path | Should Be $migration
+                $migrationCount++
+            } else {
+                $path | Should Be $fault
+                $faultCount++
+            }
+        }
+        $migrationCount | Should Be 4
+        $faultCount | Should Be 10
+        $text | Should Match ([regex]::Escape('C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace'))
+    }
 }
