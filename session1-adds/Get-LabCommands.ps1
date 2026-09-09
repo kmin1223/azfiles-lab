@@ -145,8 +145,6 @@ $text = @"
 
 [B] step 2 - retest. DROP THE SMB SESSION FIRST, or nothing is proven
     net use * /delete /y
-    net use $unc /delete /y
-    net use Z: /delete /y
     klist purge
     #   ELEVATED window - Get-SmbConnection needs it:
     Get-SmbConnection | Where-Object ServerName -like '*file.core.windows.net'
@@ -167,6 +165,26 @@ $text = @"
 [A]     For this planted defect, check the derived-key salt metadata:
     ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Status
         -> ActiveDirectoryDomainName reads $nb (NetBIOS), not the DNS root.
+
+[A] Cloud Shell - read the storage account's salt input metadata (Slide 16)
+    `$rg = '$($ResourceGroupName.Replace("'", "''"))'
+    `$sa = '$saName'
+    `$ad = (Get-AzStorageAccount -ResourceGroupName `$rg -Name `$sa).AzureFilesIdentityBasedAuth.ActiveDirectoryProperties
+    `$ad | Format-List DomainName, NetBiosDomainName, SamAccountName, AccountType
+
+[B] Client VM - read the actual AD DS domain and computer account (read-only)
+    Import-Module ActiveDirectory
+    `$sa = '$saName'
+    `$domain = Get-ADDomain
+    `$pdc = `$domain.PDCEmulator
+    Get-ADDomain -Server `$pdc | Format-List DNSRoot, NetBIOSName
+    Get-ADComputer -Identity `$sa -Server `$pdc -Properties ServicePrincipalName | Format-List SamAccountName, ObjectClass, ServicePrincipalName
+
+    Compare Azure DomainName with AD DNSRoot, and NetBiosDomainName with NetBIOSName.
+    This lab stores SamAccountName in Azure without the AD computer account's final '$'.
+    Azure AccountType = Computer should correspond to AD ObjectClass = computer.
+    ServicePrincipalName should include cifs/$fqdn.
+    Matching metadata alone does not prove matching keys or successful authentication.
 
 [A] step 4 - repair. The ORDER is the lesson
     ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName $ResourceGroupName -Step Repair
@@ -222,7 +240,10 @@ $text = @"
     C:\LabTools\Get-KerberosEvidence.ps1 -Analyze     # re-read the last capture
 
     Retest reset, in this order:
-    net use $unc /delete /y ; net use Z: /delete /y ; klist purge
+    net use * /delete /y
+    klist purge
+    # Lab only: removes all net use connections in this user context.
+    # Open handles can keep an SMB session alive; confirm fresh authentication separately.
 
 [A] teardown
     Remove-AzResourceGroup -Name $ResourceGroupName -Force

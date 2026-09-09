@@ -579,15 +579,12 @@ Write-Host "Saved to: $infoFile" -ForegroundColor Yellow
 # already substituted - so nobody has to hand-replace <sa> during the session.
 # Written to disk as well, because Cloud Shell drops idle sessions.
 $cmdFile = Join-Path $LogPath "lab-commands-$stamp.txt"
+$commandSheetReady = $false
 try {
     & (Join-Path $scriptRoot 'Get-LabCommands.ps1') -ResourceGroupName $ResourceGroupName `
         -Prefix $Prefix -DomainController "$dcName.$DomainName" `
         -AdminUsername $AdminUsername -AdminPassword $AdminPassword -OutFile $cmdFile | Out-Null
-    Write-Host ''
-    Write-Host " Lab commands (real account name filled in): $cmdFile" -ForegroundColor Cyan
-    Write-Host '   PRIVATE: includes the VM password in plaintext; do not screen-share or commit.' -ForegroundColor Yellow
-    Write-Host "   view:  Get-Content $cmdFile" -ForegroundColor White
-    Write-Host "   again: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor White
+    $commandSheetReady = $true
 } catch {
     Write-Warning "Could not generate the lab-command sheet: $($_.Exception.Message)"
     Write-Host "  Run it yourself: ./Get-LabCommands.ps1 -ResourceGroupName $ResourceGroupName" -ForegroundColor White
@@ -620,6 +617,13 @@ try {
 } catch {
     Write-Warning "  diagnostics install did not finish: $($_.Exception.Message.Split("`n")[0])"
     Write-Warning '  The lab itself is unaffected. Rerun scripts\07-install-tools.ps1 on the client later.'
+}
+
+if ($commandSheetReady) {
+    Write-Host ''
+    Write-Host " Lab commands (real account name filled in): $cmdFile" -ForegroundColor Cyan
+    Write-Host '   PRIVATE: includes the VM password in plaintext; do not screen-share or commit.' -ForegroundColor Yellow
+    Write-Host "   view:  Get-Content $cmdFile" -ForegroundColor White
 }
 
 try { Stop-Transcript | Out-Null } catch { }
