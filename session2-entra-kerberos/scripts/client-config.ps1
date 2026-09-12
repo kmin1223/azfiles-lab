@@ -1,22 +1,43 @@
-# Runs ON the client VM. Enables cloud Kerberos ticket retrieval, kicks
-# hybrid-join registration, installs Fiddler for KDC Proxy inspection, then
-# reboots so the changes fully apply.
+# Runs ON the client VM. Check is read-only; InitializeRegistration starts the
+# SYSTEM join task only. Configure requires healthy hybrid join before writing
+# cloud Kerberos policy, installing diagnostic tools and rebooting.
+[CmdletBinding()]
+param(
+    [ValidateSet('Check', 'InitializeRegistration', 'Configure')]
+    [string]$Mode = 'Configure',
+    [string]$ExpectedTenantId
+)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# 1. Allow retrieving the Entra Kerberos TGT during logon
-$key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters'
-New-Item -Path $key -Force | Out-Null
-Set-ItemProperty -Path $key -Name CloudKerberosTicketRetrievalEnabled -Value 1 -Type DWord
-Write-Output 'CloudKerberosTicketRetrievalEnabled = 1'
+function Get-LabHybridJoinState {
+    $status = (& dsregcmd /status 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "dsregcmd /status failed (exit $LASTEXITCODE)." }
+    $tenant = [regex]::Match($status, '(?m)^\s*TenantId\s*:\s*(\S+)\s*$').Groups[1].Value
+    [pscustomobject]@{
+        DomainJoined = $status -match '(?m)^\s*DomainJoined\s*:\s*YES\s*$'
+        AzureAdJoined = $status -match '(?m)^\s*AzureAdJoined\s*:\s*YES\s*$'
+        DeviceHealthy = $status -match '(?m)^\s*DeviceAuthStatus\s*:\s*SUCCESS\s*$'
+        TenantId = $tenant
+    }
+}
 
-# 1b. DNS preflight. Hybrid join talks to enterpriseregistration.windows.net and
+$join = Get-LabHybridJoinState
+Write-Output "Hybrid join: DomainJoined=$($join.DomainJoined) AzureAdJoined=$($join.AzureAdJoined) DeviceHealthy=$($join.DeviceHealthy) TenantId=$($join.TenantId)"
+if (-not $join.DomainJoined) {
+    throw 'CLIENT_NOT_DOMAIN_JOINED: complete Session 1 domain join first.'
+}
+if ($join.AzureAdJoined -and $ExpectedTenantId -and $join.TenantId -ne $ExpectedTenantId) {
+    throw 'CLIENT_WRONG_TENANT: client tenant does not match the Azure subscription tenant. Review the Connect wizard SCP; do not overwrite it with a script.'
+}
+
+# DNS preflight. Hybrid join talks to enterpriseregistration.windows.net and
 # login.microsoftonline.com over HTTPS. The VNet points every VM at the DC for
 # DNS, so if the DC has no forwarder NOTHING public resolves - and dsregcmd
 # reports it as 0x80072ee7 -> 0x801c003d, which reads like a tenant/SCP problem
 # rather than what it is. Name it here so nobody debugs Entra for an hour.
 $dnsOk = $true
-foreach ($n in 'login.microsoftonline.com', 'enterpriseregistration.windows.net') {
+foreach ($n in 'login.microsoftonline.com', 'enterpriseregistration.windows.net', 'device.login.microsoftonline.com') {
     try {
         Resolve-DnsName $n -ErrorAction Stop | Out-Null
         Write-Output "DNS OK: $n"
@@ -28,39 +49,47 @@ foreach ($n in 'login.microsoftonline.com', 'enterpriseregistration.windows.net'
 if (-not $dnsOk) {
     Write-Output ''
     Write-Output '*** PUBLIC DNS IS BROKEN ON THIS CLIENT - hybrid join will fail. ***'
-    Write-Output 'Cause: the VNet points this VM at the DC, and the DC has no DNS forwarder.'
-    Write-Output 'Fix (on the DC, elevated), then re-run session2 setup.ps1:'
+    Write-Output 'Check client-to-DC DNS connectivity and the DC forwarder; a missing forwarder is a common lab cause.'
+    Write-Output 'If the forwarder is missing, fix it on the DC (elevated), then retry the client check:'
     Write-Output '    Set-DnsServerForwarder -IPAddress 168.63.129.16'
     Write-Output '    Resolve-DnsName login.microsoftonline.com -Server 127.0.0.1'
     Write-Output ''
+    throw 'CLIENT_DNS_FAILED: fix DNS before registration or configuration. No policy or reboot was applied.'
 }
 
-# 2. Prime hybrid join. THIS ATTEMPT IS EXPECTED TO FAIL on a first run, and that
-# is not a bug in this script - it is the order the lab is built in.
-#
-# In a MANAGED (non-federated) tenant the device object must already exist in
-# Entra before the client can complete registration: the client asks DRS to
-# renew a device whose id is its own AD computer objectGUID, and directory sync
-# is what puts that object in Entra (Cloud Sync maps DeviceId <- objectGUID).
-# Cloud Sync runs AFTER this script, and its device sync is off by default - so
-# on the first pass DRS answers:
-#     error_missing_device / "The device object by the given id ... is not found"
-#     DsrDeviceAutoJoin failed 0x801c03f3
-# We still run it here to create the local device keys and surface the SCP
-# discovery result early. The join that actually succeeds happens after Cloud
-# Sync device sync has provisioned the computer object.
-$task = Get-ScheduledTask -TaskName 'Automatic-Device-Join' `
-    -TaskPath '\Microsoft\Windows\Workplace Join\' -ErrorAction SilentlyContinue
-if ($task) { $task | Start-ScheduledTask }
-$joinOut = dsregcmd /join /debug 2>&1
-$joinOut | Select-Object -Last 8 | Write-Output
-if ($joinOut -match 'error_missing_device' -or $joinOut -match '0x801c03f3') {
-    Write-Output ''
-    Write-Output 'EXPECTED at this stage: the Entra device object does not exist yet.'
-    Write-Output 'Next: Cloud Sync -> Properties -> Basics -> Enable device sync (preview),'
-    Write-Output 'then Provision on demand for CN=azflab-cli,CN=Computers,DC=contoso,DC=local,'
-    Write-Output 'then re-run  dsregcmd /join /debug  on the client. See MANUAL-STEP-cloud-sync.md.'
+if ($Mode -eq 'InitializeRegistration') {
+    if ($join.AzureAdJoined -and $join.DeviceHealthy) {
+        Write-Output 'CLIENT_HYBRID_JOIN_READY'
+        return
+    }
+    if ($join.AzureAdJoined) {
+        throw 'CLIENT_DEVICE_UNHEALTHY: device authentication is not SUCCESS. Diagnose the existing registration; do not blindly leave/rejoin.'
+    }
+    $task = Get-ScheduledTask -TaskName 'Automatic-Device-Join' `
+        -TaskPath '\Microsoft\Windows\Workplace Join\' -ErrorAction Stop
+    if (-not $task) { throw 'Automatic-Device-Join task is missing. Repair the client before continuing.' }
+    $task | Start-ScheduledTask -ErrorAction Stop
+    Write-Output 'CLIENT_REGISTRATION_STARTED_NOT_READY'
+    Write-Output 'The SYSTEM task runs asynchronously. This is NOT proof of registration or a successful join.'
+    Write-Output 'In a managed domain, the initial attempt writes the computer certificate to AD; Connect Sync must export it before registration can finish.'
+    Write-Output 'On the Connect server, run Start-ADSyncSyncCycle -PolicyType Delta; wait for export, then retry the join task and Check mode.'
+    Write-Output 'error_missing_device / 0x801c03f3 can occur before export. Persistent errors need diagnosis, not an assumed successful setup.'
+    Write-Output 'See MANUAL-STEP-connect-sync.md. No cloud Kerberos policy, tools or reboot were applied.'
+    return
 }
+if (-not ($join.AzureAdJoined -and $join.DeviceHealthy)) {
+    throw 'CLIENT_HYBRID_JOIN_NOT_READY: finish Connect Sync and device registration in MANUAL-STEP-connect-sync.md before setup. Pending is not joined. Use InitializeRegistration only to start the registration cycle.'
+}
+if ($Mode -eq 'Check') {
+    Write-Output 'CLIENT_HYBRID_JOIN_READY'
+    return
+}
+
+# Allow retrieving the Entra Kerberos TGT during the next user logon.
+$key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters'
+New-Item -Path $key -Force | Out-Null
+Set-ItemProperty -Path $key -Name CloudKerberosTicketRetrievalEnabled -Value 1 -Type DWord
+Write-Output 'CloudKerberosTicketRetrievalEnabled = 1'
 
 # 3. Fiddler Classic + Kerberos.NET extension - the ONLY way to see the KDC
 # Proxy (HTTPS) exchange that Entra Kerberos uses. Wireshark/netsh only show
@@ -202,5 +231,6 @@ try {
     Write-Output "Could not register the Fiddler trust task ($($_.Exception.Message.Split([char]10)[0])) - run $fidTrust by hand"
 }
 
-Write-Output 'CLIENT_CONFIG_DONE_REBOOTING'
 shutdown /r /t 10 /f
+if ($LASTEXITCODE -ne 0) { throw "Client reboot could not be scheduled (exit $LASTEXITCODE)." }
+Write-Output 'CLIENT_CONFIG_DONE_REBOOTING'

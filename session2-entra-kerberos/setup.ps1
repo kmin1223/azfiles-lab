@@ -1,20 +1,23 @@
 <#
 .SYNOPSIS
   Session 2 setup: switch the lab storage account to Microsoft Entra Kerberos
-  and prepare the client for cloud TGT retrieval + hybrid join.
+  and prepare an already hybrid-joined client for cloud TGT retrieval.
 
 .DESCRIPTION
   Builds ON TOP of the Session 1 environment (same resource group).
-  Automated steps:
+  Prerequisites (presenter prework, BEFORE running this script):
+    Session 1 base -> manual Connect Sync users/PHS + computer sync ->
+    Connect wizard device options/SCP -> healthy hybrid join.
+    See MANUAL-STEP-connect-sync.md. Do not initialize this during the session.
+
+  Automated steps (SCP is owned by the Connect wizard, never this script):
+    0. Verify healthy hybrid join in the subscription's tenant before mutations
     1. Enable Entra Kerberos (AADKERB) on the storage account
     2. Grant admin consent (openid/profile/User.Read) to the auto-created
        app '[Storage Account] <sa>.file.core.windows.net' via Microsoft Graph
-    3. Create the hybrid-join SCP in AD (via Run Command on the DC)
-    4. Client VM: CloudKerberosTicketRetrievalEnabled=1 + dsregcmd /join + reboot
-
-  ONE MANUAL STEP remains (interactive by design - Global Admin sign-in):
-    Install & configure Entra Cloud Sync so labuser1/labuser2 become hybrid
-    identities. See MANUAL-STEP-cloud-sync.md. Do it while slides run.
+    3. Client VM: CloudKerberosTicketRetrievalEnabled=1 + tools + reboot
+  Then sign in again as the synchronized lab user and verify PRT, cloud TGT,
+  CIFS ticket and a successful share mount. A SYSTEM check cannot prove the PRT.
 
 .EXAMPLE
   # Azure Cloud Shell (PowerShell) - already signed in, Az + Graph preinstalled
@@ -27,17 +30,40 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 function Step([string]$m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
+function Invoke-LabClientConfiguration {
+    param(
+        [ValidateSet('Check', 'Configure')] [string]$Mode,
+        [string]$TenantId
+    )
+    $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName "$Prefix-cli" `
+        -CommandId 'RunPowerShellScript' `
+        -ScriptPath (Join-Path (Join-Path $PSScriptRoot 'scripts') 'client-config.ps1') `
+        -Parameter @{ Mode = $Mode; ExpectedTenantId = $TenantId } -ErrorAction Stop
+    $stdout = (($r.Value | Where-Object Code -like '*StdOut*').Message) -join "`n"
+    $stderr = (($r.Value | Where-Object Code -like '*StdErr*').Message) -join "`n"
+    $stdout | Write-Host
+    $marker = if ($Mode -eq 'Check') { 'CLIENT_HYBRID_JOIN_READY' } else { 'CLIENT_CONFIG_DONE_REBOOTING' }
+    if ($stderr.Trim() -or $stdout -notmatch "(?m)^$marker\s*$") {
+        throw "Client $Mode did not finish successfully. $stderr`nSee MANUAL-STEP-connect-sync.md; do not treat pending registration as ready."
+    }
+}
 
 foreach ($m in 'Az.Accounts', 'Az.Storage', 'Az.Compute', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Authentication') {
     if (-not (Get-Module -ListAvailable $m)) {
         throw "Missing module '$m'. Install-Module Az,Microsoft.Graph -Scope CurrentUser"
     }
 }
-if (-not (Get-AzContext)) {
+$context = Get-AzContext
+if (-not $context) {
     throw 'No Azure context. Run this in Azure Cloud Shell (PowerShell), where you are already signed in.'
 }
 
 . (Join-Path (Join-Path $PSScriptRoot 'scripts') 'Connect-LabGraph.ps1')
+
+Step '0/3 Checking hybrid join before changing storage (Connect wizard owns SCP)'
+$tenantId = $context.Tenant.Id
+if (-not $tenantId) { throw 'The current Azure context has no tenant ID.' }
+Invoke-LabClientConfiguration -Mode Check -TenantId $tenantId
 
 $sa = Get-LabStorageAccount -ResourceGroupName $ResourceGroupName -Prefix $Prefix
 if (-not $sa) { throw "No $Prefix* storage account found in $ResourceGroupName." }
@@ -49,7 +75,7 @@ $dsOption = $sa.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
 Write-Host "Current storage identity option: $dsOption"
 
 # ------------------------------------------------ 1. Enable Entra Kerberos
-Step "1/4 Enabling Entra Kerberos on $saName"
+Step "1/3 Enabling Entra Kerberos on $saName"
 if ($dsOption -eq 'AADKERB') {
     Write-Host 'Entra Kerberos already enabled - skipping this step.'
 }
@@ -110,7 +136,7 @@ tenant has no such policy (a personal/dev tenant).
 }
 
 # --------------------------------------------------- 2. Grant admin consent
-Step '2/4 Granting admin consent to the storage account app (Graph)'
+Step '2/3 Granting admin consent to the storage account app (Graph)'
 
 Connect-LabGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All'
 
@@ -132,105 +158,27 @@ New-MgOauth2PermissionGrant -BodyParameter @{
 } | Out-Null
 Write-Host 'Admin consent granted: openid profile User.Read'
 
-# --------------------------------------------------------- 3. SCP in AD
-Step '3/4 Creating hybrid-join SCP in AD (Run Command on DC)'
-$org = Get-MgOrganization | Select-Object -First 1
-$tenantId = $org.Id
-$tenantDomain = ($org.VerifiedDomains | Where-Object IsInitial).Name
-$r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName "$Prefix-dc" `
-    -CommandId 'RunPowerShellScript' `
-    -ScriptPath (Join-Path (Join-Path $PSScriptRoot 'scripts') 'create-scp.ps1') `
-    -Parameter @{ TenantId = $tenantId; TenantDomain = $tenantDomain }
-($r.Value | Where-Object Code -like '*StdOut*').Message | Write-Host
-
-# --------------------------------------------------------- 4. Client config
-Step '4/4 Configuring client (cloud TGT policy + hybrid join, reboots)'
-$r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName "$Prefix-cli" `
-    -CommandId 'RunPowerShellScript' `
-    -ScriptPath (Join-Path (Join-Path $PSScriptRoot 'scripts') 'client-config.ps1')
-$clientOut = ($r.Value | Where-Object Code -like '*StdOut*').Message
-$clientOut | Write-Host
-
-# Do NOT print a green "COMPLETE" over a failed join. The client output already
-# says AzureAdJoined: NO when discovery failed - saying "complete" on top of that
-# sends people off to do Cloud Sync on a device that can never get a PRT, and
-# they then debug the wrong half of the stack.
-if ($clientOut -match 'DNS FAIL' -or $clientOut -match '0x80072ee7') {
-    Write-Host @'
-
-==============================================================
- SETUP STOPPED - PUBLIC DNS IS BROKEN
-==============================================================
- The client cannot resolve public names, so the device cannot
- reach Entra and hybrid join is impossible. This is NOT an Entra
- or SCP problem.
-
- The VNet points every VM at the DC for DNS, and the DC has no
- forwarder. Fix it on the DC (elevated), then re-run this script:
-
-   Set-DnsServerForwarder -IPAddress 168.63.129.16
-   Resolve-DnsName login.microsoftonline.com -Server 127.0.0.1
-
- From Cloud Shell, without RDP:
-   Invoke-AzVMRunCommand -ResourceGroupName <rg> -VMName <prefix>-dc `
-     -CommandId RunPowerShellScript -ScriptString `
-     "Set-DnsServerForwarder -IPAddress 168.63.129.16; Resolve-DnsName login.microsoftonline.com -Server 127.0.0.1"
-==============================================================
-'@ -ForegroundColor Red
-    throw 'Client cannot resolve public DNS - fix the DC forwarder and re-run.'
-}
-if ($clientOut -match 'error_missing_device' -or $clientOut -match '0x801c03f3') {
-    Write-Host @'
-
-==============================================================
- AzureAdJoined: NO - and that is EXPECTED right now
-==============================================================
- The client asked Entra to complete a registration for a device
- object that does not exist yet, so DRS answered:
-     error_missing_device / 0x801c03f3
-
- In a managed tenant the device object must be put into Entra by
- DIRECTORY SYNC first. That is the manual step below - and its
- device sync is OFF BY DEFAULT, so enabling it is a step people
- miss. Nothing is broken; just do them in order.
-==============================================================
-'@ -ForegroundColor Yellow
-}
-elseif ($clientOut -match 'AzureAdJoined\s*:\s*NO') {
-    Write-Host @'
-
-==============================================================
- WARNING - HYBRID JOIN DID NOT COMPLETE, AND NOT FOR THE USUAL REASON
-==============================================================
- AzureAdJoined: NO, but WITHOUT error_missing_device. Read the
- client output above for the first real error before continuing -
- do not assume Cloud Sync will fix it.
-==============================================================
-'@ -ForegroundColor Yellow
-}
+# --------------------------------------------------------- 3. Client config
+Step '3/3 Configuring client (cloud TGT policy + tools, reboots)'
+Invoke-LabClientConfiguration -Mode Configure -TenantId $tenantId
 
 Write-Host @"
 
 ==============================================================
- AUTOMATED SETUP COMPLETE
+ STORAGE/CLIENT CONFIGURATION APPLIED - USER BASELINE STILL REQUIRED
 ==============================================================
- REMAINING MANUAL STEPS (~15 min, needs Global Admin)
-   -> MANUAL-STEP-cloud-sync.md.  ORDER MATTERS:
+ Connect Sync and hybrid join were prerequisites; the wizard's
+ SCP was not changed. See MANUAL-STEP-connect-sync.md.
 
-   1. Install the Entra provisioning agent on the DC
-   2. Create a Cloud Sync config scoping OU=AzureFilesLab
-   3. Properties > Basics > ENABLE DEVICE SYNC   <- off by default,
-      and hybrid join CANNOT work without it
-   4. Provision on demand -> Device tab ->
-      CN=$Prefix-cli,CN=Computers,DC=contoso,DC=local
-   5. Confirm in Entra ID > Devices that $Prefix-cli exists
-
- Then, on the CLIENT VM (elevated), finish the join:
-   dsregcmd /join /debug   # now it should succeed
-   # sign out and back in to pick up the PRT, then:
-   dsregcmd /status        # AzureAdJoined: YES, AzureAdPrt: YES
-   klist cloud_debug       # enabled by policy: true
-   klist get krbtgt        # krbtgt/KERBEROS.MICROSOFTONLINE.COM
+ After reboot, sign in again on the CLIENT as the synchronized
+ lab user (not labadmin). In that user's normal, non-elevated shell:
+   dsregcmd /status        # DomainJoined: YES, AzureAdJoined: YES,
+                          # DeviceAuthStatus: SUCCESS, AzureAdPrt: YES
+   klist cloud_debug       # Cloud Kerberos retrieval enabled
+   klist                  # confirm cloud TGT after fresh logon
+   klist get cifs/$saName.file.core.windows.net
    net use Z: \\$saName.file.core.windows.net\labshare
+ Rehearse healthy access before any fault injection. Do not
+ continue while join, PRT, ticket retrieval or the mount is failing.
 ==============================================================
 "@ -ForegroundColor Green

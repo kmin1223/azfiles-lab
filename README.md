@@ -8,38 +8,49 @@
 > Microsoft-internal tooling — the `.gitignore` keeps them out. Never add the
 > source Microsoft support-wiki PDFs (Microsoft Confidential / NDA).
 
-Two 60-minute sessions. Each session: attendees kick off an automation script
-in **their own subscription** at minute 0, the presenter covers concepts on
-slides while it deploys, then everyone does guided break/fix labs together.
+Two 60-minute sessions. In Session 1, attendees deploy at minute 0 and follow
+guided break/fix labs. Session 2 has two separate tracks: **participants do
+cloud-only hands-on labs; only the presenter builds and demonstrates hybrid
+labs**. Both Session 2 environments must be prepared before the session.
+
+Session 2 runs **shared concepts → one prebuilt hybrid demo (healthy access,
+one fault, recovery) → continuous participant cloud-only labs A, B/B+, C and
+capstone → wrap-up**. Additional hybrid demos are optional follow-up, not
+interruptions to participant hands-on.
 
 | Session | Topic | Deploy time | Automation |
 |---|---|---|---|
 | 1 | On-prem AD DS auth (simulated with an Azure DC) | ~15 min | `session1-adds/deploy.ps1` — fully unattended |
-| 2 | Microsoft Entra Kerberos (hybrid identities) | ~10 min + 10 min manual | `session2-entra-kerberos/setup.ps1` + one interactive Cloud Sync step |
+| 2 — Hands-on — Cloud-only | Microsoft Entra Kerberos, cloud-only identities | Prework; allow time for deployment, join, RBAC and first sign-in | `session2-cloudonly/deploy.ps1` |
+| 2 — Presenter demo — Hybrid | Microsoft Entra Kerberos, synced AD identities | Presenter-only prework and rehearsal | Connect Sync + hybrid join, then `session2-entra-kerberos/setup.ps1` |
 
-Session 2 builds on the Session 1 environment. If the two sessions are days
-apart, have attendees **tear down after Session 1** (avoid idle VM costs) and
-**redeploy Session 1 shortly before Session 2** — send the reminder from the
-pre-session announcement doc (distributed with the other session materials).
-If the sessions are back-to-back, they can
-instead leave the environment running.
+Participants do **not** need to retain or redeploy Session 1 for Session 2.
+Their cloud-only environment uses a separate resource group, `azfiles-cloudonly`,
+with no DC, AD join or directory synchronization. Only the presenter may reuse a dedicated
+Session 1 deployment for the hybrid demo. Enabling AADKERB on that storage
+account replaces its AD DS authentication; do not convert an account still
+needed for a Session 1 demo.
 
 ## Contents
 
 ```
 azfiles-lab/
 ├── README.md                        <- you are here
-├── cleanup.ps1                      <- full teardown (both sessions)
+├── cleanup.ps1                      <- Session 1 / presenter hybrid teardown
 ├── session1-adds/
 │   ├── deploy.ps1                   <- attendees run THIS at session start
 │   ├── template/azuredeploy.json     <- ARM template (no Bicep needed)
 │   ├── scripts/                     <- run-command payloads (DC/client, incl. tool install)
 │   └── faults/Invoke-Fault.ps1      <- break/fix scenarios (5 faults)
-├── session2-entra-kerberos/
-│   ├── setup.ps1                    <- attendees run THIS at session start
-│   ├── MANUAL-STEP-cloud-sync.md    <- the one interactive step
+├── session2-cloudonly/              <- PARTICIPANTS: standalone prework
+│   ├── deploy.ps1
+│   ├── scripts/client-config.ps1    <- installs VM-local faults for Labs B/C
+│   └── faults/Invoke-Fault.ps1      <- cloud-only service-side faults
+├── session2-entra-kerberos/          <- PRESENTER ONLY: hybrid demos
+│   ├── setup.ps1
+│   ├── MANUAL-STEP-connect-sync.md  <- presenter-only Connect Sync / hybrid join setup
 │   ├── scripts/
-│   └── faults/Invoke-Fault.ps1      <- break/fix scenarios (4 faults)
+│   └── faults/Invoke-Fault.ps1      <- presenter hybrid break/fix scenarios
 └── tools/
     └── New-LabToolsBundle.ps1       <- PRESENTER ONLY: build the module bundle
 ```
@@ -74,8 +85,9 @@ so refreshing later is just `gh release upload tools-v1 labtools-modules.zip --c
 
 - An Azure subscription with **Owner** (RBAC + storage changes needed) and
   quota for 2× `Standard_B2ms` VMs.
-- For Session 2: **Global Administrator** on a (trial/dev) Entra tenant —
-  needed for admin consent and Cloud Sync. A personal dev tenant
+- For Session 2: **Global Administrator** on a disposable dev/trial Entra tenant —
+  needed by the lab automation for cloud-user creation and app consent.
+  Participants do not configure directory synchronization. A personal dev tenant
   (e.g., via the M365 developer program or a new trial) is strongly
   recommended over a corporate tenant.
 - **Azure Cloud Shell** — the one supported place to run the deploy and fault
@@ -84,9 +96,10 @@ so refreshing later is just `gh release upload tools-v1 labtools-modules.zip --c
 - RDP client — the in-VM klist/mount steps aren't a shell task.
 - **Plain ARM template** — nothing extra to install.
 
-> Run everything from Cloud Shell. The scripts are cross-platform, but the docs
-> assume Cloud Shell throughout: forward-slash paths (`./deploy.ps1`) and no
-> `Connect-AzAccount` (you are already signed in).
+> Run deployment and cloud-side faults from Cloud Shell. Session 2 participant
+> Labs B/C run inside the Windows VM instead. Cloud Shell examples use
+> forward-slash paths (`./deploy.ps1`) and need no `Connect-AzAccount`
+> when the correct subscription context is already active.
 
 ## Session 1 quick start (attendees)
 
@@ -228,16 +241,49 @@ same `-ResourceGroupName` — the steps are re-runnable and skip completed work.
 
 ## Session 2 quick start (attendees)
 
-Session 2 reuses the Session 1 environment, so **redeploy Session 1 first** if
-you tore it down (see the pre-session announcement you received).
+**Hands-on — Cloud-only.** Complete this before the session. Session 1 is not
+a prerequisite. Use Cloud Shell PowerShell, an Owner subscription, a dev/trial
+tenant, and quota for one `Standard_D2s_v5` VM. Use a short, lowercase,
+participant-unique prefix so the public DNS label does not collide in the region.
 
 ```powershell
-cd azfiles-lab/session2-entra-kerberos
-./setup.ps1 -ResourceGroupName azfiles-lab
-# then follow MANUAL-STEP-cloud-sync.md (~10 min, Global Admin in browser)
+# From the repository root
+./session2-cloudonly/deploy.ps1 -ResourceGroupName azfiles-cloudonly -Prefix <your-prefix>
 ```
 
-## Break/fix (presenter-driven, everyone follows along)
+Download the generated RDP file, sign in as the generated Entra lab user, and
+complete any required MFA registration. Before attending, confirm
+`AzureAdJoined: YES`, `DomainJoined: NO`, `AzureAdPrt: YES`, a CIFS service ticket,
+and a successful mount. A deployment completion message alone is not this gate.
+Use the same prefix in later cloud-side fault commands.
+
+### Session 2 presenter setup (hybrid)
+
+**Presenter demo — Hybrid.** Use Microsoft Entra Connect Sync, not the Cloud Sync
+device-sync preview. Complete all setup before presenting:
+
+1. Prepare a separate Session 1 AD DS lab; do not convert the storage account
+   still needed for Session 1 demonstrations.
+2. Follow `session2-entra-kerberos/MANUAL-STEP-connect-sync.md` to install
+   Connect Sync on a supported host, configure password hash synchronization,
+   include both lab users and the client computer in scope, and configure
+   hybrid join/SCP with the Connect wizard. Verify the synchronized identities,
+   device registration and user PRT.
+3. Run the storage/client setup below, then verify the effective cloud Kerberos
+   policy, new CIFS ticket and successful mount.
+
+```powershell
+# From the repository root, against the presenter's dedicated hybrid lab only
+./session2-entra-kerberos/setup.ps1 -ResourceGroupName azfiles-lab
+```
+
+The manual guide is the source of truth for host prerequisites, UPN matching
+and safe retirement of any previous Cloud Sync enrollment. Never synchronize
+the same objects concurrently with both engines. Rehearse healthy access plus each planned fault
+and repair. Participants watch these demonstrations; they do not run this setup
+or its fault commands. Keep a known-good recording as a fallback for live demos.
+
+## Break/fix (run only the commands for your track)
 
 ```powershell
 # Session 1  (from the session1-adds folder)
@@ -251,9 +297,18 @@ cd azfiles-lab/session2-entra-kerberos
 ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Enforce  # comply -> error 1396
 ./labs/Invoke-Aes256Migration.ps1 -ResourceGroupName azfiles-lab -Step Repair   # fix, in the order that matters
 
-# Session 2  (from the session2-entra-kerberos folder)
+# Session 2 — PARTICIPANTS, on the cloud-only VM in elevated PowerShell
+C:\LabTools\Invoke-LabFault.ps1 -Fault NoCloudTgt
+# Do not repair until Lab B+ finishes; then repeat with -Repair.
+# Other local fault: ProxyMangled
+
+# Session 2 — PARTICIPANTS, Cloud Shell from session2-cloudonly
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-cloudonly -Prefix <your-prefix> -Fault NoShareAccess
+# Other service-side fault: ConsentRevoked (capstone)
+
+# Session 2 — PRESENTER ONLY, Cloud Shell from session2-entra-kerberos
 ./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-lab -Fault NoCloudTgt
-# Faults: NoCloudTgt | ConsentRevoked | NotHybridJoined | NoShareAccess
+# Faults: NoCloudTgt | ConsentRevoked | NotHybridJoined | NoShareAccess | ProxyMangled
 ```
 
 Every fault maps to a real-world support issue (error 1396, 1327, 64/67,
@@ -263,14 +318,34 @@ symptom → diagnosis → fix catalog.
 
 ## Cleanup (after Session 2)
 
+**Participants — cloud-only:** delete only your cloud-only resource group.
+
 ```powershell
-./cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra
+Remove-AzResourceGroup -Name azfiles-cloudonly -Force -AsJob
 ```
 
-Then delete the Cloud Sync configuration + provisioning agent in the Entra
-portal (noted by the script).
+After Azure deletion completes, remove any remaining lab-owned Entra users,
+device, storage application and service principal. Do not delete similarly
+named objects belonging to another lab. There is no directory synchronization to remove.
+
+**Presenter — hybrid:** BEFORE deleting the DC or sync host, follow the retirement
+checklist in `session2-entra-kerberos/MANUAL-STEP-connect-sync.md`.
+Remove only lab-owned objects from the synchronization scope/source and verify
+the deletion exports while Connect Sync and AD are still running, then retire
+the dedicated lab sync host. Do not stop a shared sync service or disable
+directory synchronization tenant-wide. After completing the checklist:
+
+```powershell
+./cleanup.ps1 -ResourceGroupName azfiles-lab -IncludeEntra -ConnectSyncRetired
+```
+
+`-ConnectSyncRetired` acknowledges the prerequisite; the script does not retire
+Connect Sync itself or delete synchronized users. A separate sync host outside
+the lab RG also needs its own retirement. Never give this hybrid cleanup command to cloud-only
+participants as their teardown procedure.
 
 ## Cost note
 
-2× B2ms + Standard LRS storage ≈ a few USD for the two sessions if you clean
-up the same day. Deallocate VMs between sessions if they're days apart.
+Session 1 uses two VMs; each Session 2 participant uses one cloud-only VM and
+storage. The presenter's hybrid environment is additional. Clean up each
+environment after use, or deallocate VMs between sessions to reduce idle costs.
