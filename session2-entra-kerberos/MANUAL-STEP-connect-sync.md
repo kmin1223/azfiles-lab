@@ -335,8 +335,28 @@ Rehearse healthy access and recovery before presenting any hybrid fault.
 | No computer export | Include `CN=Computers`; verify `userCertificate` after the client task; retain default device attribute flows; examine sync/export errors |
 | Pending / `0x801c03f3` persists | Confirm certificate export completed and retry task; inspect **User Device Registration/Admin** events, intended SCP tenant, SYSTEM DNS/HTTPS/proxy access; do not report setup complete |
 | DeviceAuthStatus not SUCCESS | Check that the correct cloud device exists and is enabled; investigate deleted/recreated device history, not automatic SCP replacement |
+| Setup prints an empty TenantId / `CLIENT_TENANT_ID_UNAVAILABLE` | Capture `dsregcmd /status` and its exit code through client VM Run Command (SYSTEM). Some clients return exit code 0 and healthy device status but omit TenantId even in interactive output. Update `scripts/client-config.ps1` in the Cloud Shell source copy: if a healthy hybrid device omits TenantId, it reads only `HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo\<current dsregcmd Thumbprint>` and reports `TenantIdSource`. The registration value must be a nonempty GUID and still match the subscription tenant. This read-only compatibility path depends on local Windows registration metadata; absent/inaccessible keys or invalid values stop setup. Never enumerate and pick another key, use the user's PRT authority/SCP as device evidence, or substitute the expected tenant. The cause of the incomplete Tenant Details output is not established. |
+| `CLIENT_WRONG_TENANT` with two nonempty IDs | Compare the reported client tenant with the selected Azure subscription's tenant. Correct the Azure context or investigate the actual registration; do not substitute the expected tenant for missing client evidence. |
 | Device joined but no PRT | Fresh password logon as the exact synced user, PHS, verified UPN, authentication/Conditional Access failures and RDP sign-in context |
 | PRT present but SMB fails | Effective Kerberos policy, new cloud/CIFS tickets, storage-app consent, share-level access and NTFS ACLs; do not change sync architecture to fix an ACL |
+
+After updating the client payload, run **Check only** in Cloud Shell PowerShell
+before rerunning the storage-changing setup (use the intended subscription):
+
+```powershell
+$tenantId = (Get-AzContext).Tenant.Id
+if (-not $tenantId) { throw 'The current Azure context has no tenant ID.' }
+$result = Invoke-AzVMRunCommand -ResourceGroupName azfiles-lab -VMName azflab-cli `
+    -CommandId RunPowerShellScript `
+    -ScriptPath ./session2-entra-kerberos/scripts/client-config.ps1 `
+    -Parameter @{ Mode = 'Check'; ExpectedTenantId = $tenantId } -ErrorAction Stop
+$result.Value | Format-List Code, Message
+```
+
+Require `CLIENT_HYBRID_JOIN_READY` in stdout and no stderr errors. `TenantIdSource`
+identifies which device evidence supplied the value; a successful Run Command
+transport status alone is not a passing check. Check mode does not change
+storage, policies, SCP or registration, and does not reboot.
 
 For devices deleted/recreated by scope changes, follow
 [Microsoft's pending-device recovery](https://learn.microsoft.com/troubleshoot/azure/active-directory/pending-devices);

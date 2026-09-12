@@ -24,6 +24,11 @@ function Get-ScheduledTask { param($TaskName, $TaskPath) throw 'Unmocked task re
 function Start-ScheduledTask { param([Parameter(ValueFromPipeline)]$InputObject) throw 'Unmocked task start' }
 function New-Item { param($Path, [switch]$Force) throw 'Unmocked registry write' }
 function Set-ItemProperty { param($Path, $Name, $Value, $Type) throw 'Unmocked registry write' }
+function Get-ItemProperty {
+    [CmdletBinding()]
+    param($LiteralPath, $Name)
+    throw 'Unmocked registry read'
+}
 function shutdown { throw 'Unmocked reboot request' }
 function Get-AzStorageAccount { param($ResourceGroupName) throw 'Unmocked Azure storage read' }
 function Remove-AzResourceGroup { param($Name, [switch]$Force, [switch]$AsJob) throw 'Unmocked Azure deletion' }
@@ -69,6 +74,7 @@ TenantId : test-tenant
         Mock Start-ScheduledTask {}
         Mock New-Item {}
         Mock Set-ItemProperty {}
+        Mock Get-ItemProperty { throw 'Unexpected registration metadata read' }
     }
 
     It 'checks a healthy device without changing policy or starting registration' {
@@ -77,6 +83,7 @@ TenantId : test-tenant
         Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
         Assert-MockCalled Start-ScheduledTask -Times 0 -Exactly -Scope It
         Assert-MockCalled Resolve-DnsName -Times 3 -Exactly -Scope It
+        Assert-MockCalled Get-ItemProperty -Times 0 -Exactly -Scope It
     }
 
     It 'rejects an unjoined pending device instead of reporting success' {
@@ -114,6 +121,136 @@ TenantId : test-tenant
         { & $clientPreflight -Mode Configure -ExpectedTenantId another-tenant } |
             Should Throw 'CLIENT_WRONG_TENANT'
         Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
+    }
+
+    It 'reads tenant field names case-insensitively like other dsregcmd fields' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId', 'TenantID')
+        $result = @(& $clientPreflight -Mode Check -ExpectedTenantId test-tenant)
+        $result -contains 'CLIENT_HYBRID_JOIN_READY' | Should Be $true
+    }
+
+    It 'reads indented CRLF tenant output' {
+        $script:deviceStatus = ($deviceStatus -split '\r?\n' | ForEach-Object {
+            "    $_  "
+        }) -join "`r`n"
+        $result = @(& $clientPreflight -Mode Check -ExpectedTenantId test-tenant)
+        $result -contains 'CLIENT_HYBRID_JOIN_READY' | Should Be $true
+    }
+
+    It 'rejects a missing tenant distinctly before any configuration writes' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant', '')
+        { & $clientPreflight -Mode Configure -ExpectedTenantId test-tenant } |
+            Should Throw 'CLIENT_TENANT_ID_UNAVAILABLE'
+        Assert-MockCalled New-Item -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-ScheduledTask -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not read the next line as a blank tenant value' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant', "TenantId : `r`nMdmUrl : `r`n")
+        { & $clientPreflight -Mode Check -ExpectedTenantId test-tenant } |
+            Should Throw 'CLIENT_TENANT_ID_UNAVAILABLE'
+    }
+
+    It 'requires a readable tenant for joined devices even without an expected tenant' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant', '')
+        { & $clientPreflight -Mode InitializeRegistration } |
+            Should Throw 'CLIENT_TENANT_ID_UNAVAILABLE'
+        Assert-MockCalled Start-ScheduledTask -Times 0 -Exactly -Scope It
+    }
+
+    It 'reads only the current thumbprint registration when Tenant Details are omitted' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant', @'
+    Thumbprint : 0123456789abcdef0123456789abcdef01234567
+    TenantName :
+    AzureAdPrtAuthority : https://login.microsoftonline.com/unrelated-user-tenant
+'@)
+        Mock Get-ItemProperty { [pscustomobject]@{ TenantId = '11111111-2222-3333-4444-555555555555' } }
+        $result = @(& $clientPreflight -Mode Check -ExpectedTenantId '11111111-2222-3333-4444-555555555555')
+        $result -contains 'CLIENT_HYBRID_JOIN_READY' | Should Be $true
+        ($result -join "`n") | Should Match 'TenantIdSource=HKLM:'
+        Assert-MockCalled Get-ItemProperty -Times 1 -Exactly -Scope It -ParameterFilter {
+            $LiteralPath -eq 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo\0123456789abcdef0123456789abcdef01234567' -and
+            $Name -eq 'TenantId'
+        }
+        Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-ScheduledTask -Times 0 -Exactly -Scope It
+    }
+
+    It 'still rejects another tenant obtained from the current registration before writes' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant',
+            'Thumbprint : 0123456789abcdef0123456789abcdef01234567')
+        Mock Get-ItemProperty { [pscustomobject]@{ TenantId = '11111111-2222-3333-4444-555555555555' } }
+        { & $clientPreflight -Mode Configure -ExpectedTenantId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' } |
+            Should Throw 'CLIENT_WRONG_TENANT'
+        Assert-MockCalled New-Item -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-ScheduledTask -Times 0 -Exactly -Scope It
+    }
+
+    It 'resolves a blank tenant without consuming the next field or reinitializing join' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant',
+            "TenantID : `r`nMdmUrl : `r`nTHUMBPRINT : 0123456789ABCDEF0123456789ABCDEF01234567")
+        Mock Get-ItemProperty { [pscustomobject]@{ TenantId = '11111111-2222-3333-4444-555555555555' } }
+        $result = @(& $clientPreflight -Mode InitializeRegistration)
+        $result -contains 'CLIENT_HYBRID_JOIN_READY' | Should Be $true
+        Assert-MockCalled Get-ItemProperty -Times 1 -Exactly -Scope It
+        Assert-MockCalled Start-ScheduledTask -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not use registry metadata to override an explicit dsregcmd tenant' {
+        { & $clientPreflight -Mode Check -ExpectedTenantId another-tenant } |
+            Should Throw 'CLIENT_WRONG_TENANT'
+        Assert-MockCalled Get-ItemProperty -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects absent or unreadable registration metadata without choosing another key' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant',
+            'Thumbprint : 0123456789abcdef0123456789abcdef01234567')
+        Mock Get-ItemProperty { throw 'Registration key not accessible' }
+        { & $clientPreflight -Mode Configure -ExpectedTenantId test-tenant } |
+            Should Throw 'CLIENT_TENANT_ID_UNAVAILABLE'
+        Assert-MockCalled Get-ItemProperty -Times 1 -Exactly -Scope It
+        Assert-MockCalled New-Item -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects empty malformed and zero registration tenants' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant',
+            'Thumbprint : 0123456789abcdef0123456789abcdef01234567')
+        foreach ($invalidTenant in @('', 'not-a-guid', '00000000-0000-0000-0000-000000000000')) {
+            $script:registrationTenant = $invalidTenant
+            Mock Get-ItemProperty { [pscustomobject]@{ TenantId = $registrationTenant } }
+            { & $clientPreflight -Mode Configure -ExpectedTenantId test-tenant } |
+                Should Throw 'CLIENT_TENANT_ID_UNAVAILABLE'
+        }
+        Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects invalid or missing thumbprints rather than constructing an unbound path' {
+        foreach ($invalidThumbprint in @('', '*', '..', 'abcd', ('0' * 41))) {
+            $script:deviceStatus = "DomainJoined : YES`nAzureAdJoined : YES`nDeviceAuthStatus : SUCCESS`nThumbprint : $invalidThumbprint`nTenantId :"
+            { & $clientPreflight -Mode Configure -ExpectedTenantId test-tenant } |
+                Should Throw 'CLIENT_TENANT_ID_UNAVAILABLE'
+        }
+        Assert-MockCalled Get-ItemProperty -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-ItemProperty -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not use a registration entry to promote an unhealthy device to ready' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant',
+            'Thumbprint : 0123456789abcdef0123456789abcdef01234567').Replace('SUCCESS', 'FAILED')
+        { & $clientPreflight -Mode Check } | Should Throw 'CLIENT_TENANT_ID_UNAVAILABLE'
+        Assert-MockCalled Get-ItemProperty -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-ScheduledTask -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not consult registration metadata for a pending device' {
+        $script:deviceStatus = $deviceStatus.Replace('TenantId : test-tenant',
+            'Thumbprint : 0123456789abcdef0123456789abcdef01234567').Replace('AzureAdJoined : YES', 'AzureAdJoined : NO')
+        $result = @(& $clientPreflight -Mode InitializeRegistration -ExpectedTenantId test-tenant)
+        $result -contains 'CLIENT_REGISTRATION_STARTED_NOT_READY' | Should Be $true
+        Assert-MockCalled Get-ItemProperty -Times 0 -Exactly -Scope It
     }
 
     It 'fails on an unreadable dsregcmd status' {

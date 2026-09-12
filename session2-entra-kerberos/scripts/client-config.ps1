@@ -13,22 +13,48 @@ $ProgressPreference = 'SilentlyContinue'
 function Get-LabHybridJoinState {
     $status = (& dsregcmd /status 2>&1) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "dsregcmd /status failed (exit $LASTEXITCODE)." }
-    $tenant = [regex]::Match($status, '(?m)^\s*TenantId\s*:\s*(\S+)\s*$').Groups[1].Value
-    [pscustomobject]@{
+    $tenant = [regex]::Match($status, '(?im)^[ \t]*TenantId[ \t]*:[ \t]*(\S+)[ \t]*\r?$').Groups[1].Value
+    $state = [pscustomobject]@{
         DomainJoined = $status -match '(?m)^\s*DomainJoined\s*:\s*YES\s*$'
         AzureAdJoined = $status -match '(?m)^\s*AzureAdJoined\s*:\s*YES\s*$'
         DeviceHealthy = $status -match '(?m)^\s*DeviceAuthStatus\s*:\s*SUCCESS\s*$'
         TenantId = $tenant
+        TenantIdSource = if ($tenant) { 'dsregcmd' } else { 'Unavailable' }
     }
+    if ($state.DomainJoined -and $state.AzureAdJoined -and $state.DeviceHealthy -and -not $tenant) {
+        # Some clients omit Tenant Details despite successful device authentication.
+        # Bind this local metadata read to the current certificate, never the first key.
+        $thumbprint = [regex]::Match($status, '(?im)^[ \t]*Thumbprint[ \t]*:[ \t]*([0-9a-f]{40})[ \t]*\r?$').Groups[1].Value
+        if (-not $thumbprint) {
+            throw 'CLIENT_TENANT_ID_UNAVAILABLE: dsregcmd omitted TenantId and a valid device Thumbprint. Cannot identify the current registration; do not change SCP or bypass tenant validation.'
+        }
+        $joinPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo\$thumbprint"
+        try {
+            $registration = Get-ItemProperty -LiteralPath $joinPath -Name TenantId -ErrorAction Stop
+        } catch {
+            throw "CLIENT_TENANT_ID_UNAVAILABLE: cannot read TenantId from the current device registration '$joinPath'. $($_.Exception.Message)"
+        }
+        $registeredTenant = [guid]::Empty
+        if (-not [guid]::TryParse([string]$registration.TenantId, [ref]$registeredTenant) -or
+            $registeredTenant -eq [guid]::Empty) {
+            throw "CLIENT_TENANT_ID_UNAVAILABLE: the current device registration '$joinPath' has no valid TenantId. Do not substitute the expected tenant."
+        }
+        $state.TenantId = $registeredTenant.ToString()
+        $state.TenantIdSource = $joinPath
+    }
+    $state
 }
 
 $join = Get-LabHybridJoinState
-Write-Output "Hybrid join: DomainJoined=$($join.DomainJoined) AzureAdJoined=$($join.AzureAdJoined) DeviceHealthy=$($join.DeviceHealthy) TenantId=$($join.TenantId)"
+Write-Output "Hybrid join: DomainJoined=$($join.DomainJoined) AzureAdJoined=$($join.AzureAdJoined) DeviceHealthy=$($join.DeviceHealthy) TenantId=$($join.TenantId) TenantIdSource=$($join.TenantIdSource)"
 if (-not $join.DomainJoined) {
     throw 'CLIENT_NOT_DOMAIN_JOINED: complete Session 1 domain join first.'
 }
+if ($join.AzureAdJoined -and [string]::IsNullOrWhiteSpace($join.TenantId)) {
+    throw 'CLIENT_TENANT_ID_UNAVAILABLE: no readable TenantId was available for this registration. Inspect dsregcmd /status and device health in the same VM Run Command (SYSTEM) context. This is not proof of a different tenant; do not change SCP or bypass tenant validation.'
+}
 if ($join.AzureAdJoined -and $ExpectedTenantId -and $join.TenantId -ne $ExpectedTenantId) {
-    throw 'CLIENT_WRONG_TENANT: client tenant does not match the Azure subscription tenant. Review the Connect wizard SCP; do not overwrite it with a script.'
+    throw "CLIENT_WRONG_TENANT: client tenant '$($join.TenantId)' does not match the Azure subscription tenant '$ExpectedTenantId'. Review the Azure context and Connect wizard SCP; do not overwrite it with a script."
 }
 
 # DNS preflight. Hybrid join talks to enterpriseregistration.windows.net and
