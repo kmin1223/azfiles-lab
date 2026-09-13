@@ -35,6 +35,18 @@
   The one thing that cannot be automated: security defaults force MFA
   registration on first sign-in. That is a prework item, not a bug.
 
+.PARAMETER Prefix
+  Optional explicit resource prefix (up to 11 lowercase letters/digits).
+  Otherwise derived from the signed-in Azure account, tenant, subscription
+  and resource group. The same context resolves the same prefix in fault scripts.
+  Existing labs made with the old default must pass -Prefix azfcloud.
+
+.PARAMETER LogPath
+  Parent directory for private, timestamped run folders containing deploy.log
+  and lab-info.txt. Defaults to $HOME/azfiles-lab-logs. Files include generated
+  lab credentials: do not commit/share them. Download before leaving a Cloud
+  Shell session if persistent storage is not configured.
+
 .EXAMPLE
   # Azure Cloud Shell (PowerShell) - already signed in
   ./deploy.ps1 -ResourceGroupName azfiles-cloudonly
@@ -43,13 +55,22 @@
 param(
     [Parameter(Mandatory)] [string]$ResourceGroupName,
     [string]$Location  = 'koreacentral',
-    [string]$Prefix    = 'azfcloud',
+    [ValidatePattern('^[a-z0-9]{1,11}$')]
+    [string]$Prefix,
     [string]$ShareName = 'labshare',
-    [string]$VmSize    = 'Standard_D2s_v5'
+    [string]$VmSize    = 'Standard_D2s_v5',
+    [ValidateNotNullOrEmpty()]
+    [string]$LogPath   = (Join-Path $HOME 'azfiles-lab-logs')
 )
 $ErrorActionPreference = 'Stop'
 $sw = [Diagnostics.Stopwatch]::StartNew()
-function Step([string]$m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
+$startedUtc = [datetime]::UtcNow
+function Step([string]$m) {
+    $deploymentInfo['Last step'] = $m
+    $deploymentInfo['Elapsed'] = Format-CloudDeploymentElapsed $sw.Elapsed
+    Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
+    Write-Host "`n[+$($deploymentInfo['Elapsed'])] === $m ===" -ForegroundColor Cyan
+}
 
 # Shared with the Session 2 hybrid scripts: Graph from Cloud Shell with no
 # device code. Cloud Shell signs you in to Azure but NOT to Graph - separate
@@ -58,11 +79,40 @@ $helper = Join-Path (Split-Path $PSScriptRoot -Parent) 'session2-entra-kerberos/
 if (-not (Test-Path $helper)) { throw "Missing $helper - run this from a full clone of the repo." }
 . $helper
 
-if (-not (Get-AzContext)) {
+$azContext = Get-AzContext -ErrorAction Stop
+if (-not $azContext) {
     throw 'No Azure context. Run this in Azure Cloud Shell (PowerShell), where you are already signed in.'
 }
+. (Join-Path (Join-Path $PSScriptRoot 'scripts') 'CloudOnlyLabNaming.ps1')
+$namingParameters = @{ ResourceGroupName = $ResourceGroupName; AzureContext = $azContext }
+if ($PSBoundParameters.ContainsKey('Prefix')) { $namingParameters.Prefix = $Prefix }
+$Prefix = Resolve-CloudOnlyLabPrefix @namingParameters
+Write-Host "Cloud-only resource prefix: $Prefix (use this value with -Prefix when accessing this lab from another login context)."
 $graph = 'https://graph.microsoft.com/v1.0'
 $users = @('labuser1', 'labuser2')
+
+. (Join-Path (Join-Path $PSScriptRoot 'scripts') 'CloudOnlyDeploymentLog.ps1')
+$logRun = Start-CloudDeploymentLog -LogPath $LogPath
+$deploymentInfo = [ordered]@{
+    Status = 'IN PROGRESS'
+    'Started UTC' = $startedUtc.ToString('o')
+    'Resource group' = $ResourceGroupName
+    Prefix = $Prefix
+    'Storage account' = 'not yet recorded'
+    'File share' = $ShareName
+    'VM name' = "$Prefix-cli"
+    'User baseline' = 'NOT VERIFIED'
+    Transcript = $logRun.Transcript
+}
+$deploymentFailure = $null
+$deploymentCompleted = $false
+$joined = $false
+try {
+Write-Host "Transcript: $($logRun.Transcript)"
+Write-Host "Lab info  : $($logRun.InfoFile)"
+Write-Host "Started UTC: $($deploymentInfo['Started UTC']); resource group: $ResourceGroupName; prefix: $Prefix"
+Write-Warning 'Logs contain generated lab credentials. Keep them private; do not commit or share them. Cloud Shell retention depends on persistent storage; download the files if needed.'
+Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 
 # ------------------------------------------------------------------ password
 # No % or ! : Run Command parameters pass through a cmd layer that expands them
@@ -73,6 +123,7 @@ $pick = { param($set, $n) -join (1..$n | ForEach-Object { $set | Get-Random }) }
 $plainPw = (& $pick $U 3) + (& $pick $L 6) + (& $pick $D 3) + (& $pick $S 2)
 if ($plainPw -match '[\s"''`$%!]') { throw 'Generated password contains a forbidden character - re-run.' }
 $secPw = ConvertTo-SecureString $plainPw -AsPlainText -Force
+$deploymentInfo['Generated password'] = $plainPw
 
 Step "0/9 Resource group $ResourceGroupName in $Location"
 if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
@@ -81,8 +132,16 @@ if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyCont
 
 # ------------------------------------------------- 1. storage + Entra Kerberos
 Step '1/9 Storage account with Entra Kerberos'
-$sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue |
-    Where-Object StorageAccountName -like "$Prefix*" | Select-Object -First 1
+$accounts = @(Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction Stop)
+if (-not $PSBoundParameters.ContainsKey('Prefix') -and
+    @($accounts | Where-Object { $_.StorageAccountName.StartsWith('azfcloud', [StringComparison]::Ordinal) }).Count) {
+    throw 'CLOUD_PREFIX_LEGACY_LAB: This resource group contains an account matching the old azfcloud prefix. To reuse that lab, specify its exact previous -Prefix (usually azfcloud); for a new lab, use a separate resource group. No storage account was selected.'
+}
+$matchingAccounts = @($accounts | Where-Object { $_.StorageAccountName.StartsWith($Prefix, [StringComparison]::Ordinal) })
+if ($matchingAccounts.Count -gt 1) {
+    throw "CLOUD_STORAGE_AMBIGUOUS: More than one storage account matches '$Prefix' in '$ResourceGroupName'. Use the intended resource group/prefix; no storage account was selected."
+}
+$sa = $matchingAccounts | Select-Object -First 1
 if ($sa) {
     $saName = $sa.StorageAccountName
     Write-Host "  reusing $saName"
@@ -92,6 +151,8 @@ if ($sa) {
         -SkuName Standard_LRS -Kind StorageV2 -EnableLargeFileShare -MinimumTlsVersion TLS1_2 | Out-Null
     Write-Host "  created $saName"
 }
+$deploymentInfo['Storage account'] = $saName
+Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 # Cloud-only: no ActiveDirectoryDomainName / DomainGuid to supply. That is the point.
 Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName `
     -EnableAzureActiveDirectoryKerberosForFile $true | Out-Null
@@ -128,6 +189,8 @@ Write-Host '  consent granted: openid profile User.Read'
 Step '3/9 Cloud-only Entra users'
 $org = Get-MgOrganization | Select-Object -First 1
 $initialDomain = ($org.VerifiedDomains | Where-Object IsInitial).Name
+$deploymentInfo['Lab users'] = ($users | ForEach-Object { "$_@$initialDomain" }) -join ', '
+Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 $userIds = @{}
 foreach ($u in $users) {
     $upn = "$u@$initialDomain"
@@ -194,6 +257,9 @@ if (-not $pipObj.DnsSettings -or -not $pipObj.DnsSettings.Fqdn) {
 $fqdn = $pipObj.DnsSettings.Fqdn
 $ip   = $pipObj.IpAddress
 Write-Host "  $fqdn  ($ip)"
+$deploymentInfo['RDP host'] = $fqdn
+$deploymentInfo['Public IP'] = $ip
+Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 
 # ------------------------------------------------------- 5. managed identity
 # Hard prerequisite for AADLoginForWindows. Without it the extension still
@@ -266,6 +332,7 @@ The device is not Entra joined after 6 minutes. Read the logs; do not guess:
 That channel is the primary evidence for device registration.
 "@
 }
+$deploymentInfo['Entra joined'] = if ($joined) { 'YES' } else { 'NOT CONFIRMED' }
 
 # ------------------------------------------------------------------ 9. RBAC
 # 'Virtual Machine Administrator Login' is what makes the lab user a local admin
@@ -299,6 +366,8 @@ authentication level:i:2
 "@
 $rdpPath = "$HOME/azfiles-cloudonly.rdp"
 $rdp | Set-Content -Path $rdpPath -Encoding ascii
+$deploymentInfo['RDP file'] = $rdpPath
+Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 
 # Push the file to the browser straight away. enablerdsaadauth is a FILE
 # property - mstsc has no switch or GUI field for it - so everyone needs this
@@ -312,9 +381,10 @@ if (Get-Command download -ErrorAction SilentlyContinue) {
 Write-Host @"
 
 ==============================================================
- DEPLOYMENT COMPLETE  ($([int]$sw.Elapsed.TotalMinutes) min $($sw.Elapsed.Seconds % 60) s)
+ $(if ($joined) { 'DEPLOYMENT CONFIGURATION APPLIED' } else { 'DEPLOYMENT INCOMPLETE - ENTRA JOIN NOT CONFIRMED' })
 ==============================================================
  storage account : $saName
+ resource prefix : $Prefix
  file share      : $ShareName
  users           : labuser1@$initialDomain   (has share access)
                    labuser2@$initialDomain   (none - Lab D contrast)
@@ -372,3 +442,13 @@ $(if ($autoDownloaded) {
    # then delete the two users and the device object in Entra ID
 ==============================================================
 "@ -ForegroundColor Green
+$deploymentCompleted = $true
+} catch {
+    $deploymentFailure = $_
+    Write-Host "DEPLOYMENT FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    throw
+} finally {
+    $sw.Stop()
+    Complete-CloudDeploymentLog -Run $logRun -Info $deploymentInfo -Elapsed $sw.Elapsed `
+        -Completed $deploymentCompleted -Joined $joined -Failure $deploymentFailure
+}

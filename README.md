@@ -241,21 +241,56 @@ same `-ResourceGroupName` — the steps are re-runnable and skip completed work.
 
 ## Session 2 quick start (attendees)
 
-**Hands-on — Cloud-only.** Complete this before the session. Session 1 is not
+**Hands-on — Cloud-only.** Start this on slide 2, or complete it in advance. Session 1 is not
 a prerequisite. Use Cloud Shell PowerShell, an Owner subscription, a dev/trial
-tenant, and quota for one `Standard_D2s_v5` VM. Use a short, lowercase,
-participant-unique prefix so the public DNS label does not collide in the region.
+tenant, and quota for one `Standard_D2s_v5` VM. No prefix input is needed:
+resource names use a deterministic prefix derived from your Azure account,
+tenant, subscription and resource group, not your Cloud Shell home folder.
 
 ```powershell
-# From the repository root
-./session2-cloudonly/deploy.ps1 -ResourceGroupName azfiles-cloudonly -Prefix <your-prefix>
+git clone https://github.com/kmin1223/azfiles-lab.git
+cd azfiles-lab
+./session2-cloudonly/deploy.ps1 `
+    -ResourceGroupName azfiles-cloudonly
 ```
 
+Use a separate disposable tenant per participant with Global Administrator
+permissions. Do not run in a corporate/production or shared participant tenant:
+the script creates `labuser1`/`labuser2` and resets their passwords if they exist.
+If multiple subscriptions are available, select the intended one first with
+`Set-AzContext -Subscription "<name-or-id>"`. Follow any Graph sign-in/consent
+prompts. Do not redeploy an already healthy lab just to follow the slide.
+
 Download the generated RDP file, sign in as the generated Entra lab user, and
-complete any required MFA registration. Before attending, confirm
+complete any required MFA registration manually. Before hands-on, confirm
 `AzureAdJoined: YES`, `DomainJoined: NO`, `AzureAdPrt: YES`, a CIFS service ticket,
 and a successful mount. A deployment completion message alone is not this gate.
-Use the same prefix in later cloud-side fault commands.
+Run later cloud-side fault commands with the same Azure login, tenant,
+subscription and resource group; they derive the same prefix automatically.
+The resolved prefix is printed at startup and in the deployment summary. To
+access a lab created with an explicit prefix or the old default, keep passing
+that value (for example `-Prefix azfcloud`) to deployment and faults. No
+automatic fallback selects legacy or other participants' accounts. An explicit
+deployment prefix must be 1-11 lowercase letters/digits; it is still optional.
+Automatic names do not isolate the shared `labuser1`/`labuser2` directory
+identities, so the separate-tenant requirement above still applies.
+If deployment, sign-in
+or permission propagation is still pending, observe the demo and join when
+ready; no fixed deployment-to-readiness duration is guaranteed.
+
+Deployment prints `[+hh:mm:ss]` at each step and `Total elapsed` on normal
+completion or a handled deployment failure. Each run writes a transcript
+(`deploy.log`) and an incrementally updated resource/connection summary
+(`lab-info.txt`) under `$HOME/azfiles-lab-logs/cloudonly-deploy-<UTC timestamp>-<id>/`.
+Use optional `-LogPath` to change the parent directory. The paths are printed
+at startup and completion. Final status distinguishes configuration applied
+(user access still unverified), join incomplete, and failure; after an abrupt
+process termination the last snapshot may remain `IN PROGRESS`.
+These files include the generated password. Run folders are restricted to
+the current user on Linux (mode 700), or the current user, SYSTEM and local
+administrators on Windows. Do not commit or share them. Cloud Shell retention
+depends on persistent storage; download the files before leaving an ephemeral
+session. Parameter/context preflight failures occur before logging starts.
 
 ### Session 2 presenter setup (hybrid)
 
@@ -303,7 +338,7 @@ C:\LabTools\Invoke-LabFault.ps1 -Fault NoCloudTgt
 # Other local fault: ProxyMangled
 
 # Session 2 — PARTICIPANTS, Cloud Shell from session2-cloudonly
-./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-cloudonly -Prefix <your-prefix> -Fault NoShareAccess
+./faults/Invoke-Fault.ps1 -ResourceGroupName azfiles-cloudonly -Fault NoShareAccess
 # Other service-side fault: ConsentRevoked (capstone)
 
 # Session 2 — PRESENTER ONLY, Cloud Shell from session2-entra-kerberos

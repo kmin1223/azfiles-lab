@@ -21,3 +21,6 @@ labtools-modules.zip
 .DS_Store
 Thumbs.db
 *.tmp
+
+# Per-run deployment output includes generated lab credentials.
+cloudonly-deploy-*/

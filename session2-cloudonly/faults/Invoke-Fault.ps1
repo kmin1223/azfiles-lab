@@ -39,9 +39,14 @@
                   Used by Lab D as the "share RBAC" door.
 
 .EXAMPLE
-  # Azure Cloud Shell (PowerShell), full clone repository root, OWN participant prefix
-  .\session2-cloudonly\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-cloudonly -Prefix <participant-prefix> -Fault ConsentRevoked
-  .\session2-cloudonly\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-cloudonly -Prefix <participant-prefix> -Fault ConsentRevoked -Repair
+  # Same Azure login, tenant, subscription and resource group as deployment.
+  .\session2-cloudonly\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-cloudonly -Fault ConsentRevoked
+  .\session2-cloudonly\faults\Invoke-Fault.ps1 -ResourceGroupName azfiles-cloudonly -Fault ConsentRevoked -Repair
+
+.PARAMETER Prefix
+  Optional. Uses the same Azure-context-derived prefix as deploy.ps1 when omitted.
+  For an existing lab with an explicit or old default prefix, supply that value
+  (for example -Prefix azfcloud). Never falls back to another participant's account.
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +56,7 @@ param(
     [string]$Fault,
     [switch]$Repair,
     [ValidatePattern('^[a-z0-9]{1,24}$')]
-    [string]$Prefix = 'azfcloud',
+    [string]$Prefix,
     [string]$User   = 'labuser1'
 )
 $ErrorActionPreference = 'Stop'
@@ -63,6 +68,14 @@ $helper = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'ses
 if (-not (Test-Path $helper)) { throw 'Missing Connect-LabGraph.ps1 - run from a full clone of the repo.' }
 . $helper
 
+. (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts') 'CloudOnlyLabNaming.ps1')
+$azContext = Get-AzContext -ErrorAction Stop
+if (-not $azContext) { throw 'No Azure context. Sign in to the intended lab subscription before running a fault.' }
+$namingParameters = @{ ResourceGroupName = $ResourceGroupName; AzureContext = $azContext }
+if ($PSBoundParameters.ContainsKey('Prefix')) { $namingParameters.Prefix = $Prefix }
+$Prefix = Resolve-CloudOnlyLabPrefix @namingParameters
+Write-Host "Cloud-only resource prefix: $Prefix"
+
 function Get-ConsentLabStorageAccount([string]$ResourceGroupName, [string]$Prefix) {
     if ($Prefix -cnotmatch '^[a-z0-9]{1,24}$') {
         throw 'CONSENT_TARGET_INVALID: Use the literal lowercase alphanumeric participant prefix, not a wildcard.'
@@ -70,7 +83,7 @@ function Get-ConsentLabStorageAccount([string]$ResourceGroupName, [string]$Prefi
     $accounts = @(Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
         Where-Object { $_.StorageAccountName.StartsWith($Prefix, [StringComparison]::Ordinal) })
     if ($accounts.Count -ne 1) {
-        throw "CONSENT_TARGET_AMBIGUOUS: Expected exactly one '$Prefix*' storage account in '$ResourceGroupName'; found $($accounts.Count). Check your subscription/resource group and use a more specific participant prefix. Nothing was changed."
+        throw "CONSENT_TARGET_AMBIGUOUS: Expected exactly one '$Prefix*' storage account in '$ResourceGroupName'; found $($accounts.Count). Use the same Azure login/tenant/subscription/resource group as deployment, or pass the recorded -Prefix (azfcloud for the old default). Nothing was changed."
     }
     $accounts[0]
 }
