@@ -14,8 +14,11 @@
     0. Verify healthy hybrid join in the subscription's tenant before mutations
     1. Optionally grant the specified user SMB Share Contributor on labshare
     2. Enable Entra Kerberos (AADKERB) on the storage account
-    3. Grant admin consent (openid/profile/User.Read) to the auto-created
-       app '[Storage Account] <sa>.file.core.windows.net' via Microsoft Graph
+    3. Restore missing openid/profile/User.Read API permission declarations
+       on '[Storage Account] <sa>.file.core.windows.net', preserving other
+       declarations; keep or create the exact admin consent baseline.
+       Requires Application.ReadWrite.All plus DelegatedPermissionGrant.ReadWrite.All
+       and caller authorization to edit the app and grant tenant-wide consent.
     4. Client VM: CloudKerberosTicketRetrievalEnabled=1 + tools + reboot
   Then sign in again as the synchronized lab user and verify PRT, cloud TGT,
   CIFS ticket and a successful share mount. A SYSTEM check cannot prove the PRT.
@@ -223,7 +226,7 @@ if ($PrepareRbacLab) {
 # --------------------------------------------------- 3. Grant admin consent
 Step '3/4 Granting admin consent to the storage account app (Graph)'
 
-Connect-LabGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All'
+Connect-LabGraph -Scopes 'Application.ReadWrite.All', 'DelegatedPermissionGrant.ReadWrite.All'
 
 Initialize-LabGraphConsent -StorageAccountName $saName
 

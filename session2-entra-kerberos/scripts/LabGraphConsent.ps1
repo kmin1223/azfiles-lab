@@ -1,4 +1,5 @@
 # Shared baseline validation for setup and the consent fault.
+. (Join-Path $PSScriptRoot 'LabAppPermissions.ps1')
 function Assert-ConsentGuid([string]$Value, [string]$Label) {
     $parsed = [guid]::Empty
     if (-not [guid]::TryParse($Value, [ref]$parsed) -or $parsed -eq [guid]::Empty) {
@@ -36,12 +37,12 @@ function Get-LabGraphConsent([string]$ClientId, [string]$GraphId) {
 function Get-LabConsentPrincipals {
     param([string]$StorageAccountName, [switch]$RetryMissingStoragePrincipal)
     $escapedName = $StorageAccountName.Replace("'", "''")
-    $storageSps = @(Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $escapedName.file.core.windows.net'" -All -ErrorAction Stop)
+    $storageSps = @(Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $escapedName.file.core.windows.net'" -Property @('id', 'appId') -All -ErrorAction Stop)
     if ($RetryMissingStoragePrincipal -and $storageSps.Count -eq 0) {
         Start-Sleep -Seconds 30
-        $storageSps = @(Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $escapedName.file.core.windows.net'" -All -ErrorAction Stop)
+        $storageSps = @(Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $escapedName.file.core.windows.net'" -Property @('id', 'appId') -All -ErrorAction Stop)
     }
-    $graphSps = @(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -All -ErrorAction Stop)
+    $graphSps = @(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -Property @('id', 'appId', 'oauth2PermissionScopes') -All -ErrorAction Stop)
     if ($storageSps.Count -ne 1 -or $graphSps.Count -ne 1) {
         throw 'CONSENT_SP_AMBIGUOUS: Expected exactly one storage account service principal and one Microsoft Graph service principal. Inspect Enterprise applications and resolve missing/duplicate identities before retrying.'
     }
@@ -52,7 +53,11 @@ function Get-LabConsentPrincipals {
     if ([guid]$clientId -eq [guid]$graphId) {
         throw 'CONSENT_SP_AMBIGUOUS: Storage and Microsoft Graph service principals must be distinct. Inspect Enterprise applications before retrying.'
     }
-    [pscustomobject]@{ ClientId = $clientId; GraphId = $graphId }
+    [pscustomobject]@{
+        ClientId = $clientId; GraphId = $graphId
+        StorageAppId = [string]$storageSps[0].AppId
+        GraphServicePrincipal = $graphSps[0]
+    }
 }
 
 function Initialize-LabGraphConsent {
@@ -64,6 +69,7 @@ function Initialize-LabGraphConsent {
     )
     $principals = Get-LabConsentPrincipals -StorageAccountName $StorageAccountName -RetryMissingStoragePrincipal
     $baseline = Get-LabGraphConsent -ClientId $principals.ClientId -GraphId $principals.GraphId
+    Initialize-LabAppPermissions -Principals $principals
     if ($baseline) {
         Write-Host 'Admin consent baseline already present on directory read: openid profile User.Read. No grant changed.'
         return

@@ -19,7 +19,7 @@ foreach ($name in @('Invoke-LabConsentFault', 'Show-Cmd')) {
 
 function Connect-LabGraph { param($Scopes) throw 'Unmocked Graph connection' }
 function Get-MgServicePrincipal {
-    [CmdletBinding()] param($Filter, [switch]$All)
+    [CmdletBinding()] param($Filter, $Property, [switch]$All)
     throw 'Unmocked service principal read'
 }
 function Get-MgOauth2PermissionGrant {

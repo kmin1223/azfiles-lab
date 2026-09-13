@@ -9,7 +9,7 @@ function Connect-LabGraph { param($Scopes) throw 'Unmocked Graph connection' }
 function Step { param($Message) }
 function Invoke-LabClientConfiguration { param($Mode, $TenantId) throw 'Unmocked VM configuration' }
 function Get-MgServicePrincipal {
-    [CmdletBinding()] param($Filter, [switch]$All)
+    [CmdletBinding()] param($Filter, $Property, [switch]$All)
     throw 'Unmocked service principal read'
 }
 function Get-MgOauth2PermissionGrant {
@@ -23,6 +23,14 @@ function New-MgOauth2PermissionGrant {
 function Remove-MgOauth2PermissionGrant {
     [CmdletBinding()] param($OAuth2PermissionGrantId)
     throw 'Setup must never delete a grant'
+}
+function Get-MgApplication {
+    [CmdletBinding()] param($Filter, $ApplicationId, $Property, [switch]$All)
+    throw 'Unmocked application read'
+}
+function Update-MgApplication {
+    [CmdletBinding()] param($ApplicationId, $BodyParameter)
+    throw 'Unmocked application update'
 }
 
 Describe 'Setup consent preserves an existing baseline (offline)' {
@@ -78,6 +86,7 @@ Describe 'Setup consent preserves an existing baseline (offline)' {
             if (-not $invisibleCreate) { $script:grants += $script:baseline }
         }
         Mock Remove-MgOauth2PermissionGrant { throw 'Setup must never delete a grant' }
+        Mock Initialize-LabAppPermissions {}
         Mock Start-Sleep {}
         Mock Write-Host {}
     }
@@ -191,6 +200,20 @@ Describe 'Setup consent preserves an existing baseline (offline)' {
         }
         Assert-MockCalled Remove-MgOauth2PermissionGrant -Times 0 -Exactly -Scope It
         Assert-MockCalled New-MgOauth2PermissionGrant -Times 0 -Exactly -Scope It
+        Assert-MockCalled Initialize-LabAppPermissions -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Principals.ClientId -eq $script:clientId -and $Principals.GraphId -eq $script:graphId
+        }
+        Assert-MockCalled Connect-LabGraph -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Scopes -contains 'Application.ReadWrite.All' -and $Scopes -contains 'DelegatedPermissionGrant.ReadWrite.All'
+        }
+    }
+
+    It 'blocks consent creation and reboot if configured permission repair fails' {
+        $script:grants = @($unrelated)
+        Mock Initialize-LabAppPermissions { throw 'APP_PERMISSIONS_UPDATE_FAILED' }
+        { & $setupTail } | Should Throw 'APP_PERMISSIONS_UPDATE_FAILED'
+        Assert-MockCalled New-MgOauth2PermissionGrant -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-LabClientConfiguration -Times 0 -Exactly -Scope It
     }
 
     It 'loads the shared helper and required Graph module before Azure changes' {

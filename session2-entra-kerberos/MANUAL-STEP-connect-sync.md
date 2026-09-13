@@ -452,6 +452,43 @@ configuring/rebooting the client. Other-resource grants are preserved.
 Ambiguous service principals, unexpected Graph scopes/user grants, or failed
 reads stop setup instead of triggering deletion or permission changes.
 Update the complete checkout, not just `setup.ps1`, to include the helper.
+Setup also uses `scripts/LabAppPermissions.ps1` to validate and restore the
+three required delegated **Configured permissions**. It resolves the app
+registration by the storage service principal's `appId` (not a second
+display-name match), obtains scope IDs from Microsoft's Graph service
+principal, and adds only missing `openid`, `profile` and `User.Read` declarations.
+It preserves other API entries and existing Scope/Role declarations, then
+re-reads the app to verify the complete expected permission list before
+continuing. Do not edit API permissions concurrently with setup: updating
+`requiredResourceAccess` replaces that collection.
+
+These are two separate directory states:
+
+| State | Directory object/property | What setup does |
+| --- | --- | --- |
+| Requested/configured permissions | App registration `requiredResourceAccess` | Restores missing required delegated declarations and verifies readback |
+| Actual delegated consent | Service principal `oauth2PermissionGrants` | Keeps the exact baseline or creates it when absent; never deletes it during setup |
+
+Removing `openid` using **Remove permission** in App registrations does not
+automatically revoke an existing consent grant. The older setup could therefore
+report "baseline already present" while the configured list still lacked
+`openid`. Restoring a declaration also does not by itself grant consent.
+See [Update an app's requested permissions](https://learn.microsoft.com/entra/identity-platform/howto-update-permissions).
+For the **missing admin consent** demonstration, restore the configured list
+and user baseline first, then use `Invoke-Fault.ps1 -Fault ConsentRevoked`.
+That changes the actual baseline grant, not the app's requested-permissions
+list. Do not treat removal from the configured list alone as proof of a
+consent-related ticket failure.
+
+Updating declarations requires the Graph caller's `Application.ReadWrite.All`
+permission and authorization to edit this app (for example, app ownership or
+an appropriate Entra application administrator role). Setup requests this
+scope plus `DelegatedPermissionGrant.ReadWrite.All`; reusing an existing Graph
+session/token does **not** add permissions. An update-denied error requires
+reconnecting Graph with an authorized lab identity and the required scopes,
+not deleting the app or broadening Azure SMB roles. Failed or unconfirmed
+updates stop before consent creation and client configuration.
+
 Older setup versions piped a grant object directly into
 `Remove-MgOauth2PermissionGrant`, which can fail with
 `InputObject.OAuth2PermissionGrantId` missing. Do not work around this by
