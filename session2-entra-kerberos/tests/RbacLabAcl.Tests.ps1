@@ -1,5 +1,20 @@
 $ErrorActionPreference = 'Stop'
 $script:aclScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\copy-rbac-lab-acl.ps1'
+$tokens = $null
+$parseErrors = $null
+$aclAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $aclScript, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+$writerFunction = $aclAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Set-RbacDirectoryDacl'
+}, $true)
+. ([scriptblock]::Create($writerFunction.Extent.Text))
+$script:nativeDaclWriter = $writerFunction.Body.GetScriptBlock()
+# Keep the real entrypoint, but do not redefine the writer over its mock.
+$script:aclRunner = [scriptblock]::Create(
+    (Get-Content $aclScript -Raw).Remove($writerFunction.Extent.StartOffset, $writerFunction.Extent.Text.Length))
 
 # Stubs prevent Pester 3 dynamic-parameter discovery from invoking real providers.
 function New-PSDrive {
@@ -19,11 +34,6 @@ function Get-Acl {
     [CmdletBinding()] param($LiteralPath)
     throw 'Unmocked ACL read'
 }
-function Set-Acl {
-    [CmdletBinding()] param($LiteralPath, $AclObject)
-    throw 'Unmocked ACL write'
-}
-
 function New-TestRootAcl {
     param([string]$Sddl)
     $acl = New-Object System.Security.AccessControl.DirectorySecurity
@@ -43,6 +53,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
         $script:partialMount = $false
         $script:sourceChanged = $false
         $script:targetChanged = $false
+        $script:writeException = $null
         $script:cleanupStuck = $false
         $script:counters = @{ enumerations = 0 }
         $script:sourceSddl = 'O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FR;;;BA)S:(AU;SA;FA;;;SY)'
@@ -97,11 +108,16 @@ Describe 'RBAC lab root DACL copy (offline)' {
             if ($targetChanged -and $reads[$kind] -eq 2) { return (New-TestRootAcl $targetSddl) }
             return $targetAcl
         }
-        Mock Set-Acl {
-            if ($mounts[$LiteralPath.Split(':')[0]] -ne 'target') { throw 'Source write forbidden' }
+        Mock Set-RbacDirectoryDacl {
+            if ($LiteralPath -ne '\\azflabtest.file.core.windows.net\rbac-lab') { throw 'Unexpected write path' }
             $events.Add('write:target')
+            if ($writeException) { throw $writeException }
             if ($failAt -eq 'write') { throw $testKey }
-            if (-not [object]::ReferenceEquals($targetAcl, $AclObject)) { throw 'Unexpected ACL object' }
+            if ($AclObject.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All) -cne $expectedDacl) {
+                throw 'Write descriptor must contain only the expected DACL'
+            }
+            $targetAcl.SetSecurityDescriptorSddlForm(
+                $AclObject.GetSecurityDescriptorSddlForm($accessSection), $accessSection)
         }
         Mock Remove-PSDrive {
             if (-not $mounts.ContainsKey($Name)) { throw 'Unrelated drive removal forbidden' }
@@ -117,7 +133,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
     }
 
     It 'copies only the destination DACL and emits exactly one marker after verified cleanup' {
-        $output = @(& $aclScript -StorageAccountName azflabtest -StorageKey $testKey |
+        $output = @(& $aclRunner -StorageAccountName azflabtest -StorageKey $testKey |
             ForEach-Object { $events.Add("output:$_"); $_ })
         $output.Count | Should Be 1
         $output[0] | Should Be 'RBAC_LAB_ACL_READY'
@@ -133,14 +149,14 @@ Describe 'RBAC lab root DACL copy (offline)' {
         $targetAcl.GetSecurityDescriptorSddlForm($auditSection) | Should Be $targetAudit
         $reads.source | Should Be 2
         $reads.target | Should Be 2
-        Assert-MockCalled Set-Acl -Times 1 -Exactly -Scope It
+        Assert-MockCalled Set-RbacDirectoryDacl -Times 1 -Exactly -Scope It
         Assert-MockCalled Remove-Item -Times 0 -Exactly -Scope It
         Assert-MockCalled Copy-Item -Times 0 -Exactly -Scope It
         Assert-MockCalled Set-Content -Times 0 -Exactly -Scope It
     }
 
     It 'uses distinct random local nonpersistent mounts with one shared administrative credential' {
-        & $aclScript -StorageAccountName azflabtest -StorageKey $testKey | Out-Null
+        & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey | Out-Null
         $mountCalls.Count | Should Be 2
         $mountCalls[0].Name | Should Match '^RbacSrc[0-9a-f]{32}$'
         $mountCalls[1].Name | Should Match '^RbacDst[0-9a-f]{32}$'
@@ -166,7 +182,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
             $seen = New-Object 'System.Collections.Generic.List[string]'
             $caught = $null
             try {
-                & $aclScript -StorageAccountName azflabtest -StorageKey $testKey |
+                & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey |
                     ForEach-Object { $seen.Add([string]$_) }
             }
             catch { $caught = $_ }
@@ -182,14 +198,71 @@ Describe 'RBAC lab root DACL copy (offline)' {
 
     It 'rejects source DACL changes during the copy' {
         $script:sourceChanged = $true
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'source DACL verification'
         $mounts.Count | Should Be 0
     }
 
+    It 'reports the typed access-denied code without exposing the exception message' {
+        $script:writeException = New-Object System.UnauthorizedAccessException("Provider message $testKey")
+        $seen = @()
+        $caught = $null
+        try { $seen = @(& $aclRunner -StorageAccountName azflabtest -StorageKey $testKey) }
+        catch { $caught = $_ }
+        $caught.Exception.Message | Should Match 'destination DACL write'
+        $caught.Exception.Message | Should Match 'ExceptionType=System.UnauthorizedAccessException'
+        $caught.Exception.Message | Should Match 'HResult=0x80070005'
+        $caught.Exception.Message.Contains($testKey) | Should Be $false
+        $seen.Count | Should Be 0
+        $mounts.Count | Should Be 0
+    }
+
+    It 'includes numeric Win32 diagnostics without the raw provider message' {
+        $script:writeException = New-Object System.ComponentModel.Win32Exception(5, $testKey)
+        $caught = $null
+        try { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey | Out-Null }
+        catch { $caught = $_ }
+        $caught.Exception.Message | Should Match 'ExceptionType=System.ComponentModel.Win32Exception'
+        $caught.Exception.Message | Should Match 'NativeErrorCode=5'
+        $caught.Exception.Message.Contains($testKey) | Should Be $false
+        $mounts.Count | Should Be 0
+    }
+
+    It 'persists an Access-only descriptor through the real runtime API on an isolated local directory' {
+        $directory = [System.IO.Directory]::CreateDirectory((Join-Path $TestDrive 'native-dacl-write'))
+        $initialAcl = if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $directory.GetAccessControl()
+        } else {
+            [System.IO.FileSystemAclExtensions]::GetAccessControl($directory)
+        }
+        $initialIdentity = $initialAcl.GetSecurityDescriptorSddlForm($identitySections)
+        $dacl = New-Object System.Security.AccessControl.DirectorySecurity
+        $dacl.SetSecurityDescriptorSddlForm($initialAcl.GetSecurityDescriptorSddlForm($accessSection), $accessSection)
+        $dacl.SetAccessRuleProtection($true, $true)
+        $sourceDirectory = [System.IO.Directory]::CreateDirectory((Join-Path $TestDrive 'native-dacl-source'))
+        & $nativeDaclWriter -LiteralPath $sourceDirectory.FullName -AclObject $dacl
+        $sourceDescriptor = if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $sourceDirectory.GetAccessControl()
+        } else {
+            [System.IO.FileSystemAclExtensions]::GetAccessControl($sourceDirectory)
+        }
+        $persistedSourceDacl = $sourceDescriptor.GetSecurityDescriptorSddlForm($accessSection)
+        $dacl = New-Object System.Security.AccessControl.DirectorySecurity
+        $dacl.SetSecurityDescriptorSddlForm($persistedSourceDacl, $accessSection)
+        & $nativeDaclWriter -LiteralPath $directory.FullName -AclObject $dacl
+        $actual = if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $directory.GetAccessControl()
+        } else {
+            [System.IO.FileSystemAclExtensions]::GetAccessControl($directory)
+        }
+        $actual.AreAccessRulesProtected | Should Be $true
+        $actual.GetSecurityDescriptorSddlForm($accessSection) | Should Be $persistedSourceDacl
+        $actual.GetSecurityDescriptorSddlForm($identitySections) | Should Be $initialIdentity
+    }
+
     It 'rejects destination readback differences' {
         $script:targetChanged = $true
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'destination DACL verification'
         $mounts.Count | Should Be 0
     }
@@ -197,7 +270,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
     It 'cleans even a mount created by a failing authentication operation' {
         $script:failAt = 'mount:target'
         $script:partialMount = $true
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'destination authentication and mount'
         $removed.Count | Should Be 2
         $mounts.Count | Should Be 0
@@ -208,7 +281,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
         $seen = New-Object 'System.Collections.Generic.List[string]'
         $caught = $null
         try {
-            & $aclScript -StorageAccountName azflabtest -StorageKey $testKey |
+            & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey |
                 ForEach-Object { $seen.Add([string]$_) }
         }
         catch { $caught = $_ }
@@ -221,7 +294,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
     It 'cleans a partially created first mount without touching unrelated drives' {
         $script:failAt = 'mount:source'
         $script:partialMount = $true
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'source authentication and mount'
         $removed.Count | Should Be 1
         $removed[0] | Should Match '^RbacSrc[0-9a-f]{32}$'
@@ -230,7 +303,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
 
     It 'reports a second mount cleanup failure after successfully removing the first' {
         $script:failAt = 'remove:target'
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'Temporary mount removal failed'
         $removed.Count | Should Be 2
         $mounts.Count | Should Be 1
@@ -241,7 +314,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
         $script:sourceChanged = $true
         $script:failAt = 'remove:target'
         $caught = $null
-        try { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey }
+        try { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey }
         catch { $caught = $_ }
         $caught.Exception.Message | Should Match 'source DACL verification'
         $caught.Exception.Message | Should Match 'Temporary mount removal failed'
@@ -250,19 +323,19 @@ Describe 'RBAC lab root DACL copy (offline)' {
 
     It 'rejects cleanup enumeration failures' {
         $script:failAt = 'enumerate'
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'Temporary mount enumeration failed'
     }
 
     It 'verifies mounts are actually removed before declaring success' {
         $script:cleanupStuck = $true
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'Temporary mount cleanup verification failed'
     }
 
     It 'fails explicitly before mounting if credential creation fails' {
         $script:failAt = 'credential'
-        { & $aclScript -StorageAccountName azflabtest -StorageKey $testKey } |
+        { & $aclRunner -StorageAccountName azflabtest -StorageKey $testKey } |
             Should Throw 'credential creation'
         $mountCalls.Count | Should Be 0
     }
@@ -270,12 +343,12 @@ Describe 'RBAC lab root DACL copy (offline)' {
     It 'rejects invalid storage account names and empty keys before any provider call' {
         foreach ($invalidName in @('ab', 'Avalidname', 'with-dash', ('a' * 25), 'abc\share', "abc`n")) {
             $bindingFailed = $false
-            try { & $aclScript -StorageAccountName $invalidName -StorageKey $testKey }
+            try { & $aclRunner -StorageAccountName $invalidName -StorageKey $testKey }
             catch [System.Management.Automation.ParameterBindingException] { $bindingFailed = $true }
             $bindingFailed | Should Be $true
         }
         $bindingFailed = $false
-        try { & $aclScript -StorageAccountName azflabtest -StorageKey '' }
+        try { & $aclRunner -StorageAccountName azflabtest -StorageKey '' }
         catch [System.Management.Automation.ParameterBindingException] { $bindingFailed = $true }
         $bindingFailed | Should Be $true
         $mountCalls.Count | Should Be 0
@@ -294,7 +367,7 @@ Describe 'RBAC lab root DACL copy (offline)' {
             param($node)
             $node -is [System.Management.Automation.Language.CommandAst]
         }, $true) | ForEach-Object { $_.GetCommandName() })
-        foreach ($forbidden in @('net', 'net.exe', 'Remove-Item', 'Copy-Item', 'Set-Content',
+        foreach ($forbidden in @('net', 'net.exe', 'Set-Acl', 'Remove-Item', 'Copy-Item', 'Set-Content',
                 'Invoke-Expression', 'Start-Process', 'Write-Host', 'Write-Verbose', 'Write-Debug')) {
             $commands -contains $forbidden | Should Be $false
         }

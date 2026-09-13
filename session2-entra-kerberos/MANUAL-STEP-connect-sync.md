@@ -432,6 +432,18 @@ lookup with the expected `azfiles_lab=rbac-first-lab-v1` and selected
 setup; do not delete the share or rewrite its metadata. Missing/mismatched
 metadata in the named response still stops setup, as do lookup failures.
 
+**ACL write failures:** the DC payload constructs a fresh Access-only security
+descriptor and persists it through the .NET filesystem API. Do not substitute
+`Set-Acl` with a full `Get-Acl` object: the PowerShell provider can attempt to
+persist owner, group and SACL as well as the DACL. The payload verifies both
+root DACLs and the unchanged destination owner/group before reporting success.
+Failures report the operation, exception type, HRESULT, and a Win32 error code
+when available; raw provider messages and credential-bearing targets are omitted.
+`RBAC_LAB_ACL_FAILED` is a provisioning error, not the intended user-session
+RBAC denial. Do not grant the lab user a broader role or skip ACL verification
+to clear it. The default-share-permission change, consent reset and client
+reboot are later steps and are not reached when ACL provisioning stops.
+
 **Required user checks before class:** after all permission changes have
 propagated, use the same actual synchronized user session (not SYSTEM, an
 administrator using a storage key, or a saved alternate credential). Verify a

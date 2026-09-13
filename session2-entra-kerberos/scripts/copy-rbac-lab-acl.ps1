@@ -10,8 +10,22 @@ param(
     [string]$StorageKey
 )
 
+function Set-RbacDirectoryDacl {
+    param(
+        [Parameter(Mandatory)] [string]$LiteralPath,
+        [Parameter(Mandatory)] [System.Security.AccessControl.DirectorySecurity]$AclObject
+    )
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        [System.IO.Directory]::SetAccessControl($LiteralPath, $AclObject)
+    } else {
+        [System.IO.FileSystemAclExtensions]::SetAccessControl(
+            (New-Object System.IO.DirectoryInfo $LiteralPath), $AclObject)
+    }
+}
+
 $ErrorActionPreference = 'Stop'
 $access = [System.Security.AccessControl.AccessControlSections]::Access
+$identitySections = [System.Security.AccessControl.AccessControlSections]'Owner, Group'
 $attemptedMounts = @()
 $failure = $null
 $cleanupFailures = @()
@@ -52,10 +66,16 @@ try {
     $expectedDacl = $sourceAcl.GetSecurityDescriptorSddlForm($access)
     $stage = 'destination DACL read'
     $targetAcl = Get-Acl -LiteralPath $targetRoot -ErrorAction Stop
+    $targetIdentity = $targetAcl.GetSecurityDescriptorSddlForm($identitySections)
 
+    $stage = 'destination DACL construction'
+    # Set-Acl can persist all sections. A fresh descriptor and direct .NET write
+    # persist only Access, without attempting to write owner, group or SACL.
+    $daclOnly = New-Object System.Security.AccessControl.DirectorySecurity
+    $daclOnly.SetSecurityDescriptorSddlForm($expectedDacl, $access)
     $stage = 'destination DACL write'
-    $targetAcl.SetSecurityDescriptorSddlForm($expectedDacl, $access)
-    Set-Acl -LiteralPath $targetRoot -AclObject $targetAcl -ErrorAction Stop
+    Set-RbacDirectoryDacl -LiteralPath "\\$StorageAccountName.file.core.windows.net\rbac-lab" `
+        -AclObject $daclOnly
 
     $stage = 'source DACL verification'
     $sourceReadback = Get-Acl -LiteralPath $sourceRoot -ErrorAction Stop
@@ -67,10 +87,20 @@ try {
     if ($targetReadback.GetSecurityDescriptorSddlForm($access) -cne $expectedDacl) {
         throw 'Destination root DACL does not match.'
     }
+    $stage = 'destination owner and group verification'
+    if ($targetReadback.GetSecurityDescriptorSddlForm($identitySections) -cne $targetIdentity) {
+        throw 'Destination owner or group changed during copy.'
+    }
 }
 catch {
-    # Provider errors may contain credentials. Report the failed operation, never its raw error.
-    $failure = "RBAC lab ACL preparation failed during $stage."
+    # Keep typed diagnostic codes, never raw provider messages or error targets.
+    $cause = $_.Exception.GetBaseException()
+    $diagnostic = 'ExceptionType={0}; HResult=0x{1:X8}; Category={2}' -f `
+        $cause.GetType().FullName, $cause.HResult, $_.CategoryInfo.Category
+    if ($cause -is [System.ComponentModel.Win32Exception]) {
+        $diagnostic += "; NativeErrorCode=$($cause.NativeErrorCode)"
+    }
+    $failure = "RBAC lab ACL preparation failed during $stage. $diagnostic"
 }
 finally {
     if ($attemptedMounts.Count -gt 0) {
