@@ -50,7 +50,7 @@ function Get-AzStorageAccount {
     throw 'Unmocked Azure storage read'
 }
 function Get-AzRmStorageShare {
-    [CmdletBinding()] param($ResourceGroupName, $StorageAccountName)
+    [CmdletBinding()] param($ResourceGroupName, $StorageAccountName, $Name)
     throw 'Unmocked share read'
 }
 function New-AzRmStorageShare {
@@ -590,8 +590,12 @@ Describe 'Opt-in RBAC setup wiring (offline)' {
             }
         }
         Mock Get-AzRmStorageShare {
-            [pscustomobject]@{ Name = 'labshare'; EnabledProtocols = 'SMB'; Metadata = @{} }
-            if ($testShareCreated) {
+            if (-not $Name) {
+                [pscustomobject]@{ Name = 'labshare'; EnabledProtocols = 'SMB'; Metadata = $null }
+                if ($testShareCreated) {
+                    [pscustomobject]@{ Name = 'rbac-lab'; EnabledProtocols = 'SMB'; Metadata = $null }
+                }
+            } elseif ($Name -eq 'rbac-lab' -and $testShareCreated) {
                 [pscustomobject]@{
                     Name = 'rbac-lab'; EnabledProtocols = 'SMB'
                     Metadata = @{ azfiles_lab = 'rbac-first-lab-v1'; user_object_id = $setupUserId }
@@ -623,6 +627,7 @@ Describe 'Opt-in RBAC setup wiring (offline)' {
             $Scope -like '*/rbac-lab'
         }
         Assert-MockCalled New-AzRmStorageShare -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'rbac-lab' }
+        Assert-MockCalled Get-AzRmStorageShare -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'rbac-lab' }
         Assert-MockCalled Invoke-AzVMRunCommand -Times 1 -Exactly -Scope It -ParameterFilter { $VMName -eq 'azflab-dc' }
     }
 

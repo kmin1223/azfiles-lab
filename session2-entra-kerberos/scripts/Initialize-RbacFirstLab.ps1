@@ -74,6 +74,14 @@ function Get-RbacFirstLabPlan {
         throw 'RBAC_LAB_SOURCE_MISSING: one existing SMB labshare is required.'
     }
     if ($target.Count -gt 1) { throw 'RBAC_LAB_TARGET_AMBIGUOUS: more than one rbac-lab was returned.' }
+    if ($target.Count -eq 1) {
+        # Share listings can omit metadata; ownership requires a named GET.
+        $target = @(Get-AzRmStorageShare -ResourceGroupName $ResourceGroupName `
+            -StorageAccountName $StorageAccount.StorageAccountName -Name 'rbac-lab' -ErrorAction Stop)
+        if ($target.Count -ne 1 -or $target[0].Name -ne 'rbac-lab') {
+            throw 'RBAC_LAB_TARGET_NOT_CONFIRMED: named lookup did not return exactly one rbac-lab. No existing share was adopted.'
+        }
+    }
     if ($target.Count -eq 1 -and (
         $target[0].EnabledProtocols -eq 'NFS' -or
         $null -eq $target[0].Metadata -or

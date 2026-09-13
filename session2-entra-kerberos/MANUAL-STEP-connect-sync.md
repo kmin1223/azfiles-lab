@@ -422,6 +422,16 @@ not delete its contents. To rehearse a new denied state after repair, reset
 only the exact test-share role manually **well before class**, allow revocation
 to propagate, and repeat the negative check. Never revoke `labshare` access.
 
+**Ownership lookup:** `Get-AzRmStorageShare` without `-Name` can return
+`Metadata: null` even when the share has the correct ownership markers.
+The helper uses the list only to discover the target, then validates metadata
+through `Get-AzRmStorageShare -Name 'rbac-lab'`, including after creation.
+If an older helper reports `RBAC_LAB_TARGET_NOT_OWNED`, compare the named
+lookup with the expected `azfiles_lab=rbac-first-lab-v1` and selected
+`user_object_id`. When they match, update the helper and retry the unfinished
+setup; do not delete the share or rewrite its metadata. Missing/mismatched
+metadata in the named response still stops setup, as do lookup failures.
+
 **Required user checks before class:** after all permission changes have
 propagated, use the same actual synchronized user session (not SYSTEM, an
 administrator using a storage key, or a saved alternate credential). Verify a

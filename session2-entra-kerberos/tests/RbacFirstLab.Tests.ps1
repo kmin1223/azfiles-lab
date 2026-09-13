@@ -9,7 +9,7 @@ function Get-AzRoleAssignment {
 }
 function Get-AzRoleDefinition { [CmdletBinding()] param($Id) throw 'Unmocked role definition read' }
 function Get-AzRmStorageShare {
-    [CmdletBinding()] param($ResourceGroupName, $StorageAccountName)
+    [CmdletBinding()] param($ResourceGroupName, $StorageAccountName, $Name)
     throw 'Unmocked share read'
 }
 function New-AzRmStorageShare {
@@ -69,6 +69,10 @@ Describe 'Two-share RBAC first lab (offline)' {
         $script:roleReadFailure = $false
         $script:expansionFailure = $false
         $script:shareReadFailure = $false
+        $script:detailReadFailure = $false
+        $script:overrideDetail = $false
+        $script:detailResponse = $null
+        $script:listMetadataIncluded = $false
         $script:createFailure = $false
         $script:createInvisible = $false
         $script:keyUnavailable = $false
@@ -89,7 +93,17 @@ Describe 'Two-share RBAC first lab (offline)' {
         Mock Get-AzRoleDefinition { $definition }
         Mock Get-AzRmStorageShare {
             if ($shareReadFailure) { throw 'Share listing denied' }
-            $shares
+            if ($Name) {
+                if ($detailReadFailure) { throw 'Share detail denied' }
+                if ($overrideDetail) { return $script:detailResponse }
+                $script:shares | Where-Object Name -eq $Name
+            } else {
+                foreach ($share in $script:shares) {
+                    if ($listMetadataIncluded) { $share } else {
+                        [pscustomobject]@{ Name = $share.Name; EnabledProtocols = $share.EnabledProtocols; Metadata = $null }
+                    }
+                }
+            }
         }
         Mock New-AzRmStorageShare {
             if ($createFailure) { throw 'Share creation denied' }
@@ -149,6 +163,65 @@ Describe 'Two-share RBAC first lab (offline)' {
         { Get-RbacFirstLabPlan -ResourceGroupName test-rg -StorageAccount $account -UserObjectId $userId } |
             Should Throw 'RBAC_LAB_TARGET_NOT_OWNED'
         Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It
+    }
+
+    It 'reads ownership from the named share when listing metadata is absent' {
+        $script:shares = @($sourceShare, $ownedShare)
+        $p = Get-RbacFirstLabPlan -ResourceGroupName test-rg -StorageAccount $account -UserObjectId $userId
+        $p.TargetExists | Should Be $true
+        Assert-MockCalled Get-AzRmStorageShare -Times 1 -Exactly -Scope It -ParameterFilter {
+            $ResourceGroupName -eq 'test-rg' -and $StorageAccountName -eq 'azflabtest' -and $Name -eq 'rbac-lab'
+        }
+        Assert-MockCalled New-AzRmStorageShare -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-AzStorageAccount -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not fall back to listed metadata when named lookup is denied' {
+        $script:shares = @($sourceShare, $ownedShare)
+        $script:listMetadataIncluded = $true
+        $script:detailReadFailure = $true
+        { Initialize-RbacFirstLab -Plan $plan -DcVmName test-dc } | Should Throw 'Share detail denied'
+        Assert-MockCalled New-AzRmStorageShare -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-AzStorageAccount -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects a missing named response instead of recreating the listed share' {
+        $script:shares = @($sourceShare, $ownedShare)
+        $script:overrideDetail = $true
+        { Initialize-RbacFirstLab -Plan $plan -DcVmName test-dc } | Should Throw 'RBAC_LAB_TARGET_NOT_CONFIRMED'
+        Assert-MockCalled New-AzRmStorageShare -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-AzStorageAccount -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects an ambiguous named response' {
+        $script:shares = @($sourceShare, $ownedShare)
+        $script:overrideDetail = $true
+        $script:detailResponse = @($ownedShare, $ownedShare)
+        { Get-RbacFirstLabPlan -ResourceGroupName test-rg -StorageAccount $account -UserObjectId $userId } |
+            Should Throw 'RBAC_LAB_TARGET_NOT_CONFIRMED'
+    }
+
+    It 'rejects a different share returned by the named lookup' {
+        $script:shares = @($sourceShare, $ownedShare)
+        $script:overrideDetail = $true
+        $script:detailResponse = $sourceShare
+        { Get-RbacFirstLabPlan -ResourceGroupName test-rg -StorageAccount $account -UserObjectId $userId } |
+            Should Throw 'RBAC_LAB_TARGET_NOT_CONFIRMED'
+    }
+
+    It 'rejects named metadata for a different lab even if the list claims ownership' {
+        $script:shares = @($sourceShare, $ownedShare)
+        $script:listMetadataIncluded = $true
+        $script:overrideDetail = $true
+        $script:detailResponse = [pscustomobject]@{
+            Name = 'rbac-lab'; EnabledProtocols = 'SMB'
+            Metadata = @{ azfiles_lab = 'another-lab'; user_object_id = $userId }
+        }
+        { Initialize-RbacFirstLab -Plan $plan -DcVmName test-dc } | Should Throw 'RBAC_LAB_TARGET_NOT_OWNED'
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-AzStorageAccount -Times 0 -Exactly -Scope It
     }
 
     It 'does not treat failed role or group reads as an empty authorization set' {
