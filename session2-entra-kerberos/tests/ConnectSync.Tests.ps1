@@ -16,6 +16,21 @@ $invokeFunction = $setupAst.Find({
 }, $true)
 # Extracted functions have no script-file context; supply the real payload root.
 . ([scriptblock]::Create($invokeFunction.Extent.Text.Replace('$PSScriptRoot', '$root')))
+$grantFunction = $setupAst.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Grant-LabShareAccess'
+}, $true)
+. ([scriptblock]::Create($grantFunction.Extent.Text))
+# Pester 3 cannot mock Get-Module's PSEdition parameter on newer PowerShell.
+$setupPreStorage = [scriptblock]::Create(
+    $setupSource.Substring(0, $setupSource.IndexOf('Step "2/4 Enabling Entra Kerberos')).
+        Replace('$PSScriptRoot', '$root').
+        Replace('Get-Module -ListAvailable', 'Get-TestAvailableModule -ListAvailable'))
+$setupPreConsent = [scriptblock]::Create(
+    $setupSource.Substring(0, $setupSource.IndexOf("Step '3/4 Granting admin consent")).
+        Replace('$PSScriptRoot', '$root').
+        Replace('Get-Module -ListAvailable', 'Get-TestAvailableModule -ListAvailable'))
 
 # Fail-closed stubs ensure these tests never access a VM, registry or join task.
 function dsregcmd { throw 'Unmocked device registration command' }
@@ -30,9 +45,43 @@ function Get-ItemProperty {
     throw 'Unmocked registry read'
 }
 function shutdown { throw 'Unmocked reboot request' }
-function Get-AzStorageAccount { param($ResourceGroupName) throw 'Unmocked Azure storage read' }
+function Get-AzStorageAccount {
+    [CmdletBinding()] param($ResourceGroupName, $Name)
+    throw 'Unmocked Azure storage read'
+}
+function Get-AzRmStorageShare {
+    [CmdletBinding()] param($ResourceGroupName, $StorageAccountName)
+    throw 'Unmocked share read'
+}
+function New-AzRmStorageShare {
+    [CmdletBinding()] param($ResourceGroupName, $StorageAccountName, $Name, $EnabledProtocol, $QuotaGiB,
+        [Alias('Metadata')]$LabMetadata)
+    throw 'Unmocked share creation'
+}
+function Get-AzStorageAccountKey {
+    [CmdletBinding()] param($ResourceGroupName, $Name)
+    throw 'Unmocked key read'
+}
+function Get-AzContext { throw 'Unmocked Azure context read' }
+function Get-TestAvailableModule { param($Name, [switch]$ListAvailable) throw 'Unmocked module availability check' }
+function Get-AzADUser {
+    [CmdletBinding()]
+    param($UserPrincipalName)
+    throw 'Unmocked directory user read'
+}
+function Get-AzRoleAssignment {
+    [CmdletBinding()]
+    param($ObjectId, $Scope, $RoleDefinitionName, [switch]$ExpandPrincipalGroups)
+    throw 'Unmocked RBAC read'
+}
+function New-AzRoleAssignment {
+    [CmdletBinding()]
+    param($ObjectId, $Scope, $RoleDefinitionName)
+    throw 'Unmocked RBAC write'
+}
 function Remove-AzResourceGroup { param($Name, [switch]$Force, [switch]$AsJob) throw 'Unmocked Azure deletion' }
 function Invoke-AzVMRunCommand {
+    [CmdletBinding()]
     param($ResourceGroupName, $VMName, $CommandId, $ScriptPath, $Parameter)
     throw 'Unmocked Azure operation'
 }
@@ -308,6 +357,313 @@ TenantId : test-tenant
         @(& $reboot) -contains 'CLIENT_CONFIG_DONE_REBOOTING' | Should Be $true
         Mock shutdown { $global:LASTEXITCODE = 1 }
         { & $reboot } | Should Throw 'Client reboot could not be scheduled'
+    }
+}
+
+Describe 'Hybrid share RBAC (offline)' {
+    BeforeEach {
+        $script:shareUpn = 'hybrid-labuser1@example.onmicrosoft.com'
+        $script:shareUserId = '11111111-2222-3333-4444-555555555555'
+        $script:storageId = '/subscriptions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/resourceGroups/test-rg/providers/Microsoft.Storage/storageAccounts/azflabtest'
+        $script:shareScope = "$storageId/fileServices/default/fileshares/labshare"
+        $script:shareRole = 'Storage File Data SMB Share Contributor'
+        $script:resolvedUser = [pscustomobject]@{ Id = $shareUserId; UserPrincipalName = $shareUpn }
+        $script:expectedAssignment = [pscustomobject]@{
+            ObjectId = $shareUserId; Scope = $shareScope; RoleDefinitionName = $shareRole
+        }
+        $script:existingAssignments = @()
+        Mock Get-AzADUser { $resolvedUser }
+        Mock Get-AzRoleAssignment { $existingAssignments }
+        Mock New-AzRoleAssignment {
+            $script:existingAssignments = @($expectedAssignment)
+            $expectedAssignment
+        }
+        Mock Write-Warning {}
+    }
+
+    It 'resolves the exact cloud UPN and creates only a labshare-scoped contributor role' {
+        Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId
+        Assert-MockCalled Get-AzADUser -Times 1 -Exactly -Scope It -ParameterFilter {
+            $UserPrincipalName -eq 'hybrid-labuser1@example.onmicrosoft.com'
+        }
+        Assert-MockCalled New-AzRoleAssignment -Times 1 -Exactly -Scope It -ParameterFilter {
+            $ObjectId -eq $shareUserId -and $Scope -eq $shareScope -and
+            $RoleDefinitionName -eq 'Storage File Data SMB Share Contributor'
+        }
+        Assert-MockCalled Write-Warning -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Message -match 'not an SMB access check' -and $Message -match '30 minutes'
+        }
+    }
+
+    It 'does not duplicate the same assignment when rerun' {
+        Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId
+        Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId
+        Assert-MockCalled Get-AzRoleAssignment -Times 2 -Exactly -Scope It
+        Assert-MockCalled New-AzRoleAssignment -Times 1 -Exactly -Scope It
+    }
+
+    It 'reuses an existing assignment regardless of scope or UPN casing' {
+        $script:resolvedUser.UserPrincipalName = $shareUpn.ToUpperInvariant()
+        $script:expectedAssignment.Scope = $shareScope.ToUpperInvariant()
+        $script:existingAssignments = @($expectedAssignment)
+        Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not mistake another user role or scope for the requested assignment' {
+        $script:existingAssignments = @(
+            [pscustomobject]@{ ObjectId = '99999999-2222-3333-4444-555555555555'; Scope = $shareScope; RoleDefinitionName = $shareRole }
+            [pscustomobject]@{ ObjectId = $shareUserId; Scope = $shareScope; RoleDefinitionName = 'Owner' }
+            [pscustomobject]@{ ObjectId = $shareUserId; Scope = $storageId; RoleDefinitionName = $shareRole }
+        )
+        Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId
+        Assert-MockCalled New-AzRoleAssignment -Times 1 -Exactly -Scope It -ParameterFilter {
+            $ObjectId -eq $shareUserId -and $Scope -eq $shareScope -and $RoleDefinitionName -eq $shareRole
+        }
+    }
+
+    It 'stops on a missing ambiguous or different UPN before reading or writing RBAC' {
+        foreach ($users in @(
+            @{ Value = @() }
+            @{ Value = @($resolvedUser, $resolvedUser) }
+            @{ Value = @([pscustomobject]@{ Id = $shareUserId; UserPrincipalName = 'labuser1@example.onmicrosoft.com' }) }
+        )) {
+            $script:resolvedUser = $users.Value
+            { Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId } |
+                Should Throw 'SHARE_RBAC_USER_NOT_FOUND'
+        }
+        Assert-MockCalled Get-AzRoleAssignment -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects invalid user object IDs without assigning roles' {
+        foreach ($invalidId in @('', 'not-a-guid', '00000000-0000-0000-0000-000000000000')) {
+            $script:resolvedUser.Id = $invalidId
+            { Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId } |
+                Should Throw 'SHARE_RBAC_USER_NOT_FOUND'
+        }
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not accept a display name or domain logon in place of a UPN' {
+        foreach ($invalidUpn in @('', 'labuser1', 'CONTOSO\labuser1', ' labuser1@example.com')) {
+            $rejected = $false
+            try {
+                Grant-LabShareAccess -UserPrincipalName $invalidUpn -StorageAccountId $storageId -ErrorAction Stop
+            } catch [System.Management.Automation.ParameterBindingException] {
+                $rejected = $true
+            }
+            $rejected | Should Be $true
+        }
+        Assert-MockCalled Get-AzADUser -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects an empty or non-storage-account scope before any Azure calls' {
+        foreach ($invalidScope in @('', '/subscriptions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', "$storageId/fileServices/default")) {
+            $rejected = $false
+            try {
+                Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $invalidScope -ErrorAction Stop
+            } catch [System.Management.Automation.ParameterBindingException] {
+                $rejected = $true
+            }
+            $rejected | Should Be $true
+        }
+        Assert-MockCalled Get-AzADUser -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'surfaces directory lookup errors rather than substituting another identity' {
+        Mock Get-AzADUser { throw 'Directory read denied' }
+        { Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId } |
+            Should Throw 'Directory read denied'
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not mistake a failed RBAC read for an absent assignment' {
+        Mock Get-AzRoleAssignment { throw 'RBAC read denied' }
+        { Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId } |
+            Should Throw 'RBAC read denied'
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'surfaces insufficient role-assignment permission without claiming success' {
+        Mock New-AzRoleAssignment { throw 'Microsoft.Authorization/roleAssignments/write denied' }
+        { Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId } |
+            Should Throw 'roleAssignments/write denied'
+        Assert-MockCalled Write-Warning -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects an absent or mismatched create response instead of claiming success' {
+        foreach ($response in @(
+            @{ Value = $null }
+            @{ Value = [pscustomobject]@{ ObjectId = $shareUserId; Scope = $storageId; RoleDefinitionName = $shareRole } }
+            @{ Value = [pscustomobject]@{ ObjectId = '99999999-2222-3333-4444-555555555555'; Scope = $shareScope; RoleDefinitionName = $shareRole } }
+            @{ Value = [pscustomobject]@{ ObjectId = $shareUserId; Scope = $shareScope; RoleDefinitionName = 'Owner' } }
+        )) {
+            $script:createdResponse = $response.Value
+            Mock New-AzRoleAssignment { $createdResponse }
+            { Grant-LabShareAccess -UserPrincipalName $shareUpn -StorageAccountId $storageId } |
+                Should Throw 'SHARE_RBAC_NOT_CONFIRMED'
+        }
+        Assert-MockCalled Write-Warning -Times 0 -Exactly -Scope It
+    }
+}
+
+Describe 'Opt-in RBAC setup wiring (offline)' {
+    BeforeEach {
+        $script:setupUpn = 'hybrid-labuser1@example.onmicrosoft.com'
+        $script:setupUserId = '11111111-2222-3333-4444-555555555555'
+        $script:setupStorageId = '/subscriptions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/resourceGroups/test-rg/providers/Microsoft.Storage/storageAccounts/azflabtest'
+        $script:missingResourcesModule = $false
+        Mock Get-TestAvailableModule {
+            if ($Name -eq 'Az.Resources' -and $missingResourcesModule) { return }
+            [pscustomobject]@{ Name = $Name }
+        }
+        Mock Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'test-tenant' } } }
+        Mock Invoke-AzVMRunCommand {
+            [pscustomobject]@{ Value = @(
+                [pscustomobject]@{ Code = 'ComponentStatus/StdOut/succeeded'; Message = 'CLIENT_HYBRID_JOIN_READY' }
+                [pscustomobject]@{ Code = 'ComponentStatus/StdErr/succeeded'; Message = '' }
+            ) }
+        }
+        Mock Get-AzStorageAccount {
+            [pscustomobject]@{
+                Id = $setupStorageId
+                StorageAccountName = 'azflabtest'
+                AzureFilesIdentityBasedAuth = [pscustomobject]@{ DirectoryServiceOptions = 'AD' }
+            }
+        }
+        Mock Get-AzADUser {
+            [pscustomobject]@{ Id = $setupUserId; UserPrincipalName = $setupUpn }
+        }
+        Mock Get-AzRoleAssignment { @() }
+        Mock New-AzRoleAssignment {
+            [pscustomobject]@{ ObjectId = $ObjectId; Scope = $Scope; RoleDefinitionName = $RoleDefinitionName }
+        }
+        Mock Write-Warning {}
+    }
+
+    It 'preserves manual setup when the new parameter is omitted' {
+        & $setupPreStorage -ResourceGroupName test-rg | Out-Null
+        Assert-MockCalled Get-AzADUser -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+        Assert-MockCalled Get-TestAvailableModule -Times 0 -Exactly -Scope It -ParameterFilter { $Name -eq 'Az.Resources' }
+        Assert-MockCalled Write-Warning -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Message -match 'share RBAC is unchanged'
+        }
+    }
+
+    It 'requires an explicit user for the two-share lab before Azure calls' {
+        { & $setupPreStorage -ResourceGroupName test-rg -PrepareRbacLab } |
+            Should Throw 'PrepareRbacLab requires ShareUserPrincipalName'
+        Assert-MockCalled Get-AzContext -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'gates both lab planning and initialization behind the explicit opt-in flag' {
+        $setupSource | Should Match '(?s)if \(\$PrepareRbacLab\) \{\s+\$rbacLabPlan = Get-RbacFirstLabPlan'
+        $setupSource | Should Match '(?s)if \(\$PrepareRbacLab\) \{\s+Step ''2b/4[^'']*''\s+Initialize-RbacFirstLab'
+        ($setupSource.IndexOf('Get-RbacFirstLabPlan -ResourceGroupName') -lt
+            $setupSource.IndexOf('Step "2/4 Enabling')) | Should Be $true
+        ($setupSource.IndexOf('Initialize-RbacFirstLab -Plan') -lt
+            $setupSource.IndexOf('Invoke-LabClientConfiguration -Mode Configure')) | Should Be $true
+    }
+
+    It 'wires the selected UPN and discovered account to share-scoped RBAC' {
+        & $setupPreStorage -ResourceGroupName test-rg -ShareUserPrincipalName $setupUpn | Out-Null
+        Assert-MockCalled Get-TestAvailableModule -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'Az.Resources' }
+        Assert-MockCalled New-AzRoleAssignment -Times 1 -Exactly -Scope It -ParameterFilter {
+            $ObjectId -eq $setupUserId -and
+            $Scope -eq "$setupStorageId/fileServices/default/fileshares/labshare"
+        }
+    }
+
+    It 'runs opt-in preparation end to end before consent and only assigns the healthy share role' {
+        $script:testShareCreated = $false
+        Mock Get-AzStorageAccount {
+            [pscustomobject]@{
+                Id = $setupStorageId; StorageAccountName = 'azflabtest'; Kind = 'StorageV2'
+                AzureFilesIdentityBasedAuth = [pscustomobject]@{
+                    DirectoryServiceOptions = 'AADKERB'; DefaultSharePermission = 'None'
+                }
+            }
+        }
+        Mock Get-AzRmStorageShare {
+            [pscustomobject]@{ Name = 'labshare'; EnabledProtocols = 'SMB'; Metadata = @{} }
+            if ($testShareCreated) {
+                [pscustomobject]@{
+                    Name = 'rbac-lab'; EnabledProtocols = 'SMB'
+                    Metadata = @{ azfiles_lab = 'rbac-first-lab-v1'; user_object_id = $setupUserId }
+                }
+            }
+        }
+        Mock New-AzRmStorageShare { $script:testShareCreated = $true }
+        Mock Get-AzStorageAccountKey {
+            [pscustomobject]@{ KeyName = 'key1'; Value = 'TEST-ONLY-SETUP-KEY' }
+        }
+        Mock Invoke-AzVMRunCommand {
+            if ($VMName -eq 'azflab-dc' -and (
+                $Parameter.StorageAccountName -ne 'azflabtest' -or
+                $Parameter.StorageKey -ne 'TEST-ONLY-SETUP-KEY')) {
+                throw 'DC payload received incorrect parameters'
+            }
+            $marker = if ($VMName -eq 'azflab-dc') { 'RBAC_LAB_ACL_READY' } else { 'CLIENT_HYBRID_JOIN_READY' }
+            [pscustomobject]@{ Value = @(
+                [pscustomobject]@{ Code = 'ComponentStatus/StdOut/succeeded'; Message = $marker }
+                [pscustomobject]@{ Code = 'ComponentStatus/StdErr/succeeded'; Message = '' }
+            ) }
+        }
+        & $setupPreConsent -ResourceGroupName test-rg -ShareUserPrincipalName $setupUpn -PrepareRbacLab | Out-Null
+        Assert-MockCalled New-AzRoleAssignment -Times 1 -Exactly -Scope It -ParameterFilter {
+            $ObjectId -eq $setupUserId -and
+            $Scope -eq "$setupStorageId/fileServices/default/fileshares/labshare"
+        }
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It -ParameterFilter {
+            $Scope -like '*/rbac-lab'
+        }
+        Assert-MockCalled New-AzRmStorageShare -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'rbac-lab' }
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 1 -Exactly -Scope It -ParameterFilter { $VMName -eq 'azflab-dc' }
+    }
+
+    It 'stops before lookup or RBAC when the client is not ready' {
+        Mock Invoke-AzVMRunCommand { throw 'Client not ready' }
+        { & $setupPreStorage -ResourceGroupName test-rg -ShareUserPrincipalName $setupUpn } |
+            Should Throw 'Client not ready'
+        Assert-MockCalled Get-AzADUser -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'requires Az.Resources only when opting into RBAC' {
+        $script:missingResourcesModule = $true
+        { & $setupPreStorage -ResourceGroupName test-rg -ShareUserPrincipalName $setupUpn } |
+            Should Throw "Missing module 'Az.Resources'"
+        Assert-MockCalled Invoke-AzVMRunCommand -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-AzRoleAssignment -Times 0 -Exactly -Scope It
+    }
+
+    It 'propagates RBAC failures before the storage transition' {
+        Mock New-AzRoleAssignment { throw 'Role assignment denied' }
+        { & $setupPreStorage -ResourceGroupName test-rg -ShareUserPrincipalName $setupUpn } |
+            Should Throw 'Role assignment denied'
+        $grantOffset = $setupSource.IndexOf('Grant-LabShareAccess -UserPrincipalName $ShareUserPrincipalName')
+        ($grantOffset -gt 0 -and $grantOffset -lt $setupSource.IndexOf('Set-AzStorageAccount')) | Should Be $true
+        ($grantOffset -lt $setupSource.IndexOf('Invoke-LabClientConfiguration -Mode Configure')) | Should Be $true
+    }
+
+    It 'does not change default permissions or remove existing RBAC' {
+        $setupSource | Should Not Match 'Set-AzStorageAccount[^\r\n]*DefaultSharePermission|Remove-AzRoleAssignment'
+        $grantFunction.Extent.Text | Should Not Match 'DefaultSharePermission|Set-Acl|icacls|Remove-Az'
+    }
+
+    It 'documents propagation manual mode and the default-only fault limitation' {
+        $guide = Get-Content (Join-Path $root 'MANUAL-STEP-connect-sync.md') -Raw
+        $guide | Should Match 'ShareUserPrincipalName'
+        $guide | Should Match '30 minutes'
+        $guide | Should Match 'If you omit the parameter'
+        $guide | Should Match 'does \*\*not\*\* revoke this explicit user RBAC'
+        $faultSource = Get-Content (Join-Path $root 'faults\Invoke-Fault.ps1') -Raw
+        $faultSource | Should Match "Write-Warning 'NoShareAccess changes only default share permission"
     }
 }
 

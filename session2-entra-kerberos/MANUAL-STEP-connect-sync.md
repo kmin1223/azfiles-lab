@@ -301,12 +301,47 @@ Only after the device, synchronized users/PHS and user PRT gates above, run
 from the repo root in **Cloud Shell PowerShell**, in the intended subscription:
 
 ```powershell
-./session2-entra-kerberos/setup.ps1 -ResourceGroupName azfiles-lab -Prefix azflab
+./session2-entra-kerberos/setup.ps1 -ResourceGroupName azfiles-lab -Prefix azflab `
+    -ShareUserPrincipalName 'hybrid-labuser1@<verified-domain>'
 ```
 
-It checks client hybrid join/tenant **before** changing storage, enables AADKERB,
-grants storage-app consent, applies the client cloud Kerberos policy and reboots.
-It does not configure Connect or repair SCP. No fault injection is part of setup.
+Replace `<verified-domain>` with the suffix you chose for the synchronized
+user. Use the **exact Entra UPN**, not `CONTOSO\labuser1`, a display name, or the
+similarly named cloud-only account.
+
+The optional `-ShareUserPrincipalName` requires **Az.Resources**, directory
+permission to read that user, and permission to read/create role assignments
+at `labshare` or above (for example, Owner, User Access Administrator or Role
+Based Access Control Administrator with suitable scope/conditions). An Entra
+Global Administrator role alone is not Azure RBAC authorization.
+
+Setup checks client hybrid join/tenant, resolves the requested user in the
+current Azure tenant and grants **Storage File Data SMB Share Contributor**
+only at `<storage-account-id>/fileServices/default/fileshares/labshare`
+**before** changing the storage identity source. An existing assignment for
+the same user, role and exact scope is reused. Read, lookup or assignment
+errors stop setup rather than being treated as missing permissions/success.
+The RBAC step does not change default share permissions, NTFS ACLs, other
+users, or existing inherited assignments.
+
+If you omit the parameter, no user is guessed and no RBAC is changed; setup
+warns that share-level access must be configured manually. You can assign the
+same role to the synchronized user via **labshare > Access control (IAM)**.
+Keep default share permission Disabled when using the user-scoped baseline;
+the RBAC step does not remove a pre-existing broad default permission for you.
+
+Setup then enables AADKERB, grants storage-app consent, applies the client
+cloud Kerberos policy and reboots.
+It does not configure Connect or repair SCP. Without `-PrepareRbacLab`, no
+fault injection is part of setup. The optional two-share prework is below.
+
+**Allow RBAC propagation before declaring the baseline broken.** A successful
+role assignment or an IAM portal entry is control-plane evidence, not a passing
+SMB access test. [Share-level permission changes usually take effect within
+30 minutes, but can take longer](https://learn.microsoft.com/azure/storage/files/storage-files-identity-assign-share-level-permissions#share-level-permissions-for-specific-microsoft-entra-users-or-groups).
+Setup does not impose a fixed sleep or promise that reboot/sign-out accelerates
+server-side propagation. Do not broaden the role or reset passwords just because
+an immediate retry is denied.
 
 After reboot, sign in afresh as `CONTOSO\labuser1` (its configured, synced UPN
 is the cloud identity). In the **same non-elevated user session**:
@@ -317,6 +352,7 @@ klist cloud_debug
 klist
 # Substitute the actual storage account name.
 klist get cifs/<storage>.file.core.windows.net
+klist
 net use Z: \\<storage>.file.core.windows.net\labshare
 Get-ChildItem Z:\
 ```
@@ -326,6 +362,103 @@ TGT, a newly retrieved CIFS ticket and successful share access. Remove only
 known lab SMB connections if old Session 1 connections obscure the result.
 Do not call `setup.ps1`'s configuration message the completed baseline.
 Rehearse healthy access and recovery before presenting any hybrid fault.
+
+An initially empty `klist` or zero cloud-cache flags before `klist get` do not
+by themselves prove a cloud TGT failure; compare the state after the request.
+CIFS ticket issuance can succeed while share access is denied. With encrypted
+SMB3, use the matching SMBClient/Security event (for example, 31010) to read
+the error instead of expecting the status code to be visible in Wireshark.
+
+**Fault compatibility:** the hybrid `NoShareAccess` fault changes only default
+share permission. It does **not** revoke this explicit user RBAC, so it is not
+a reliable access-denial demo for this baseline. Do not use its `-Repair` to
+repair user RBAC: that enables a broad default permission. For a user-RBAC
+denial demo, use the separate pre-staged `rbac-lab` below rather than revoking
+the healthy `labshare` assignment during class. Other hybrid faults are unchanged.
+
+## 6.1 Optional first lab: successful ticket, missing share RBAC
+
+Run this **before class**, against the presenter's dedicated Hybrid environment:
+
+```powershell
+./session2-entra-kerberos/setup.ps1 -ResourceGroupName azfiles-lab -Prefix azflab `
+    -ShareUserPrincipalName 'hybrid-labuser1@<verified-domain>' `
+    -PrepareRbacLab
+```
+
+This remains full setup: it checks the joined client, grants the normal share
+role, ensures AADKERB/consent, configures the client and **reboots it**. Do not
+rerun it during the exercise simply to grant the repair role.
+
+| Share | Root DACL | Share-level permission for selected user | Purpose |
+| --- | --- | --- | --- |
+| `labshare` | Existing, unchanged | Explicit SMB Share Contributor | Healthy comparison and subsequent labs |
+| `rbac-lab` | Copied from `labshare` | No applicable SMB data role | First lab: valid CIFS ticket, denied share access |
+
+The flag requires `-ShareUserPrincipalName`. In addition to the normal setup
+permissions, the operator needs share creation/read, storage key listing,
+Run Command on the DC, role definition/assignment reads, and user/group
+expansion permission. No extra modules beyond the existing optional
+**Az.Resources** are needed. The helper mounts both shares temporarily using
+storage-key administrative access on the DC, copies only the root DACL,
+verifies it, and removes only its own temporary drives. It does not copy
+files or replace the source ACL, owner or SACL. The new SMB share is supported
+on the Session 1 StorageV2 account and has a 100-GiB quota, not prefilled data.
+
+**Account-wide effect:** default share permission becomes **None/Disabled** for
+all shares on this account. Other identities relying only on that default lose
+access after propagation. Explicit roles are not removed. Use this flag only
+on the dedicated lab account, never on shared/production storage.
+
+**Safe prework and reruns:** the script inspects effective roles and expands
+the user's transitive group assignments. Inherited roles, wildcard/custom
+Azure Files data grants and already-repaired access stop preparation.
+Conditioned roles and `NotDataActions` exceptions are conservative blockers,
+not a claim that access was tested. Lookup errors also stop; no role is
+automatically revoked. An existing `rbac-lab` must carry this lab's metadata
+and the same selected user ID; unrelated shares are not adopted. An unfinished
+owned share can be retried, but the script may recopy its root DACL. It does
+not delete its contents. To rehearse a new denied state after repair, reset
+only the exact test-share role manually **well before class**, allow revocation
+to propagate, and repeat the negative check. Never revoke `labshare` access.
+
+**Required user checks before class:** after all permission changes have
+propagated, use the same actual synchronized user session (not SYSTEM, an
+administrator using a storage key, or a saved alternate credential). Verify a
+fresh CIFS ticket and successful access to `labshare`, then denial on `rbac-lab`:
+
+```powershell
+$sa = '<actual-storage-account>'
+klist get "cifs/$sa.file.core.windows.net"
+Get-ChildItem "\\$sa.file.core.windows.net\labshare" -ErrorAction Stop
+Get-ChildItem "\\$sa.file.core.windows.net\rbac-lab" -ErrorAction Stop
+# The second command is expected to report Access Denied, not DNS/network failure.
+```
+
+Both shares use the **same CIFS SPN**. The denied share does not need a
+different ticket. Match the actual client error and SMBClient/Security event
+(for example, 31010) to the test path/time; a generic password prompt or
+cancelled prompt/error 1223 is not sufficient evidence. With SMB3 encryption,
+Wireshark can show encrypted traffic without exposing its inner denial status.
+`RBAC_LAB_PROVISIONED_USER_CHECKS_REQUIRED` means provisioning only, not that
+these positive/negative checks passed. If both shares succeed or both fail,
+do not start the exercise.
+
+**First 10-15 minutes:** reproduce the denied share, confirm the ticket,
+compare `labshare`, correlate the access-denied evidence and inspect missing
+share RBAC. Then, in Cloud Shell, run the **exact `New-AzRoleAssignment` command
+printed by setup**. It grants only the selected user **Storage File Data SMB
+Share Contributor** on `rbac-lab`. Record the assignment time in UTC with
+`(Get-Date).ToUniversalTime().ToString('o')`. If the role already exists, verify
+the exact user/role/scope in IAM instead of adding broader permissions.
+
+**Do not block the class:** mark this point **diagnosed / repair applied** and
+continue on `labshare`. Recheck `rbac-lab` later, after subsequent account/client
+faults have been repaired, and mark **recovery verified** only when that user's
+share access actually works. Propagation can exceed 30 minutes; signing out
+does not accelerate it. If time runs out, show a pre-recorded successful
+recovery and explicitly leave live recovery **pending**. Do not use the old
+`NoShareAccess -Repair`: its broad default permission would mask this lab.
 
 ## Troubleshooting and cleanup
 

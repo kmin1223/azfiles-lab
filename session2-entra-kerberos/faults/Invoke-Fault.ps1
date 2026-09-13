@@ -20,12 +20,19 @@
                               reg fixes "don't work" because policy wins
                     Repair  : remove the policy-path value (+ re-logon)
 
-  ConsentRevoked    Remove the OAuth2 permission grants from the storage
-                    account's service principal.
-                    Symptom : Entra won't issue the TGT for the SA; mount fails
+  ConsentRevoked    Remove only the Microsoft Graph AllPrincipals grant with
+                    exactly openid/profile/User.Read from the storage app.
+                    Refuses ambiguous or non-baseline Graph consent.
+                    Scope   : ALL shares/new requests for this storage account,
+                              including labshare and rbac-lab; not just one share.
+                    Symptom : fresh CIFS service-ticket acquisition may fail.
+                              Existing tickets/SMB sessions may survive; this
+                              does not clear the PRT or cloud TGT.
                     Diagnose: Entra portal -> App registrations ->
                               [Storage Account] <sa>... -> API permissions
-                    Repair  : re-grant openid/profile/User.Read
+                    Repair  : re-grant only that baseline when Graph consent
+                              is absent; verify directory readback, then test
+                              a fresh CIFS ticket (not a propagation guarantee).
 
   NotHybridJoined   dsregcmd /leave on the client (device drops out of Entra).
                     Symptom : dsregcmd /status AzureAdJoined: NO; no PRT ->
@@ -33,6 +40,8 @@
                     Repair  : re-join + reboot (takes a few minutes to register)
 
   NoShareAccess     DefaultSharePermission = None.
+                    Explicit/inherited RBAC remains effective; this fault does
+                    not deny a user granted access by setup -ShareUserPrincipalName.
                     Symptom : Kerberos succeeds but share access denied ->
                               proves auth vs authorization are separate layers
                     Repair  : restore StorageFileDataSmbShareContributor
@@ -100,6 +109,103 @@ function Invoke-OnVm([string]$Vm, [string]$Script) {
             -CommandId 'RunPowerShellScript' -ScriptPath $tmp
         ($r.Value | Where-Object Code -like '*StdOut*').Message
     } finally { Remove-Item $tmp -Force }
+}
+
+function Assert-ConsentGuid([string]$Value, [string]$Label) {
+    $parsed = [guid]::Empty
+    if (-not [guid]::TryParse($Value, [ref]$parsed) -or $parsed -eq [guid]::Empty) {
+        throw "CONSENT_ID_INVALID: $Label must be a nonzero GUID. Inspect the storage app and Microsoft Graph service principals before retrying."
+    }
+}
+
+function Get-LabGraphConsent([string]$ClientId, [string]$GraphId) {
+    $grants = @(Get-MgOauth2PermissionGrant -Filter "clientId eq '$ClientId'" -All -ErrorAction Stop)
+    foreach ($grant in $grants) {
+        Assert-ConsentGuid -Value $grant.ClientId -Label 'Grant clientId'
+        Assert-ConsentGuid -Value $grant.ResourceId -Label 'Grant resourceId'
+        if ([guid]$grant.ClientId -ne [guid]$ClientId) {
+            throw 'CONSENT_STATE_UNEXPECTED: Grant listing returned a different client. Inspect permissions before retrying; no automatic cleanup is safe.'
+        }
+    }
+    $graphGrants = @($grants | Where-Object { [guid]$_.ResourceId -eq [guid]$GraphId })
+    if ($graphGrants.Count -eq 0) { return }
+    if ($graphGrants.Count -ne 1) {
+        throw 'CONSENT_STATE_UNEXPECTED: Expected one Graph AllPrincipals baseline grant or none. Multiple/user-specific Graph grants can mask the fault. Inspect the storage app Permissions; do not delete unrelated consent.'
+    }
+    $grant = $graphGrants[0]
+    $scopes = @(([string]$grant.Scope).Trim() -split '\s+' | Sort-Object -Unique)
+    if ($grant.ConsentType -cne 'AllPrincipals' -or
+        -not [string]::IsNullOrEmpty([string]$grant.PrincipalId) -or
+        [string]::IsNullOrWhiteSpace([string]$grant.Id) -or
+        $scopes.Count -ne 3 -or
+        $scopes -cnotcontains 'openid' -or $scopes -cnotcontains 'profile' -or
+        $scopes -cnotcontains 'User.Read') {
+        throw 'CONSENT_STATE_UNEXPECTED: Graph consent must be a single AllPrincipals grant with exactly openid/profile/User.Read and no user-specific principal. Inspect Permissions and use a disposable baseline lab account; unexpected consent will not be overwritten.'
+    }
+    $grant
+}
+
+function Invoke-LabConsentFault([string]$StorageAccountName, [switch]$Repair) {
+    Write-Warning "ConsentRevoked affects ALL shares/new requests for storage account '$StorageAccountName' (including labshare and rbac-lab), not just the RBAC demo share. Use only a disposable lab account. Existing tickets/SMB sessions may survive. This does not clear or revoke the PRT or cloud TGT."
+    Write-Host "Fresh-ticket validation (lab user, after closing the lab SMB connections): klist purge; klist get cifs/$StorageAccountName.file.core.windows.net"
+    Write-Host 'klist purge affects cached Kerberos tickets in that logon session; consent changes alone do not purge tickets. Directory readback does not prove live CIFS service-ticket acquisition or SMB access, and propagation may lag.'
+    Connect-LabGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All'
+    $escapedName = $StorageAccountName.Replace("'", "''")
+    $storageSps = @(Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $escapedName.file.core.windows.net'" -All -ErrorAction Stop)
+    $graphSps = @(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -All -ErrorAction Stop)
+    if ($storageSps.Count -ne 1 -or $graphSps.Count -ne 1) {
+        throw 'CONSENT_SP_AMBIGUOUS: Expected exactly one storage account service principal and one Microsoft Graph service principal. Inspect Enterprise applications and resolve missing/duplicate identities before retrying.'
+    }
+    $clientId = [string]$storageSps[0].Id
+    $graphId = [string]$graphSps[0].Id
+    Assert-ConsentGuid -Value $clientId -Label 'Storage service principal Id'
+    Assert-ConsentGuid -Value $graphId -Label 'Microsoft Graph service principal Id'
+    if ([guid]$clientId -eq [guid]$graphId) {
+        throw 'CONSENT_SP_AMBIGUOUS: Storage and Microsoft Graph service principals must be distinct. Inspect Enterprise applications before retrying.'
+    }
+    $baseline = Get-LabGraphConsent -ClientId $clientId -GraphId $graphId
+    if (-not $Repair -and -not $baseline) {
+        Write-Host 'Graph consent already missing on directory read; nothing removed. This is not evidence of a live ticket or mount failure.'
+        return
+    }
+    if ($Repair -and $baseline) {
+        Write-Host 'Exact baseline Graph consent already present on directory read; nothing changed. Validate fresh CIFS service-ticket acquisition separately.'
+        return
+    }
+    if (-not $Repair) {
+        Show-Cmd -Where 'runs here, against Microsoft Graph (validated baseline only)' -Command `
+            "Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId '$($baseline.Id)' -ErrorAction Stop"
+        Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId $baseline.Id -ErrorAction Stop
+    } else {
+        Show-Cmd -Where 'runs here, against Microsoft Graph (absent baseline only)' -Command @"
+New-MgOauth2PermissionGrant -BodyParameter @{
+    clientId    = '$clientId'
+    consentType = 'AllPrincipals'
+    resourceId  = '$graphId'
+    scope       = 'openid profile User.Read'
+} -ErrorAction Stop
+"@
+        New-MgOauth2PermissionGrant -BodyParameter @{
+            clientId = $clientId
+            consentType = 'AllPrincipals'
+            resourceId = $graphId
+            scope = 'openid profile User.Read'
+        } -ErrorAction Stop | Out-Null
+    }
+    try {
+        $readback = Get-LabGraphConsent -ClientId $clientId -GraphId $graphId
+        if (($Repair -and -not $readback) -or (-not $Repair -and $readback)) {
+            throw 'The requested consent state is not yet visible.'
+        }
+    } catch {
+        throw "CONSENT_READBACK_UNCONFIRMED: The mutation request completed, but directory readback did not confirm it. Propagation may lag or consent may have changed concurrently. Inspect Permissions and re-read before retrying; no automatic rollback or extra mutation was attempted. $($_.Exception.Message)"
+    }
+    if ($Repair) {
+        Write-Host 'Directory readback confirms the exact baseline Graph consent (openid profile User.Read). Live ticket acquisition/recovery is not yet verified.'
+    } else {
+        Write-Host 'Directory readback confirms Graph consent is absent. Fresh CIFS service-ticket acquisition may fail; existing tickets/sessions may survive. Live failure is not yet verified.'
+    }
+    Write-Host 'Diagnose in portal: Entra ID -> Enterprise applications -> [Storage Account]... -> Permissions.'
 }
 
 $mode = if ($Repair) { 'REPAIR' } else { 'INJECT' }
@@ -172,36 +278,7 @@ Write-Output 'WinHTTP proxy reset (direct access restored)'
     }
 
     'ConsentRevoked' {
-        Connect-LabGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All'
-        $spn = Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $saName.file.core.windows.net'"
-        if (-not $spn) { throw 'Storage account service principal not found.' }
-        if (-not $Repair) {
-            Show-Cmd -Where 'runs here, against Microsoft Graph' -Command @"
-Get-MgOauth2PermissionGrant -Filter "clientId eq '$($spn.Id)'" |
-    ForEach-Object { Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId `$_.Id }
-"@
-            Get-MgOauth2PermissionGrant -Filter "clientId eq '$($spn.Id)'" |
-                ForEach-Object { Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId $_.Id }
-            Write-Host 'OAuth2 grants removed. New sessions: TGT issuance for the SA fails.'
-            Write-Host 'Diagnose in portal: Entra ID -> Enterprise applications -> [Storage Account]... -> Permissions.'
-        } else {
-            $graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
-            Show-Cmd -Where 'runs here, against Microsoft Graph' -Command @"
-New-MgOauth2PermissionGrant -BodyParameter @{
-    clientId    = '$($spn.Id)'          # the storage account's service principal
-    consentType = 'AllPrincipals'
-    resourceId  = '$($graphSp.Id)'      # Microsoft Graph
-    scope       = 'openid profile User.Read'
-}
-"@
-            New-MgOauth2PermissionGrant -BodyParameter @{
-                clientId    = $spn.Id
-                consentType = 'AllPrincipals'
-                resourceId  = $graphSp.Id
-                scope       = 'openid profile User.Read'
-            } | Out-Null
-            Write-Host 'Consent restored (openid profile User.Read).'
-        }
+        Invoke-LabConsentFault -StorageAccountName $saName -Repair:$Repair
     }
 
     'NotHybridJoined' {
@@ -223,6 +300,7 @@ Write-Output 'Re-join triggered, rebooting. Registration may take a few minutes.
     }
 
     'NoShareAccess' {
+        Write-Warning 'NoShareAccess changes only default share permission, not explicit/inherited RBAC. A user granted share RBAC by setup may retain access. Repair enables a broad default permission; it does not restore user-specific RBAC.'
         $perm = if ($Repair) { 'StorageFileDataSmbShareContributor' } else { 'None' }
         Show-Cmd -Where 'runs here, against Azure' -Command `
             "Set-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName -DefaultSharePermission '$perm'"
