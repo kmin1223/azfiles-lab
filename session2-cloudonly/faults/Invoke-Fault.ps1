@@ -45,6 +45,8 @@
 
 .PARAMETER Prefix
   Optional. Uses the same Azure-context-derived prefix as deploy.ps1 when omitted.
+  Cloud Shell ManagedService contexts also require the same /home/<name> in pwd.
+  Run from that home directory or any folder beneath it.
   For an existing lab with an explicit or old default prefix, supply that value
   (for example -Prefix azfcloud). Never falls back to another participant's account.
 #>

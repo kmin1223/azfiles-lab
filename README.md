@@ -244,8 +244,12 @@ same `-ResourceGroupName` — the steps are re-runnable and skip completed work.
 **Hands-on — Cloud-only.** Start this on slide 2, or complete it in advance. Session 1 is not
 a prerequisite. Use Cloud Shell PowerShell, an Owner subscription, a dev/trial
 tenant, and quota for one `Standard_D2s_v5` VM. No prefix input is needed:
-resource names use a deterministic prefix derived from your Azure account,
-tenant, subscription and resource group, not your Cloud Shell home folder.
+resource names use a deterministic prefix derived from your tenant, subscription,
+resource group and participant label. For Cloud Shell's `ManagedService` context
+(`MSI@50342`), the label is the name after `/home/` in `pwd`: both `/home/min`
+and `/home/min/azfiles-lab` use `min`. No token lookup is needed. Run from beneath
+your home directory, or pass an explicit `-Prefix`. Ordinary `User` contexts
+retain their existing Azure-account-based names.
 
 ```powershell
 git clone https://github.com/kmin1223/azfiles-lab.git
@@ -266,7 +270,8 @@ complete any required MFA registration manually. Before hands-on, confirm
 `AzureAdJoined: YES`, `DomainJoined: NO`, `AzureAdPrt: YES`, a CIFS service ticket,
 and a successful mount. A deployment completion message alone is not this gate.
 Run later cloud-side fault commands with the same Azure login, tenant,
-subscription and resource group; they derive the same prefix automatically.
+subscription, resource group and Cloud Shell home name; they derive the same
+prefix automatically. The home name is only a naming label, not proof of identity.
 The resolved prefix is printed at startup and in the deployment summary. To
 access a lab created with an explicit prefix or the old default, keep passing
 that value (for example `-Prefix azfcloud`) to deployment and faults. No
@@ -274,6 +279,10 @@ automatic fallback selects legacy or other participants' accounts. An explicit
 deployment prefix must be 1-11 lowercase letters/digits; it is still optional.
 Automatic names do not isolate the shared `labuser1`/`labuser2` directory
 identities, so the separate-tenant requirement above still applies.
+Cloud-only storage accounts are created with `securityControl=ignore`.
+On reuse, deployment merges this tag without removing other tags. This is a
+custom lab tag; its effect depends on the policies or automation that consume it,
+not an Azure Storage security setting.
 If deployment, sign-in
 or permission propagation is still pending, observe the demo and join when
 ready; no fixed deployment-to-readiness duration is guaranteed.

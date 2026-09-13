@@ -10,6 +10,16 @@ function Get-AzStorageAccount {
     [CmdletBinding()] param($ResourceGroupName)
     throw 'Unmocked storage read'
 }
+function New-AzStorageAccount {
+    [CmdletBinding()]
+    param($ResourceGroupName, $Name, $Location, $SkuName, $Kind,
+        [switch]$EnableLargeFileShare, $MinimumTlsVersion, [hashtable]$Tag)
+    throw 'Unmocked storage creation'
+}
+function Update-AzTag {
+    [CmdletBinding()] param($ResourceId, [hashtable]$Tag, $Operation)
+    throw 'Unmocked tag update'
+}
 
 # Execute real entry-point preflights only; exclude all deployment/fault mutations.
 $entryPreflights = @{}
@@ -50,6 +60,19 @@ foreach ($entry in @('deploy.ps1', 'faults\Invoke-Fault.ps1')) {
             'param([string]$ResourceGroupName, [string]$Prefix = "azf560970e8")' + "`n" +
             (($selection | ForEach-Object { $_.Extent.Text }) -join "`n") + "`nreturn `$sa"
         )
+        $provisionEnd = $deploymentStatements | Where-Object {
+            $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Extent.Text -match '^if \(\$sa\)'
+        } | Select-Object -First 1
+        if (-not $provisionEnd) { throw 'Missing storage provisioning boundary' }
+        $provision = $deploymentStatements | Where-Object {
+            $_.Extent.StartOffset -ge $start.Extent.StartOffset -and
+            $_.Extent.EndOffset -le $provisionEnd.Extent.EndOffset
+        }
+        $storageProvision = [scriptblock]::Create(
+            'param([string]$ResourceGroupName, [string]$Prefix = "azf560970e8", [string]$Location = "koreacentral")' + "`n" +
+            (($provision | ForEach-Object { $_.Extent.Text }) -join "`n") + "`nreturn `$saName"
+        )
     }
 }
 
@@ -60,12 +83,25 @@ Describe 'Cloud-only automatic naming (offline)' {
             Tenant = [pscustomobject]@{ Id = '11111111-2222-3333-4444-555555555555' }
             Subscription = [pscustomobject]@{ Id = '22222222-2222-3333-4444-555555555555' }
         }
-        $script:namingAccounts = @([pscustomobject]@{ StorageAccountName = 'azf560970e8abcdefgh' })
+        $script:namingAccounts = @([pscustomobject]@{
+            StorageAccountName = 'azf560970e8abcdefgh'
+            Id = '/subscriptions/test/resourceGroups/azfiles-cloudonly/providers/Microsoft.Storage/storageAccounts/azf560970e8abcdefgh'
+            Tags = @{ owner = 'lab'; securityControl = 'enforce' }
+        })
+        $script:namingLocation = '/home/min/azfiles-lab'
         $script:namingReadFailure = $false
+        $script:tagWriteFailure = $false
+        $script:createdTags = $null
         Mock Get-AzContext { $script:namingContext }
+        Mock Get-Location { [pscustomobject]@{ Path = $script:namingLocation } }
         Mock Get-AzStorageAccount {
             if ($script:namingReadFailure) { throw 'Storage read denied' }
             $script:namingAccounts
+        }
+        Mock New-AzStorageAccount { $script:createdTags = $Tag.Clone() }
+        Mock Update-AzTag {
+            if ($script:tagWriteFailure) { throw 'Tag update denied' }
+            foreach ($key in $Tag.Keys) { $script:namingAccounts[0].Tags[$key] = $Tag[$key] }
         }
         Mock Write-Host {}
     }
@@ -87,6 +123,50 @@ Describe 'Cloud-only automatic naming (offline)' {
         (Get-Command Resolve-CloudOnlyLabPrefix).Definition | Should Not Match '\$HOME|\$env:'
     }
 
+    It 'uses only the home name from pwd for Cloud Shell ManagedService naming' {
+        $namingContext.Account.Type = 'ManagedService'
+        $namingContext.Account.Id = 'MSI@50342'
+        $prefix = Resolve-CloudOnlyLabPrefix -ResourceGroupName azfiles-cloudonly -AzureContext $namingContext
+        $prefix | Should Match '^azf[0-9a-f]{8}$'
+        foreach ($path in @('/home/min', '/home/min/', '/home/min/another/folder')) {
+            $script:namingLocation = $path
+            Resolve-CloudOnlyLabPrefix -ResourceGroupName azfiles-cloudonly -AzureContext $namingContext |
+                Should Be $prefix
+        }
+        $namingContext.Account.Id = 'MSI@50400'
+        Resolve-CloudOnlyLabPrefix -ResourceGroupName azfiles-cloudonly -AzureContext $namingContext |
+            Should Be $prefix
+        $script:namingLocation = '/home/lee/azfiles-lab'
+        Resolve-CloudOnlyLabPrefix -ResourceGroupName azfiles-cloudonly -AzureContext $namingContext |
+            Should Not Be $prefix
+    }
+
+    It 'rejects ManagedService naming outside a home directory: <Path>' -TestCases @(
+        @{ Path = '/home' }, @{ Path = '/home/' }, @{ Path = '/tmp/azfiles-lab' },
+        @{ Path = '/homeother/min' }, @{ Path = 'C:\temp\azfiles-lab' }
+    ) {
+        param($Path)
+        $namingContext.Account.Type = 'ManagedService'
+        $namingContext.Account.Id = 'MSI@50342'
+        $script:namingLocation = $Path
+        { Resolve-CloudOnlyLabPrefix -ResourceGroupName azfiles-cloudonly -AzureContext $namingContext } |
+            Should Throw 'CLOUD_PREFIX_HOME_REQUIRED'
+        Resolve-CloudOnlyLabPrefix -ResourceGroupName azfiles-cloudonly -AzureContext $namingContext -Prefix azfcloud |
+            Should Be 'azfcloud'
+    }
+
+    It 'resolves Cloud Shell deployment, injection and repair consistently from nested folders' {
+        $namingContext.Account.Type = 'ManagedService'
+        $namingContext.Account.Id = 'MSI@50342'
+        $deployPrefix = & $entryPreflights['deploy.ps1'] -ResourceGroupName azfiles-cloudonly
+        $script:namingLocation = '/home/min/azfiles-lab/session2-cloudonly'
+        & $entryPreflights['faults\Invoke-Fault.ps1'] -ResourceGroupName azfiles-cloudonly -Fault ConsentRevoked |
+            Should Be $deployPrefix
+        & $entryPreflights['faults\Invoke-Fault.ps1'] -ResourceGroupName azfiles-cloudonly -Fault ConsentRevoked -Repair |
+            Should Be $deployPrefix
+        Assert-MockCalled Get-AzStorageAccount -Times 0 -Exactly -Scope It
+    }
+
     It 'separates different <Field> values' -TestCases @(
         @{ Field = 'account' }, @{ Field = 'tenant' }, @{ Field = 'subscription' }, @{ Field = 'resource group' }
     ) {
@@ -104,7 +184,7 @@ Describe 'Cloud-only automatic naming (offline)' {
 
     It 'rejects incomplete or non-user identity: <State>' -TestCases @(
         @{ State = 'no context' }, @{ State = 'no account' }, @{ State = 'blank account' },
-        @{ State = 'service principal' }, @{ State = 'managed identity' }
+        @{ State = 'service principal' }, @{ State = 'unsupported account type' }
     ) {
         param($State)
         switch ($State) {
@@ -112,7 +192,7 @@ Describe 'Cloud-only automatic naming (offline)' {
             'no account' { $namingContext.Account = $null }
             'blank account' { $namingContext.Account.Id = ' ' }
             'service principal' { $namingContext.Account.Type = 'ServicePrincipal' }
-            'managed identity' { $namingContext.Account.Type = 'ManagedService' }
+            'unsupported account type' { $namingContext.Account.Type = 'AccessToken' }
         }
         { Resolve-CloudOnlyLabPrefix -ResourceGroupName azfiles-cloudonly -AzureContext $namingContext } |
             Should Throw 'CLOUD_PREFIX_IDENTITY_REQUIRED'
@@ -214,5 +294,42 @@ Describe 'Cloud-only automatic naming (offline)' {
     It 'allows a genuinely empty resource group to proceed to new storage creation' {
         $script:namingAccounts = @()
         @(& $storageSelection -ResourceGroupName azfiles-cloudonly).Count | Should Be 0
+    }
+
+    It 'sets the requested tag during new account creation' {
+        $script:namingAccounts = @()
+        & $storageProvision -ResourceGroupName azfiles-cloudonly | Should Match '^azf560970e8[a-z]{8}$'
+        $script:createdTags.securityControl | Should Be 'ignore'
+        Assert-MockCalled New-AzStorageAccount -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Tag.Count -eq 1 -and $Tag.securityControl -eq 'ignore' -and
+            $ResourceGroupName -eq 'azfiles-cloudonly' -and $MinimumTlsVersion -eq 'TLS1_2'
+        }
+        Assert-MockCalled Update-AzTag -Times 0 -Exactly -Scope It
+    }
+
+    It 'merges the requested tag on reuse, preserving unrelated tags across reruns' {
+        1..2 | ForEach-Object {
+            & $storageProvision -ResourceGroupName azfiles-cloudonly | Should Be 'azf560970e8abcdefgh'
+        }
+        $script:namingAccounts[0].Tags.securityControl | Should Be 'ignore'
+        $script:namingAccounts[0].Tags.owner | Should Be 'lab'
+        Assert-MockCalled Update-AzTag -Times 2 -Exactly -Scope It -ParameterFilter {
+            $Operation -eq 'Merge' -and $Tag.Count -eq 1 -and $Tag.securityControl -eq 'ignore' -and
+            $ResourceId -eq $script:namingAccounts[0].Id
+        }
+        Assert-MockCalled New-AzStorageAccount -Times 0 -Exactly -Scope It
+    }
+
+    It 'propagates tag update failures instead of reporting successful reuse' {
+        $script:tagWriteFailure = $true
+        { & $storageProvision -ResourceGroupName azfiles-cloudonly } | Should Throw 'Tag update denied'
+        Assert-MockCalled New-AzStorageAccount -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not tag or create an account when storage selection is ambiguous' {
+        $script:namingAccounts += [pscustomobject]@{ StorageAccountName = 'azf560970e8ijklmnop' }
+        { & $storageProvision -ResourceGroupName azfiles-cloudonly } | Should Throw 'CLOUD_STORAGE_AMBIGUOUS'
+        Assert-MockCalled Update-AzTag -Times 0 -Exactly -Scope It
+        Assert-MockCalled New-AzStorageAccount -Times 0 -Exactly -Scope It
     }
 }

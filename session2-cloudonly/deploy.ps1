@@ -38,7 +38,9 @@
 .PARAMETER Prefix
   Optional explicit resource prefix (up to 11 lowercase letters/digits).
   Otherwise derived from the signed-in Azure account, tenant, subscription
-  and resource group. The same context resolves the same prefix in fault scripts.
+  and resource group. Cloud Shell ManagedService contexts use the name after
+  /home/ in pwd instead of MSI@50342; no token lookup is needed.
+  Use the same context and home name in fault scripts.
   Existing labs made with the old default must pass -Prefix azfcloud.
 
 .PARAMETER LogPath
@@ -142,15 +144,19 @@ if ($matchingAccounts.Count -gt 1) {
     throw "CLOUD_STORAGE_AMBIGUOUS: More than one storage account matches '$Prefix' in '$ResourceGroupName'. Use the intended resource group/prefix; no storage account was selected."
 }
 $sa = $matchingAccounts | Select-Object -First 1
+$storageTags = @{ securityControl = 'ignore' }
 if ($sa) {
     $saName = $sa.StorageAccountName
+    Update-AzTag -ResourceId $sa.Id -Tag $storageTags -Operation Merge -ErrorAction Stop | Out-Null
     Write-Host "  reusing $saName"
 } else {
     $saName = "$Prefix" + (-join ((1..8) | ForEach-Object { [char[]]'abcdefghijklmnopqrstuvwxyz' | Get-Random }))
     New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $saName -Location $Location `
-        -SkuName Standard_LRS -Kind StorageV2 -EnableLargeFileShare -MinimumTlsVersion TLS1_2 | Out-Null
+        -SkuName Standard_LRS -Kind StorageV2 -EnableLargeFileShare -MinimumTlsVersion TLS1_2 `
+        -Tag $storageTags | Out-Null
     Write-Host "  created $saName"
 }
+Write-Host '  storage tag: securityControl=ignore'
 $deploymentInfo['Storage account'] = $saName
 Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 # Cloud-only: no ActiveDirectoryDomainName / DomainGuid to supply. That is the point.

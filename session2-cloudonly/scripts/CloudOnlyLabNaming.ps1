@@ -15,8 +15,8 @@ function Resolve-CloudOnlyLabPrefix {
 
     if (-not $AzureContext -or
         [string]::IsNullOrWhiteSpace([string]$AzureContext.Account.Id) -or
-        [string]$AzureContext.Account.Type -ine 'User') {
-        throw 'CLOUD_PREFIX_IDENTITY_REQUIRED: Automatic naming needs a signed-in Azure user. Check Get-AzContext, or supply an explicit -Prefix for an existing lab. The shell home directory is not an Azure identity.'
+        [string]$AzureContext.Account.Type -notin @('User', 'ManagedService')) {
+        throw 'CLOUD_PREFIX_IDENTITY_REQUIRED: Automatic naming needs an Azure User context or a Cloud Shell ManagedService context. Check Get-AzContext, or supply the recorded -Prefix for an existing lab.'
     }
 
     $tenantId = [guid]::Empty
@@ -29,9 +29,19 @@ function Resolve-CloudOnlyLabPrefix {
         throw 'CLOUD_PREFIX_CONTEXT_INVALID: Automatic naming needs a valid tenant, subscription and resource group. Check Get-AzContext before continuing.'
     }
 
+    $accountName = ([string]$AzureContext.Account.Id).Trim().ToLowerInvariant()
+    if ([string]$AzureContext.Account.Type -ieq 'ManagedService') {
+        # Cloud Shell reports MSI@50342, not a participant ID. Use a naming label,
+        # not an authentication identity, from pwd; nested folders do not matter.
+        if ((Get-Location).Path -cnotmatch '^/home/([^/]+)(?:/|$)') {
+            throw 'CLOUD_PREFIX_HOME_REQUIRED: Run from /home/<name> or a folder beneath it in Cloud Shell, or supply the recorded -Prefix for an existing lab.'
+        }
+        $accountName = $Matches[1].ToLowerInvariant()
+    }
+
     $identity = @(
         $tenantId.ToString('D')
-        ([string]$AzureContext.Account.Id).Trim().ToLowerInvariant()
+        $accountName
         $subscriptionId.ToString('D')
         $ResourceGroupName.Trim().ToLowerInvariant()
     ) -join '|'
