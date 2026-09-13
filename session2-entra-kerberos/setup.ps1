@@ -110,7 +110,7 @@ function Grant-LabShareAccess {
     [pscustomobject]@{ ObjectId = $objectId.ToString(); UserPrincipalName = $UserPrincipalName; Scope = $scope }
 }
 
-$modules = @('Az.Accounts', 'Az.Storage', 'Az.Compute', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Authentication')
+$modules = @('Az.Accounts', 'Az.Storage', 'Az.Compute', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Authentication', 'Microsoft.Graph.Identity.SignIns')
 if ($ShareUserPrincipalName) { $modules += 'Az.Resources' }
 foreach ($m in $modules) {
     if (-not (Get-Module -ListAvailable $m)) {
@@ -123,6 +123,7 @@ if (-not $context) {
 }
 
 . (Join-Path (Join-Path $PSScriptRoot 'scripts') 'Connect-LabGraph.ps1')
+. (Join-Path (Join-Path $PSScriptRoot 'scripts') 'LabGraphConsent.ps1')
 if ($PrepareRbacLab) {
     . (Join-Path (Join-Path $PSScriptRoot 'scripts') 'Initialize-RbacFirstLab.ps1')
 }
@@ -224,23 +225,7 @@ Step '3/4 Granting admin consent to the storage account app (Graph)'
 
 Connect-LabGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All'
 
-$spn = Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $saName.file.core.windows.net'"
-if (-not $spn) {
-    Start-Sleep 30  # app creation can lag the storage config
-    $spn = Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $saName.file.core.windows.net'"
-}
-if (-not $spn) { throw "Service principal for $saName not found yet - retry in a minute." }
-
-$graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
-$existingGrant = Get-MgOauth2PermissionGrant -Filter "clientId eq '$($spn.Id)'" -ErrorAction SilentlyContinue
-if ($existingGrant) { $existingGrant | Remove-MgOauth2PermissionGrant }
-New-MgOauth2PermissionGrant -BodyParameter @{
-    clientId    = $spn.Id
-    consentType = 'AllPrincipals'
-    resourceId  = $graphSp.Id
-    scope       = 'openid profile User.Read'
-} | Out-Null
-Write-Host 'Admin consent granted: openid profile User.Read'
+Initialize-LabGraphConsent -StorageAccountName $saName
 
 # --------------------------------------------------------- 4. Client config
 Step '4/4 Configuring client (cloud TGT policy + tools, reboots)'

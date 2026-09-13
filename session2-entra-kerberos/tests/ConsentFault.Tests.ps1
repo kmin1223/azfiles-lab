@@ -7,7 +7,8 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($faultPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 # Extract only definitions: never run the script's Azure lookup or other faults.
-foreach ($name in @('Assert-ConsentGuid', 'Get-LabGraphConsent', 'Invoke-LabConsentFault', 'Show-Cmd')) {
+. (Join-Path $root 'scripts\LabGraphConsent.ps1')
+foreach ($name in @('Invoke-LabConsentFault', 'Show-Cmd')) {
     $definition = $ast.Find({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -304,12 +305,14 @@ Describe 'Presenter ConsentRevoked bounded baseline (offline)' {
     }
 
     It 'uses terminating errors on each Graph SDK operation' {
-        $commands = $ast.FindAll({
+        $helperAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $root 'scripts\LabGraphConsent.ps1'), [ref]$tokens, [ref]$parseErrors)
+        $commands = @($ast, $helperAst) | ForEach-Object { $_.FindAll({
             param($node)
             $node -is [Management.Automation.Language.CommandAst] -and
             $node.GetCommandName() -match '^(Get-MgServicePrincipal|Get-MgOauth2PermissionGrant|Remove-MgOauth2PermissionGrant|New-MgOauth2PermissionGrant)$'
-        }, $true)
-        $commands.Count | Should Be 5
+        }, $true) }
+        $commands.Count | Should Be 7
         foreach ($command in $commands) {
             $command.Extent.Text | Should Match '-ErrorAction Stop'
         }

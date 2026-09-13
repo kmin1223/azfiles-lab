@@ -85,6 +85,7 @@ $ErrorActionPreference = 'Stop'
 # Shared with setup.ps1: Cloud-Shell-friendly Graph sign-in (no device code) and
 # storage-account lookup that ignores Test-Coexistence's second account.
 . (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts/Connect-LabGraph.ps1')
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts/LabGraphConsent.ps1')
 
 $sa = Get-LabStorageAccount -ResourceGroupName $ResourceGroupName -Prefix $Prefix
 if (-not $sa) { throw "No $Prefix* storage account in $ResourceGroupName" }
@@ -111,58 +112,14 @@ function Invoke-OnVm([string]$Vm, [string]$Script) {
     } finally { Remove-Item $tmp -Force }
 }
 
-function Assert-ConsentGuid([string]$Value, [string]$Label) {
-    $parsed = [guid]::Empty
-    if (-not [guid]::TryParse($Value, [ref]$parsed) -or $parsed -eq [guid]::Empty) {
-        throw "CONSENT_ID_INVALID: $Label must be a nonzero GUID. Inspect the storage app and Microsoft Graph service principals before retrying."
-    }
-}
-
-function Get-LabGraphConsent([string]$ClientId, [string]$GraphId) {
-    $grants = @(Get-MgOauth2PermissionGrant -Filter "clientId eq '$ClientId'" -All -ErrorAction Stop)
-    foreach ($grant in $grants) {
-        Assert-ConsentGuid -Value $grant.ClientId -Label 'Grant clientId'
-        Assert-ConsentGuid -Value $grant.ResourceId -Label 'Grant resourceId'
-        if ([guid]$grant.ClientId -ne [guid]$ClientId) {
-            throw 'CONSENT_STATE_UNEXPECTED: Grant listing returned a different client. Inspect permissions before retrying; no automatic cleanup is safe.'
-        }
-    }
-    $graphGrants = @($grants | Where-Object { [guid]$_.ResourceId -eq [guid]$GraphId })
-    if ($graphGrants.Count -eq 0) { return }
-    if ($graphGrants.Count -ne 1) {
-        throw 'CONSENT_STATE_UNEXPECTED: Expected one Graph AllPrincipals baseline grant or none. Multiple/user-specific Graph grants can mask the fault. Inspect the storage app Permissions; do not delete unrelated consent.'
-    }
-    $grant = $graphGrants[0]
-    $scopes = @(([string]$grant.Scope).Trim() -split '\s+' | Sort-Object -Unique)
-    if ($grant.ConsentType -cne 'AllPrincipals' -or
-        -not [string]::IsNullOrEmpty([string]$grant.PrincipalId) -or
-        [string]::IsNullOrWhiteSpace([string]$grant.Id) -or
-        $scopes.Count -ne 3 -or
-        $scopes -cnotcontains 'openid' -or $scopes -cnotcontains 'profile' -or
-        $scopes -cnotcontains 'User.Read') {
-        throw 'CONSENT_STATE_UNEXPECTED: Graph consent must be a single AllPrincipals grant with exactly openid/profile/User.Read and no user-specific principal. Inspect Permissions and use a disposable baseline lab account; unexpected consent will not be overwritten.'
-    }
-    $grant
-}
-
 function Invoke-LabConsentFault([string]$StorageAccountName, [switch]$Repair) {
     Write-Warning "ConsentRevoked affects ALL shares/new requests for storage account '$StorageAccountName' (including labshare and rbac-lab), not just the RBAC demo share. Use only a disposable lab account. Existing tickets/SMB sessions may survive. This does not clear or revoke the PRT or cloud TGT."
     Write-Host "Fresh-ticket validation (lab user, after closing the lab SMB connections): klist purge; klist get cifs/$StorageAccountName.file.core.windows.net"
     Write-Host 'klist purge affects cached Kerberos tickets in that logon session; consent changes alone do not purge tickets. Directory readback does not prove live CIFS service-ticket acquisition or SMB access, and propagation may lag.'
     Connect-LabGraph -Scopes 'Application.Read.All', 'DelegatedPermissionGrant.ReadWrite.All'
-    $escapedName = $StorageAccountName.Replace("'", "''")
-    $storageSps = @(Get-MgServicePrincipal -Filter "displayName eq '[Storage Account] $escapedName.file.core.windows.net'" -All -ErrorAction Stop)
-    $graphSps = @(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -All -ErrorAction Stop)
-    if ($storageSps.Count -ne 1 -or $graphSps.Count -ne 1) {
-        throw 'CONSENT_SP_AMBIGUOUS: Expected exactly one storage account service principal and one Microsoft Graph service principal. Inspect Enterprise applications and resolve missing/duplicate identities before retrying.'
-    }
-    $clientId = [string]$storageSps[0].Id
-    $graphId = [string]$graphSps[0].Id
-    Assert-ConsentGuid -Value $clientId -Label 'Storage service principal Id'
-    Assert-ConsentGuid -Value $graphId -Label 'Microsoft Graph service principal Id'
-    if ([guid]$clientId -eq [guid]$graphId) {
-        throw 'CONSENT_SP_AMBIGUOUS: Storage and Microsoft Graph service principals must be distinct. Inspect Enterprise applications before retrying.'
-    }
+    $principals = Get-LabConsentPrincipals -StorageAccountName $StorageAccountName
+    $clientId = $principals.ClientId
+    $graphId = $principals.GraphId
     $baseline = Get-LabGraphConsent -ClientId $clientId -GraphId $graphId
     if (-not $Repair -and -not $baseline) {
         Write-Host 'Graph consent already missing on directory read; nothing removed. This is not evidence of a live ticket or mount failure.'

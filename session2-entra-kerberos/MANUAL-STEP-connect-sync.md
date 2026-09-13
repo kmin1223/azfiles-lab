@@ -441,8 +441,25 @@ Failures report the operation, exception type, HRESULT, and a Win32 error code
 when available; raw provider messages and credential-bearing targets are omitted.
 `RBAC_LAB_ACL_FAILED` is a provisioning error, not the intended user-session
 RBAC denial. Do not grant the lab user a broader role or skip ACL verification
-to clear it. The default-share-permission change, consent reset and client
+to clear it. The default-share-permission change, consent check and client
 reboot are later steps and are not reached when ACL provisioning stops.
+
+**Setup consent is non-destructive:** setup and the consent fault share the
+`scripts/LabGraphConsent.ps1` baseline validator. Setup keeps an existing
+Graph `AllPrincipals` grant with exactly `openid profile User.Read` unchanged;
+it creates that grant only when absent and verifies directory readback before
+configuring/rebooting the client. Other-resource grants are preserved.
+Ambiguous service principals, unexpected Graph scopes/user grants, or failed
+reads stop setup instead of triggering deletion or permission changes.
+Update the complete checkout, not just `setup.ps1`, to include the helper.
+Older setup versions piped a grant object directly into
+`Remove-MgOauth2PermissionGrant`, which can fail with
+`InputObject.OAuth2PermissionGrantId` missing. Do not work around this by
+deleting all grants manually. Fault injection alone deletes the validated
+baseline, using its explicit `-OAuth2PermissionGrantId`.
+Directory confirmation is not proof of fresh CIFS ticket acquisition or SMB
+access. Do not run the printed `rbac-lab` recovery role command before recording
+the intended user-session denial.
 
 **Required user checks before class:** after all permission changes have
 propagated, use the same actual synchronized user session (not SYSTEM, an
