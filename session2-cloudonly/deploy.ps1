@@ -49,9 +49,10 @@
 
 .PARAMETER LogPath
   Parent directory for private, timestamped run folders containing deploy.log
-  and lab-info.txt. Defaults to $HOME/azfiles-lab-logs. Files include generated
-  lab credentials: do not commit/share them. Download before leaving a Cloud
-  Shell session if persistent storage is not configured.
+  and lab-info.txt (resources, credentials, status and lab commands with actual
+  deployment values). Defaults to $HOME/azfiles-lab-logs. After finalizing the
+  output, requests browser downloads of lab-info.txt and the RDP file in Cloud
+  Shell. Keep both files private; do not commit/share credentials.
 
 .EXAMPLE
   # Azure Cloud Shell (PowerShell) - already signed in
@@ -102,11 +103,17 @@ $graph = 'https://graph.microsoft.com/v1.0'
 $users = @('labuser1', 'labuser2')
 
 . (Join-Path (Join-Path $PSScriptRoot 'scripts') 'CloudOnlyDeploymentLog.ps1')
+. (Join-Path (Join-Path $PSScriptRoot 'scripts') 'CloudOnlyDeploymentOutput.ps1')
 $logRun = Start-CloudDeploymentLog -LogPath $LogPath
 $deploymentInfo = [ordered]@{
     Status = 'IN PROGRESS'
     'Started UTC' = $startedUtc.ToString('o')
     'Resource group' = $ResourceGroupName
+    'Azure tenant ID' = [string]$azContext.Tenant.Id
+    'Subscription ID' = [string]$azContext.Subscription.Id
+    'Subscription name' = [string]$azContext.Subscription.Name
+    'Requested location' = $Location
+    'Cloud Shell script directory' = $PSScriptRoot
     Prefix = $Prefix
     'Storage account' = 'not yet recorded'
     'File share' = $ShareName
@@ -203,6 +210,10 @@ Write-Host '  consent granted: openid profile User.Read'
 Step '3/9 Cloud-only Entra users'
 $org = Get-MgOrganization | Select-Object -First 1
 $initialDomain = ($org.VerifiedDomains | Where-Object IsInitial).Name
+$deploymentInfo['Entra tenant ID'] = [string]$org.Id
+$deploymentInfo['Initial domain'] = $initialDomain
+$deploymentInfo['Storage app ID'] = [string]$spn.AppId
+$deploymentInfo['Storage service principal ID'] = [string]$spn.Id
 $deploymentInfo['Lab users'] = ($users | ForEach-Object { "$_@$initialDomain" }) -join ', '
 Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 $userIds = @{}
@@ -273,6 +284,11 @@ $ip   = $pipObj.IpAddress
 Write-Host "  $fqdn  ($ip)"
 $deploymentInfo['RDP host'] = $fqdn
 $deploymentInfo['Public IP'] = $ip
+$deploymentInfo['Public IP resource ID'] = $pipObj.Id
+$deploymentInfo['NIC resource ID'] = $nic.Id
+$deploymentInfo['Subnet resource ID'] = $nic.IpConfigurations[0].Subnet.Id
+$deploymentInfo['VNet resource ID'] = $nic.IpConfigurations[0].Subnet.Id -replace '/subnets/[^/]+$', ''
+$deploymentInfo['NIC NSG resource ID'] = $nic.NetworkSecurityGroup.Id
 Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 
 # ------------------------------------------------------- 5. managed identity
@@ -280,6 +296,10 @@ Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 # installs, still reports success, and the join silently does nothing.
 Step '5/9 System-assigned managed identity'
 $vmObj = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $vmName
+$deploymentInfo['VM resource ID'] = $vmObj.Id
+$deploymentInfo['VM location'] = $vmObj.Location
+$deploymentInfo['VM size'] = $vmObj.HardwareProfile.VmSize
+$deploymentInfo['OS disk resource ID'] = $vmObj.StorageProfile.OsDisk.ManagedDisk.Id
 if ($vmObj.Identity -and $vmObj.Identity.Type -match 'SystemAssigned') {
     Write-Host '  already enabled'
 } else {
@@ -296,6 +316,8 @@ $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName
     -Parameter @{ DnsSuffix = "$Location.cloudapp.azure.com" }
 Assert-CloudOnlyRunCommand -Result $r -CompletionMarker 'CLIENT_CONFIG_DONE'
 $deploymentInfo['Capture tools'] = 'Machine installation verified; user Inspector loading/capture NOT VERIFIED'
+$deploymentInfo['PowerShell tools'] = 'Az subset and AzFilesHybrid imports verified; Azure diagnostics NOT RUN. VM inventory: C:\LabTools\powershell-modules.json'
+$deploymentInfo['Trace helper'] = 'C:\LabTools\Get-KerberosEvidence.ps1: StartTrace, StopTrace (auto-convert), ConvertTrace'
 Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 
 # --------------------------------------------------------------- 7. restart
@@ -373,6 +395,16 @@ if (-not (Get-AzRoleAssignment -ObjectId $userIds['labuser1'] -Scope $saId `
 }
 Write-Host '  labuser1 : share Contributor  (labuser2 deliberately has none - Lab D)'
 Write-Host '  NOTE: role assignments take a few minutes to propagate.'
+$deploymentInfo['Resource group ID'] = $rgScope
+$deploymentInfo['Storage resource ID'] = $saId
+$deploymentInfo['Share UNC'] = "\\$saName.file.core.windows.net\$ShareName"
+$deploymentInfo['CIFS SPN'] = "cifs/$saName.file.core.windows.net"
+$deploymentInfo['labuser1 object ID'] = $userIds['labuser1']
+$deploymentInfo['labuser2 object ID'] = $userIds['labuser2']
+$deploymentInfo['VM role assigned'] = 'Both lab users: Virtual Machine Administrator Login at RG scope'
+$deploymentInfo['SMB role assigned'] = 'labuser1: Storage File Data SMB Share Contributor at storage-account scope'
+$deploymentInfo['labuser2 SMB role'] = 'Not assigned by this deployment; inherited permissions are not ruled out'
+$deploymentInfo['Directory scope'] = 'Users, device and storage app are tenant objects, not RG resources'
 
 # ------------------------------------------------------------------- report
 $rdp = @"
@@ -382,88 +414,34 @@ enablerdsaadauth:i:1
 authentication level:i:2
 "@
 $rdpPath = "$HOME/azfiles-cloudonly.rdp"
-$rdp | Set-Content -Path $rdpPath -Encoding ascii
+$rdp | Set-Content -LiteralPath $rdpPath -Encoding ascii
 $deploymentInfo['RDP file'] = $rdpPath
+$logRun.Commands = New-CloudDeploymentCommands -Info $deploymentInfo
 Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
-
-# Push the file to the browser as a lab convenience: it bundles the FQDN,
-# user and authentication settings. Supported mstsc clients also expose
-# enablerdsaadauth as Advanced > "Use a web account to sign in to the remote
-# computer". Cloud Shell provides 'download'; elsewhere, print the command.
-$autoDownloaded = $false
-if (Get-Command download -ErrorAction SilentlyContinue) {
-    try { download $rdpPath; $autoDownloaded = $true } catch { }
-}
 
 Write-Host @"
 
 ==============================================================
  $(if ($joined) { 'DEPLOYMENT CONFIGURATION APPLIED' } else { 'DEPLOYMENT INCOMPLETE - ENTRA JOIN NOT CONFIRMED' })
 ==============================================================
+ resource group  : $ResourceGroupName
  storage account : $saName
  resource prefix : $Prefix
  file share      : $ShareName
- users           : labuser1@$initialDomain   (has share access)
-                   labuser2@$initialDomain   (none - Lab D contrast)
- password        : $plainPw
+ lab user        : labuser1@$initialDomain
  RDP host        : $fqdn
  Entra joined    : $(if ($joined) { 'YES' } else { 'NOT YET - see the warning above' })
-==============================================================
- CONNECT
+ lab output      : $($logRun.InfoFile)
+ RDP file        : $rdpPath
 
-   >>>  download $rdpPath  <<<
-$(if ($autoDownloaded) {
-"   Already sent to your browser - check your Downloads folder.
-   Run the command above again if you need another copy."
-} else {
-"   Run that in Cloud Shell to save the .rdp file locally."
-})
-   Then open it and sign in as
-     labuser1@$initialDomain  /  $plainPw
-
- Why a file: it reliably bundles the FQDN, user and authentication
- settings for this lab; it is not the only way to connect.
- On supported mstsc clients, select Advanced ->
- "Use a web account to sign in to the remote computer"
- (equivalent to enablerdsaadauth), then connect to $fqdn
- and sign in as labuser1@$initialDomain.
- This authentication does not support an IP address. The hostname
- must match the VM's registered hostname in Entra ID and resolve
- to the VM's IP address.
-
- Fallbacks if the download is awkward: build the file by hand with
- the four lines in $rdpPath, or use Azure portal -> the VM ->
- Connect -> RDP -> login source "Microsoft Entra ID".
-
- FIRST SIGN-IN may require MFA registration depending on tenant policy.
- Capture tools: open the public desktop shortcut Fiddler Classic (Lab).
- Inspector MSI stages installation for user sign-in. Approve only the
- expected Kerberos.NET DLLs when Fiddler detects them; verify the Kerberos
- tab and actual HTTPS capture. These user steps are not automated.
-
- A certificate warning is expected: the VM's RDP certificate is
- issued for its short name, not the Azure FQDN. Continue.
-==============================================================
- FIRST THING TO RUN, as labuser1
-
-   dsregcmd /status          AzureAdJoined YES / DomainJoined NO / AzureAdPrt YES
-   klist cloud_debug         enabled by policy: 1
-   klist get cifs/$saName.file.core.windows.net
-   net use Z: \\$saName.file.core.windows.net\$ShareName
-
- Healthy signature - the cloud TGT says Kdc Called: TicketSuppliedAtLogon
- with etype Unknown (-1), and the service ticket says
- Kdc Called: KdcProxy:login.microsoftonline.com with AES-256 and Renew Time 0.
-==============================================================
- LAB FAULTS  (on the VM, elevated - no Azure access needed)
-
-   C:\LabTools\Invoke-LabFault.ps1 -Fault NoCloudTgt        # sign out/in after
-   C:\LabTools\Invoke-LabFault.ps1 -Fault ProxyMangled
-   ... add -Repair to undo
-==============================================================
- TEAR DOWN
-   Remove-AzResourceGroup -Name $ResourceGroupName -Force -AsJob
-   # then delete the two users and the device object in Entra ID
+ lab-info.txt contains resource IDs, private credentials and commands
+ for Lab A/B/C, Consent, trace capture/conversion and Azure diagnostics.
+ Open it as a guide; do NOT execute the whole file as a script.
+ After saving final status/elapsed time, both files will be submitted
+ to Cloud Shell's browser download command if available.
+ Check Downloads and allow multiple downloads if your browser asks.
+ User login, Kerberos tickets and actual file access remain UNVERIFIED.
+ Keep downloaded files private. Do not redeploy a healthy lab to repair faults.
 ==============================================================
 "@ -ForegroundColor Green
 $deploymentCompleted = $true
@@ -475,4 +453,9 @@ $deploymentCompleted = $true
     $sw.Stop()
     Complete-CloudDeploymentLog -Run $logRun -Info $deploymentInfo -Elapsed $sw.Elapsed `
         -Completed $deploymentCompleted -Joined $joined -Failure $deploymentFailure
+}
+
+# Download only after the final status/elapsed time is persisted and the transcript closes.
+if ($deploymentCompleted) {
+    Send-CloudDeploymentDownloads -Paths @($logRun.InfoFile, $rdpPath)
 }

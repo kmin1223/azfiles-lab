@@ -44,6 +44,7 @@ function Start-CloudDeploymentLog {
         Directory = $directory.FullName
         Transcript = Join-Path $directory.FullName 'deploy.log'
         InfoFile = Join-Path $directory.FullName 'lab-info.txt'
+        Commands = ''
     }
     Start-Transcript -LiteralPath $run.Transcript -NoClobber -ErrorAction Stop | Out-Null
     $run
@@ -62,6 +63,7 @@ function Save-CloudDeploymentInfo {
         ''
     )
     foreach ($key in $Info.Keys) { $lines += '{0} : {1}' -f $key, $Info[$key] }
+    if ($Run.Commands) { $lines += $Run.Commands }
     $temporary = Join-Path $Run.Directory 'lab-info.tmp'
     $lines | Set-Content -LiteralPath $temporary -Encoding UTF8 -ErrorAction Stop
     Move-Item -LiteralPath $temporary -Destination $Run.InfoFile -Force -ErrorAction Stop
