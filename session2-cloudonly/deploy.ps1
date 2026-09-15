@@ -281,14 +281,17 @@ if ($vmObj.Identity -and $vmObj.Identity.Type -match 'SystemAssigned') {
 
 # ---------------------------------------------------------- 6. client config
 Step '6/9 Client configuration (DNS suffix, Kerberos policy, lab tools)'
+. (Join-Path (Join-Path $PSScriptRoot 'scripts') 'CloudOnlyRunCommand.ps1')
 $r = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName `
     -CommandId 'RunPowerShellScript' `
     -ScriptPath (Join-Path (Join-Path $PSScriptRoot 'scripts') 'client-config.ps1') `
     -Parameter @{ DnsSuffix = "$Location.cloudapp.azure.com" }
-($r.Value | Where-Object Code -like '*StdOut*').Message | Write-Host
+Assert-CloudOnlyRunCommand -Result $r -CompletionMarker 'CLIENT_CONFIG_DONE'
+$deploymentInfo['Capture tools'] = 'Machine installation verified; user Inspector loading/capture NOT VERIFIED'
+Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 
 # --------------------------------------------------------------- 7. restart
-Step '7/9 Restart (the DNS suffix and the Kerberos policy both need one)'
+Step '7/9 Restart (DNS suffix, Kerberos policy, capture-tool installation)'
 Restart-AzVM -ResourceGroupName $ResourceGroupName -Name $vmName | Out-Null
 Start-Sleep 45
 
@@ -420,8 +423,11 @@ $(if ($autoDownloaded) {
  the four lines in $rdpPath, or use Azure portal -> the VM ->
  Connect -> RDP -> login source "Microsoft Entra ID".
 
- FIRST SIGN-IN asks you to register MFA (security defaults). Have
- Microsoft Authenticator ready - it takes about two minutes.
+ FIRST SIGN-IN may require MFA registration depending on tenant policy.
+ Capture tools: open the public desktop shortcut Fiddler Classic (Lab).
+ Inspector MSI stages installation for user sign-in. Approve only the
+ expected Kerberos.NET DLLs when Fiddler detects them; verify the Kerberos
+ tab and actual HTTPS capture. These user steps are not automated.
 
  A certificate warning is expected: the VM's RDP certificate is
  issued for its short name, not the Azure FQDN. Continue.

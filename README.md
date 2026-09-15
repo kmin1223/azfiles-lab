@@ -301,6 +301,25 @@ administrators on Windows. Do not commit or share them. Cloud Shell retention
 depends on persistent storage; download the files before leaving an ephemeral
 session. Parameter/context preflight failures occur before logging starts.
 
+### Cloud-only capture tools and restart
+
+Cloud-only deployment installs Fiddler Classic in `C:\Program Files\Fiddler`
+with a **Fiddler Classic (Lab)** public desktop shortcut, then installs the
+Kerberos.NET Inspector machine-wide `Setup.msi` from release `v4.5.45`.
+Downloads retry up to three times. Installer exit codes, the Fiddler executable
+and Inspector MSI registration are checked before the existing VM restart.
+Unlike older scripts, an installation failure stops deployment instead of
+reporting best-effort success. The MSI log is
+`C:\LabTools\kerberos-inspector-msi.log`.
+
+The MSI stages per-user Inspector setup for the next sign-in; a successful
+machine installation is not proof the Inspector has loaded. Sign in as the
+lab user, open **Fiddler Classic (Lab)**, and approve only the expected
+Kerberos.NET DLLs when prompted. Check the Kerberos tab, certificate trust,
+HTTPS decryption and a real KDC Proxy capture before injecting the Consent
+fault. User approval and capture verification remain manual. Use a disposable
+lab VM with an appropriate Fiddler license; no licensing requirement is bypassed.
+
 ### Session 2 presenter setup (hybrid)
 
 **Presenter demo — Hybrid.** Use Microsoft Entra Connect Sync, not the Cloud Sync

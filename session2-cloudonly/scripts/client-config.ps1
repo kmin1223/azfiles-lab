@@ -10,12 +10,102 @@
 #     "enabled by policy: 0" and go hunting for a policy that does not exist
 #
 # Args: -DnsSuffix <region>.cloudapp.azure.com
-param([Parameter(Mandatory)] [string]$DnsSuffix)
+param([Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string]$DnsSuffix)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+if ([string]::IsNullOrWhiteSpace($DnsSuffix)) {
+    throw 'CLIENT_DNS_SUFFIX_REQUIRED: Supply DnsSuffix for full client configuration.'
+}
+
+function Save-LabToolDownload {
+    [CmdletBinding()]
+    param([string]$Uri, [string]$Path)
+    $partial = "$Path.partial"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Uri -OutFile $partial -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+            if ((Get-Item -LiteralPath $partial -ErrorAction Stop).Length -eq 0) {
+                throw 'Downloaded file is empty.'
+            }
+            Move-Item -LiteralPath $partial -Destination $Path -Force -ErrorAction Stop
+            return
+        } catch {
+            if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction Stop }
+            if ($attempt -eq 3) { throw }
+            Write-Warning "Download attempt $attempt failed for $Uri. Retrying: $($_.Exception.Message)"
+            Start-Sleep -Seconds (5 * $attempt)
+        }
+    }
+}
+
+function Get-LabInspectorMsi {
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($root in $roots) {
+        if (Test-Path -LiteralPath $root) {
+            Get-ItemProperty -Path "$root\*" -ErrorAction Stop |
+                Where-Object {
+                    $_.DisplayName -eq 'Kerberos.NET Fiddler Extension Machine-Wide Installer' -and
+                    $_.DisplayVersion -eq '4.5.0.0'
+                }
+        }
+    }
+}
+
+function Install-LabCaptureTools {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$ToolsDirectory)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $installRoot = Join-Path $env:ProgramFiles 'Fiddler'
+    $exe = Join-Path $installRoot 'Fiddler.exe'
+    $installer = Join-Path $ToolsDirectory 'FiddlerSetup.exe'
+    $msi = Join-Path $ToolsDirectory 'Kerberos.NET-Setup.msi'
+    $msiLog = Join-Path $ToolsDirectory 'kerberos-inspector-msi.log'
+    $shortcut = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Fiddler Classic (Lab).lnk'
+
+    # Never replace binaries while another lab user is capturing authentication.
+    if (Get-Process -Name Fiddler -ErrorAction SilentlyContinue) {
+        throw 'LAB_TOOLS_IN_USE: Close Fiddler normally before installing tools; no process was stopped.'
+    }
+    Write-Warning 'Install only on a disposable lab VM and ensure the applicable Fiddler license permits your use. User DLL trust approval remains manual.'
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Save-LabToolDownload -Uri 'https://telerik-fiddler.s3.amazonaws.com/fiddler/FiddlerSetup.exe' -Path $installer
+        # NSIS /D must be last and unquoted, including when the path has spaces.
+        $process = Start-Process -FilePath $installer -ArgumentList "/S /D=$installRoot" -Wait -PassThru -ErrorAction Stop
+        if ($process.ExitCode -ne 0) {
+            throw "FIDDLER_INSTALL_FAILED: Exit code $($process.ExitCode). Installer: $installer"
+        }
+        if (-not (Test-Path -LiteralPath $exe)) {
+            throw "FIDDLER_INSTALL_MISSING: Installer returned success but $exe does not exist."
+        }
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($shortcut)
+    $link.TargetPath = $exe
+    $link.WorkingDirectory = $installRoot
+    $link.Save()
+    Write-Output "Fiddler executable verified: $exe; public desktop shortcut: $shortcut"
+
+    if (-not @(Get-LabInspectorMsi).Count) {
+        Save-LabToolDownload -Uri 'https://github.com/dotnet/Kerberos.NET/releases/download/v4.5.45/Setup.msi' -Path $msi
+        $process = Start-Process -FilePath "$env:WINDIR\System32\msiexec.exe" `
+            -ArgumentList "/i `"$msi`" /qn /norestart /L*v `"$msiLog`"" `
+            -Wait -PassThru -ErrorAction Stop
+        if ($process.ExitCode -notin @(0, 3010)) {
+            throw "INSPECTOR_INSTALL_FAILED: Exit code $($process.ExitCode). See $msiLog"
+        }
+        if (-not @(Get-LabInspectorMsi).Count) {
+            throw "INSPECTOR_INSTALL_MISSING: MSI returned success but machine-wide registration is missing. See $msiLog"
+        }
+    }
+    Write-Output 'Inspector machine-wide installer verified. User DLL installation/loading is NOT YET VERIFIED.'
+    Write-Output 'After restart, sign in as the lab user, open Fiddler Classic (Lab), and approve only the expected Kerberos.NET DLLs. Verify the Kerberos tab and a real HTTPS KDC Proxy capture.'
+}
+
 $tools = 'C:\LabTools'
 New-Item -ItemType Directory -Path $tools -Force | Out-Null
-
 # 1. Primary DNS suffix -> the device registers <vm>.<region>.cloudapp.azure.com
 $tcpip = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
 Set-ItemProperty -Path $tcpip -Name 'Domain'    -Value $DnsSuffix
@@ -136,27 +226,9 @@ switch ($Fault) {
 Set-Content -Path (Join-Path $tools 'Invoke-LabFault.ps1') -Value $fault -Encoding UTF8
 Write-Output 'C:\LabTools\Invoke-LabFault.ps1 written'
 
-# 4. Fiddler + the Kerberos.NET inspector. This is the ONLY way to read the KDC
-#    Proxy exchange - it is HTTPS, so a packet capture shows encrypted TCP and
-#    nothing else. The capstone turns on reading the response ErrorCode.
-#    Best effort: never fail a deployment over a diagnostic tool.
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    if (-not (Test-Path 'C:\Program Files*\Fiddler*\Fiddler.exe')) {
-        $f = Join-Path $tools 'FiddlerSetup.exe'
-        Invoke-WebRequest -Uri 'https://telerik-fiddler.s3.amazonaws.com/fiddler/FiddlerSetup.exe' `
-            -OutFile $f -UseBasicParsing -ErrorAction Stop
-        Start-Process -FilePath $f -ArgumentList '/S' -Wait
-        Write-Output 'Fiddler Classic installed'
-    }
-    $k = Join-Path $tools 'Fiddler.Kerberos.NET.exe'
-    Invoke-WebRequest -Uri 'https://github.com/dotnet/Kerberos.NET/releases/latest/download/Fiddler.Kerberos.NET.exe' `
-        -OutFile $k -UseBasicParsing -ErrorAction Stop
-    Start-Process -FilePath $k -ArgumentList '/S' -Wait -ErrorAction SilentlyContinue
-    Write-Output 'Kerberos.NET inspector staged'
-} catch {
-    Write-Output "Fiddler tooling not fully installed ($($_.Exception.Message.Split([char]10)[0])) - install from C:\LabTools if needed"
-}
+# 4. Install into a shared executable path, not SYSTEM's user profile. The MSI
+# stages per-user inspector setup for the next sign-in; the caller reboots.
+Install-LabCaptureTools -ToolsDirectory $tools
 
 # 5. Pre-trust a Fiddler root CA so nobody clicks through certificate prompts.
 #    Fiddler installs its CA into the CURRENT USER's Root store, and Windows
@@ -204,7 +276,7 @@ try {
     if (-not (Test-Path $fid)) { New-Item -Path $fid -Force | Out-Null }
     Set-ItemProperty -Path $fid -Name 'fiddler.network.https.CaptureHTTPS'           -Value 'True'
     Set-ItemProperty -Path $fid -Name 'fiddler.network.https.DecryptHTTPS'           -Value 'True'
-    Set-ItemProperty -Path $fid -Name 'fiddler.network.https.IgnoreServerCertErrors' -Value 'True'
+    Set-ItemProperty -Path $fid -Name 'fiddler.network.https.IgnoreServerCertErrors' -Value 'False'
     Say 'HTTPS decryption preferences written'
 } catch { Say "preference write failed: $($_.Exception.Message)" }
 Say 'DONE'
