@@ -38,6 +38,269 @@ function Save-LabToolDownload {
     }
 }
 
+function Get-LabTraceHelperContent {
+    # Embedded like Session 1: Run Command transports this with client-config.ps1,
+    # without depending on a sibling file or a public source URL inside the VM.
+    @'
+<#
+.SYNOPSIS
+  Cloud-only lab: netsh network trace start/stop and local ETL conversion only.
+.DESCRIPTION
+  Use an elevated PowerShell window as the same lab user for Start and Stop.
+  Reproduce the problem yourself in the affected user's normal window.
+  StopTrace also converts to pcapng. ConvertTrace retries conversion of a saved
+  ETL into a NEW private folder; it never starts or stops a trace.
+  Captures contain sensitive network traffic. Keep them local and private;
+  do not commit, upload or share them. Conversion does not decrypt TLS.
+.EXAMPLE
+  C:\LabTools\Get-KerberosEvidence.ps1 -StartTrace
+.EXAMPLE
+  C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace
+.EXAMPLE
+  C:\LabTools\Get-KerberosEvidence.ps1 -ConvertTrace -Path 'C:\Users\Lab User\AppData\Local\AzFilesLab-Traces\run\trace.etl'
+#>
+[CmdletBinding(DefaultParameterSetName = 'Start')]
+param(
+    [Parameter(Mandatory, ParameterSetName = 'Start')][switch]$StartTrace,
+    [Parameter(Mandatory, ParameterSetName = 'Stop')][switch]$StopTrace,
+    [Parameter(Mandatory, ParameterSetName = 'Convert')][switch]$ConvertTrace,
+    [Parameter(Mandatory, ParameterSetName = 'Convert')]
+    [ValidateNotNullOrEmpty()][string]$Path
+)
+$ErrorActionPreference = 'Stop'
+
+function Assert-TraceAdmin {
+    $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'TRACE_ADMIN_REQUIRED: Open PowerShell as administrator as the same lab user for StartTrace/StopTrace. Conversion needs no elevation.'
+    }
+}
+
+function Get-LocalTracePath {
+    param([string]$Path)
+    if ($Path -notmatch '^[a-zA-Z]:\\' -or $Path -match '["\r\n]') {
+        throw "TRACE_LOCAL_PATH_REQUIRED: Use an absolute local drive path, not a share: $Path"
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($full))
+    if ($drive.DriveType -ne [IO.DriveType]::Fixed) {
+        throw "TRACE_LOCAL_PATH_REQUIRED: Captures must stay on a local fixed drive: $full"
+    }
+    for ($entry = $full; $entry; $entry = Split-Path -Path $entry -Parent) {
+        if ((Test-Path -LiteralPath $entry) -and
+            ((Get-Item -LiteralPath $entry -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "TRACE_REPARSE_PATH: Use a local path without links or junctions: $entry"
+        }
+    }
+    $full
+}
+
+function Set-PrivateTraceDirectory {
+    param([string]$Path)
+    New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.SetOwner($owner)
+    foreach ($sid in @($owner, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+        [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+}
+
+function New-TraceRunDirectory {
+    param([string]$Root)
+    $run = Join-Path $Root ((Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+    Set-PrivateTraceDirectory -Path $run
+    $run
+}
+
+function Invoke-TraceNative {
+    param([string]$FilePath, [string[]]$Arguments, [string]$WorkDirectory)
+    # Start-Process joins ArgumentList with spaces, so quote EVERY argument
+    # explicitly for both Windows PowerShell 5.1 and PowerShell 7.
+    $quoted = foreach ($argument in $Arguments) {
+        if ($argument -match '["\r\n]' -or $argument.EndsWith('\')) {
+            throw "TRACE_ARGUMENT_INVALID: Cannot safely quote argument: $argument"
+        }
+        '"' + $argument + '"'
+    }
+    $id = [guid]::NewGuid().ToString('N')
+    $stdout = Join-Path $WorkDirectory "$id.stdout"
+    $stderr = Join-Path $WorkDirectory "$id.stderr"
+    try {
+        $process = Start-Process -FilePath $FilePath -ArgumentList ($quoted -join ' ') `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr -ErrorAction Stop
+        $output = @(
+            if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw }
+            if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw }
+        ) -join "`n"
+        if ($process.ExitCode -ne 0) {
+            throw "TRACE_COMMAND_FAILED: $FilePath $($quoted -join ' ') exited $($process.ExitCode).`n$output"
+        }
+        $output
+    } finally {
+        foreach ($log in @($stdout, $stderr)) {
+            if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -ErrorAction Stop }
+        }
+    }
+}
+
+function Assert-TraceSession {
+    param([string]$EtlPath, [string]$Root, [switch]$Stopped)
+    $status = Invoke-TraceNative -FilePath "$env:WINDIR\System32\netsh.exe" `
+        -Arguments @('trace', 'show', 'status') -WorkDirectory $Root
+    # Match the complete recorded path, not localized netsh field labels.
+    $pattern = '(?im)(?:^|[ \t"=])' + [regex]::Escape($EtlPath) + '[" \t]*\r?$'
+    if ($Stopped) {
+        if ($status -match $pattern) {
+            throw "TRACE_STOP_INCOMPLETE: netsh still reports '$EtlPath' after stop. State retained; inspect 'netsh trace show status' before retrying -StopTrace."
+        }
+        return
+    }
+    if ($status -notmatch $pattern) {
+        throw "TRACE_SESSION_MISMATCH: netsh did not report the recorded ETL '$EtlPath'. No trace was stopped. Inspect 'netsh trace show status' before taking any manual action.`n$status"
+    }
+}
+
+function Convert-TraceEtl {
+    param([string]$EtlPath, [string]$OutputDirectory)
+    if (-not (Test-Path -LiteralPath $EtlPath -PathType Leaf) -or
+        (Get-Item -LiteralPath $EtlPath).Length -eq 0) {
+        throw "TRACE_ETL_MISSING: ETL is missing or empty: $EtlPath"
+    }
+    $converter = 'C:\LabTools\etl2pcapng.exe'
+    if (-not (Test-Path -LiteralPath $converter -PathType Leaf) -or
+        (Get-Item -LiteralPath $converter).Length -eq 0) {
+        throw "TRACE_CONVERTER_MISSING: $converter is missing or empty. Ask the lab deployer to repair the Cloud-only client configuration. ETL retained: $EtlPath"
+    }
+    $pcap = Join-Path $OutputDirectory 'trace.pcapng'
+    if (Test-Path -LiteralPath $pcap) {
+        throw "TRACE_OUTPUT_EXISTS: Will not overwrite $pcap. Use -ConvertTrace -Path '$EtlPath' for a new private output folder."
+    }
+    Write-Host "Converting local ETL: $EtlPath -> $pcap"
+    $inputLock = $null
+    try {
+        # Refuse an ETL still open for writing, including a trace started outside
+        # this helper. Permit the converter to read but no writer during conversion.
+        $inputLock = [IO.File]::Open($EtlPath, 'Open', 'Read', 'Read')
+        $result = Invoke-TraceNative -FilePath $converter -Arguments @($EtlPath, $pcap) -WorkDirectory $OutputDirectory
+        if (-not (Test-Path -LiteralPath $pcap -PathType Leaf) -or (Get-Item -LiteralPath $pcap).Length -eq 0) {
+            throw "Converter returned success without a nonempty pcapng. $result"
+        }
+    } catch {
+        throw "TRACE_CONVERSION_FAILED: $($_.Exception.Message) ETL retained: $EtlPath. Output may be incomplete: $pcap. Retry with -ConvertTrace -Path '$EtlPath' (new output folder)."
+    } finally {
+        if ($inputLock) { $inputLock.Dispose() }
+    }
+    Write-Host $result
+    Write-Output "pcapng ready: $pcap ($((Get-Item -LiteralPath $pcap).Length) bytes). Keep private; TLS remains encrypted."
+}
+
+function Invoke-LabTraceAction {
+    param([ValidateSet('Start', 'Stop', 'Convert')][string]$Action, [string]$Path)
+    if ($Action -ne 'Convert') { Assert-TraceAdmin }
+    $root = Get-LocalTracePath -Path (Join-Path $env:LOCALAPPDATA 'AzFilesLab-Traces')
+    Set-PrivateTraceDirectory -Path $root
+    $pointer = Join-Path $root '.active-trace.txt'
+    $lock = $null
+    try {
+        # Serialize this user's helper calls; never run an implicit netsh stop.
+        $lock = [IO.File]::Open((Join-Path $root '.helper.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+        Write-Warning "Captures are sensitive. Keep local/private; do not upload or commit. Private root: $root"
+        switch ($Action) {
+            'Start' {
+                if (Test-Path -LiteralPath $pointer) {
+                    throw "TRACE_PENDING: Use -StopTrace as this user first. State: $pointer. If the trace was stopped externally, inspect 'netsh trace show status' and remove this state file deliberately before starting again."
+                }
+                $run = New-TraceRunDirectory -Root $root
+                $etl = Join-Path $run 'trace.etl'
+                if (Test-Path -LiteralPath $etl) { throw "TRACE_OUTPUT_EXISTS: Will not overwrite $etl" }
+                Set-Content -LiteralPath $pointer -Value $etl -Encoding UTF8 -ErrorAction Stop
+                Write-Host "Starting trace: $etl"
+                try {
+                    $result = Invoke-TraceNative -FilePath "$env:WINDIR\System32\netsh.exe" `
+                        -Arguments @('trace', 'start', 'capture=yes', 'report=no', 'persistent=no',
+                            'overwrite=no', 'maxsize=512', "tracefile=$etl") -WorkDirectory $root
+                } catch {
+                    Remove-Item -LiteralPath $pointer -ErrorAction Stop
+                    throw
+                }
+                # A zero exit alone is insufficient (e.g. an already-running session).
+                # Retain state if verification fails so no possibly-active run is lost.
+                Assert-TraceSession -EtlPath $etl -Root $root
+                Write-Host $result
+                Write-Output "Trace started: $etl. Reproduce in your normal window, then run -StopTrace here. Limit: 512 MB."
+            }
+            'Stop' {
+                if (-not (Test-Path -LiteralPath $pointer -PathType Leaf)) {
+                    throw "TRACE_NO_RUN: No trace recorded for this user. Use -StartTrace first. No trace was stopped. State: $pointer"
+                }
+                $etl = Get-LocalTracePath -Path ((Get-Content -LiteralPath $pointer -Raw).Trim())
+                if (-not $etl.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "TRACE_STATE_INVALID: Recorded ETL is outside the private root: $etl. No trace was stopped."
+                }
+                Assert-TraceSession -EtlPath $etl -Root $root
+                Write-Host "Stopping recorded trace (can take a minute): $etl"
+                $result = Invoke-TraceNative -FilePath "$env:WINDIR\System32\netsh.exe" `
+                    -Arguments @('trace', 'stop') -WorkDirectory $root
+                Assert-TraceSession -EtlPath $etl -Root $root -Stopped
+                Remove-Item -LiteralPath $pointer -ErrorAction Stop
+                Write-Host $result
+                Write-Output "Trace stopped. ETL: $etl"
+                Convert-TraceEtl -EtlPath $etl -OutputDirectory (Split-Path $etl -Parent)
+            }
+            'Convert' {
+                $etl = Get-LocalTracePath -Path $Path
+                if ([IO.Path]::GetExtension($etl) -ne '.etl') { throw 'TRACE_ETL_REQUIRED: Supply -Path to a saved .etl file.' }
+                if (-not (Test-Path -LiteralPath $etl -PathType Leaf)) { throw "TRACE_ETL_MISSING: $etl" }
+                if (Test-Path -LiteralPath $pointer) {
+                    $active = (Get-Content -LiteralPath $pointer -Raw).Trim()
+                    if ($etl -eq $active) { throw 'TRACE_STILL_ACTIVE: Use -StopTrace before converting the recorded capture.' }
+                }
+                $run = New-TraceRunDirectory -Root $root
+                Convert-TraceEtl -EtlPath $etl -OutputDirectory $run
+            }
+        }
+    } finally {
+        if ($lock) { $lock.Dispose() }
+    }
+}
+
+Invoke-LabTraceAction -Action $PSCmdlet.ParameterSetName -Path $Path
+'@
+}
+
+function Install-LabTraceTools {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ToolsDirectory)
+    $helper = Get-LabTraceHelperContent
+    $tokens = $null
+    $parseErrors = $null
+    [Management.Automation.Language.Parser]::ParseInput($helper, [ref]$tokens, [ref]$parseErrors) | Out-Null
+    if ($parseErrors.Count) { throw "TRACE_HELPER_INVALID: $($parseErrors -join '; ')" }
+    $converter = Join-Path $ToolsDirectory 'etl2pcapng.exe'
+    if (-not (Test-Path -LiteralPath $converter -PathType Leaf) -or
+        (Get-Item -LiteralPath $converter).Length -eq 0) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Save-LabToolDownload -Uri 'https://github.com/microsoft/etl2pcapng/releases/download/v1.11.0/etl2pcapng.exe' -Path $converter
+    }
+    if (-not (Test-Path -LiteralPath $converter -PathType Leaf) -or
+        (Get-Item -LiteralPath $converter).Length -eq 0) {
+        throw "TRACE_CONVERTER_MISSING: Download did not provision $converter"
+    }
+    $path = Join-Path $ToolsDirectory 'Get-KerberosEvidence.ps1'
+    Set-Content -LiteralPath $path -Value $helper -Encoding UTF8 -ErrorAction Stop
+    if ((Get-Content -LiteralPath $path -Raw).Trim() -cne $helper.Trim()) {
+        throw "TRACE_HELPER_INVALID: Written helper did not match source: $path"
+    }
+    Write-Output "Cloud-only trace helper installed: $path (-StartTrace, -StopTrace, -ConvertTrace -Path <ETL>). Converter: $converter"
+}
+
 function Get-LabInspectorMsi {
     $roots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -229,6 +492,7 @@ Write-Output 'C:\LabTools\Invoke-LabFault.ps1 written'
 # 4. Install into a shared executable path, not SYSTEM's user profile. The MSI
 # stages per-user inspector setup for the next sign-in; the caller reboots.
 Install-LabCaptureTools -ToolsDirectory $tools
+Install-LabTraceTools -ToolsDirectory $tools
 
 # 5. Pre-trust a Fiddler root CA so nobody clicks through certificate prompts.
 #    Fiddler installs its CA into the CURRENT USER's Root store, and Windows

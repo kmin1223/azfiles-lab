@@ -386,10 +386,10 @@ $rdp | Set-Content -Path $rdpPath -Encoding ascii
 $deploymentInfo['RDP file'] = $rdpPath
 Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
 
-# Push the file to the browser straight away. enablerdsaadauth is a FILE
-# property - mstsc has no switch or GUI field for it - so everyone needs this
-# file, and hand-typing the FQDN is where people get it wrong. Cloud Shell
-# provides 'download'; if this is running somewhere else, just print the command.
+# Push the file to the browser as a lab convenience: it bundles the FQDN,
+# user and authentication settings. Supported mstsc clients also expose
+# enablerdsaadauth as Advanced > "Use a web account to sign in to the remote
+# computer". Cloud Shell provides 'download'; elsewhere, print the command.
 $autoDownloaded = $false
 if (Get-Command download -ErrorAction SilentlyContinue) {
     try { download $rdpPath; $autoDownloaded = $true } catch { }
@@ -421,11 +421,15 @@ $(if ($autoDownloaded) {
    Then open it and sign in as
      labuser1@$initialDomain  /  $plainPw
 
- Why a file: enablerdsaadauth is an .rdp property. mstsc has no
- switch and no GUI field for it, so "mstsc /v:$fqdn" will NOT use
- Entra sign-in. And the address must be this FQDN - Entra rejects a
- bare IP, and the name has to match the one the device registered
- under.
+ Why a file: it reliably bundles the FQDN, user and authentication
+ settings for this lab; it is not the only way to connect.
+ On supported mstsc clients, select Advanced ->
+ "Use a web account to sign in to the remote computer"
+ (equivalent to enablerdsaadauth), then connect to $fqdn
+ and sign in as labuser1@$initialDomain.
+ This authentication does not support an IP address. The hostname
+ must match the VM's registered hostname in Entra ID and resolve
+ to the VM's IP address.
 
  Fallbacks if the download is awkward: build the file by hand with
  the four lines in $rdpPath, or use Azure portal -> the VM ->
