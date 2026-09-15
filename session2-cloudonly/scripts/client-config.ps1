@@ -38,6 +38,247 @@ function Save-LabToolDownload {
     }
 }
 
+function Get-LabModuleValidationScript {
+    @'
+param([string]$ModulePath, [string]$ReportPath)
+$ErrorActionPreference = 'Stop'
+# A clean process and an AllUsers-only search path prevent SYSTEM's profile or
+# previously loaded assemblies from making an incomplete installation look good.
+$moduleRoot = [IO.Path]::GetFullPath($ModulePath).TrimEnd('\') + '\'
+$env:PSModulePath = $ModulePath + ';' + (Join-Path $PSHOME 'Modules')
+$names = 'Az.Accounts', 'Az.Storage', 'Az.Resources', 'Az.Network', 'Az.Compute', 'AzFilesHybrid'
+foreach ($name in $names) {
+    $module = Get-Module -ListAvailable -Name $name |
+        Where-Object { $_.Path -and $_.Path.StartsWith($moduleRoot, [StringComparison]::OrdinalIgnoreCase) } |
+        Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $module) { throw "LAB_MODULE_MISSING: $name in $ModulePath" }
+    if ($name -eq 'AzFilesHybrid' -and $module.Version -lt [version]'0.3.0') {
+        throw "LAB_MODULE_TOO_OLD: AzFilesHybrid $($module.Version); Entra checks require 0.3.0 or later."
+    }
+    if ($name -eq 'Az.Storage' -and $module.Version -lt [version]'8.1.0') {
+        throw "LAB_MODULE_TOO_OLD: Az.Storage $($module.Version); AzFilesHybrid requires 8.1.0 or later."
+    }
+    # Import also enforces the selected manifest's RequiredModules constraints,
+    # which may be stricter than these documented baseline versions.
+    Import-Module -Name $module.Path -Global -Force -ErrorAction Stop
+}
+$expected = [ordered]@{
+    'Connect-AzAccount' = 'Az.Accounts'
+    'Get-AzStorageAccount' = 'Az.Storage'
+    'Debug-AzStorageAccountAuth' = 'AzFilesHybrid'
+}
+$commands = foreach ($name in $expected.Keys) {
+    $command = Get-Command -Name $name -CommandType Cmdlet, Function -ErrorAction Stop
+    if ($command.ModuleName -ne $expected[$name] -or
+        -not $command.Module.Path.StartsWith($moduleRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "LAB_COMMAND_INVALID: $name must be exported by $($expected[$name]) in $ModulePath."
+    }
+    [pscustomobject]@{ Name = $name; Module = $command.ModuleName; Version = $command.Module.Version.ToString() }
+}
+$loaded = @(Get-Module | Where-Object {
+    $_.Path -and $_.Path.StartsWith($moduleRoot, [StringComparison]::OrdinalIgnoreCase)
+} | Sort-Object Name, Version | ForEach-Object {
+    [pscustomobject]@{ Name = $_.Name; Version = $_.Version.ToString(); Path = $_.Path }
+})
+foreach ($name in $names) {
+    if (-not @($loaded | Where-Object Name -eq $name).Count) {
+        throw "LAB_MODULE_NOT_IMPORTED: $name"
+    }
+}
+[pscustomobject]@{
+    PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+    ModulePath = $ModulePath
+    Modules = $loaded
+    Commands = @($commands)
+} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ReportPath -Encoding UTF8 -ErrorAction Stop
+'@
+}
+
+function Get-LabModuleGalleryScript {
+    @'
+param([string]$ModulePath)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope AllUsers -Force -ErrorAction Stop | Out-Null
+if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+    Register-PSRepository -Default -ErrorAction Stop
+}
+$repository = Get-PSRepository -Name PSGallery -ErrorAction Stop
+$source = [uri]$repository.SourceLocation
+if ($source.Scheme -ne 'https' -or $source.Host -ne 'www.powershellgallery.com') {
+    throw "LAB_GALLERY_SOURCE_INVALID: Expected the official HTTPS PSGallery; found $source"
+}
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+$acceptLicense = (Get-Command Save-Module -ErrorAction Stop).Parameters.ContainsKey('AcceptLicense')
+foreach ($name in @('Az.Accounts', 'Az.Storage', 'Az.Resources', 'Az.Network', 'Az.Compute', 'AzFilesHybrid')) {
+    $parameters = @{
+        Name = $name; Path = $ModulePath; Repository = 'PSGallery'
+        Force = $true; ErrorAction = 'Stop'
+    }
+    if ($acceptLicense) { $parameters.AcceptLicense = $true }
+    if ($name -eq 'AzFilesHybrid') { $parameters.MinimumVersion = '0.3.0' }
+    if ($name -eq 'Az.Storage') { $parameters.MinimumVersion = '8.1.0' }
+    # Save-Module resolves RequiredModules, including version constraints and
+    # Graph dependencies. A fresh import will verify the resulting manifests.
+    Save-Module @parameters
+}
+'@
+}
+
+function Invoke-LabModuleWorker {
+    [CmdletBinding()]
+    param([string]$Script, [hashtable]$Parameters, [string]$ToolsDirectory)
+    $work = Join-Path $ToolsDirectory ('module-check-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -ErrorAction Stop | Out-Null
+    $scriptPath = Join-Path $work 'worker.ps1'
+    $stdout = Join-Path $work 'stdout.txt'
+    $stderr = Join-Path $work 'stderr.txt'
+    Set-Content -LiteralPath $scriptPath -Value $Script -Encoding UTF8 -ErrorAction Stop
+    $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
+    foreach ($key in $Parameters.Keys) {
+        $arguments += "-$key"
+        $arguments += [string]$Parameters[$key]
+    }
+    $quoted = foreach ($argument in $arguments) {
+        if ($argument -match '["\r\n]' -or $argument.EndsWith('\')) {
+            throw "LAB_MODULE_ARGUMENT_INVALID: Cannot quote $argument"
+        }
+        '"' + $argument + '"'
+    }
+    # Run Command and the lab's default interactive shell use Windows PowerShell.
+    # PS7 can also discover this standard WindowsPowerShell AllUsers module path.
+    $exe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $process = Start-Process -FilePath $exe -ArgumentList ($quoted -join ' ') `
+        -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr -ErrorAction Stop
+    $errorText = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw } else { '' }
+    if ($process.ExitCode -ne 0 -or -not [string]::IsNullOrWhiteSpace($errorText)) {
+        $detail = if ($errorText.Length -gt 1200) { $errorText.Substring(0, 1200) } else { $errorText }
+        throw "LAB_MODULE_WORKER_FAILED: Exit $($process.ExitCode). Logs: $work. $detail"
+    }
+}
+
+function Test-LabPowerShellModules {
+    [CmdletBinding()]
+    param([string]$ModulePath, [string]$ToolsDirectory)
+    $reportPath = Join-Path $ToolsDirectory ('module-report-' + [guid]::NewGuid().ToString('N') + '.json')
+    Invoke-LabModuleWorker -Script (Get-LabModuleValidationScript) `
+        -Parameters @{ ModulePath = $ModulePath; ReportPath = $reportPath } -ToolsDirectory $ToolsDirectory
+    if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+        throw "LAB_MODULE_REPORT_MISSING: Import worker did not write $reportPath"
+    }
+    $report = Get-Content -LiteralPath $reportPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if (@($report.Modules).Count -lt 6 -or @($report.Commands).Count -ne 3) {
+        throw "LAB_MODULE_REPORT_INVALID: Incomplete import/command validation: $reportPath"
+    }
+    $report
+}
+
+function Expand-LabModuleBundle {
+    [CmdletBinding()]
+    param([string]$ZipPath, [string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $root = [IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
+    $archive = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            $relative = $entry.FullName.Replace('/', '\')
+            if ([IO.Path]::IsPathRooted($relative) -or $relative.Contains(':')) {
+                throw "LAB_MODULE_BUNDLE_PATH_INVALID: $($entry.FullName)"
+            }
+            $target = [IO.Path]::GetFullPath((Join-Path $Destination $relative))
+            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "LAB_MODULE_BUNDLE_PATH_INVALID: $($entry.FullName)"
+            }
+            if (-not $entry.Name) {
+                New-Item -ItemType Directory -Path $target -Force -ErrorAction Stop | Out-Null
+            } else {
+                New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force -ErrorAction Stop | Out-Null
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+function Publish-LabPowerShellModules {
+    [CmdletBinding()]
+    param([string]$Source, [string]$ModulePath)
+    New-Item -ItemType Directory -Path $ModulePath -Force -ErrorAction Stop | Out-Null
+    foreach ($directory in Get-ChildItem -LiteralPath $Source -Directory -ErrorAction Stop) {
+        Copy-Item -LiteralPath $directory.FullName -Destination $ModulePath -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Write-LabModuleReport {
+    param($Report, [string]$ToolsDirectory)
+    $path = Join-Path $ToolsDirectory 'powershell-modules.json'
+    $Report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop
+    Write-Output "PowerShell modules imported in a fresh Windows PowerShell $($Report.PowerShellVersion) process from $($Report.ModulePath). Report: $path"
+    Write-Output 'Installed Az subset: Accounts, Storage, Resources, Network, Compute; NOT the full Az meta-module.'
+    foreach ($module in $Report.Modules) { Write-Output "  $($module.Name) $($module.Version)" }
+    Write-Output 'Exports verified: Connect-AzAccount, Get-AzStorageAccount, Debug-AzStorageAccountAuth. Azure sign-in, management permissions and diagnostic execution are NOT VERIFIED. VM sign-in/SMB roles alone do not establish management access.'
+}
+
+function Install-LabPowerShellModules {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ToolsDirectory,
+        [string]$ModuleBundleUri = 'https://github.com/kmin1223/azfiles-lab/releases/latest/download/labtools-modules.zip'
+    )
+    $modulePath = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        $report = Test-LabPowerShellModules -ModulePath $modulePath -ToolsDirectory $ToolsDirectory
+    } catch {
+        Write-Warning "Existing AllUsers module validation failed; installation/repair required. $($_.Exception.Message)"
+        $report = $null
+    }
+    if ($report) {
+        Write-LabModuleReport -Report $report -ToolsDirectory $ToolsDirectory
+        return
+    }
+    $failures = @()
+    foreach ($source in @('bundle', 'PSGallery')) {
+        if ($source -eq 'bundle' -and -not $ModuleBundleUri) {
+            Write-Warning 'Module bundle explicitly disabled; using the slower PSGallery fallback.'
+            continue
+        }
+        $stage = Join-Path $ToolsDirectory ('module-stage-' + [guid]::NewGuid().ToString('N'))
+        $zip = "$stage.zip"
+        New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+        try {
+            if ($source -eq 'bundle') {
+                Write-Output "Downloading shared lab module bundle: $ModuleBundleUri"
+                Save-LabToolDownload -Uri $ModuleBundleUri -Path $zip
+                Expand-LabModuleBundle -ZipPath $zip -Destination $stage
+            } else {
+                Write-Warning 'Using PSGallery fallback for the Az subset (Az.Storage >= 8.1.0) and AzFilesHybrid >= 0.3.0. Dependency downloads can take several minutes; unexpected prompts fail in the noninteractive worker.'
+                Invoke-LabModuleWorker -Script (Get-LabModuleGalleryScript) `
+                    -Parameters @{ ModulePath = $stage } -ToolsDirectory $ToolsDirectory
+            }
+            Test-LabPowerShellModules -ModulePath $stage -ToolsDirectory $ToolsDirectory | Out-Null
+            Publish-LabPowerShellModules -Source $stage -ModulePath $modulePath
+            $report = Test-LabPowerShellModules -ModulePath $modulePath -ToolsDirectory $ToolsDirectory
+        } catch {
+            $failures += "${source}: $($_.Exception.Message)"
+            Write-Warning "Module source failed validation/installation: $($failures[-1])"
+            $report = $null
+        } finally {
+            # Only this invocation's generated staging paths, never installed modules.
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force -ErrorAction Stop }
+        }
+        if ($report) {
+            Write-LabModuleReport -Report $report -ToolsDirectory $ToolsDirectory
+            return
+        }
+    }
+    throw "LAB_MODULES_UNAVAILABLE: Neither bundle nor PSGallery provided usable AllUsers modules. CLIENT_CONFIG_DONE was not reached. Repair the bundle/feed and rerun deployment. $($failures -join ' | ')"
+}
+
 function Get-LabTraceHelperContent {
     # Embedded like Session 1: Run Command transports this with client-config.ps1,
     # without depending on a sibling file or a public source URL inside the VM.
@@ -493,6 +734,7 @@ Write-Output 'C:\LabTools\Invoke-LabFault.ps1 written'
 # stages per-user inspector setup for the next sign-in; the caller reboots.
 Install-LabCaptureTools -ToolsDirectory $tools
 Install-LabTraceTools -ToolsDirectory $tools
+Install-LabPowerShellModules -ToolsDirectory $tools
 
 # 5. Pre-trust a Fiddler root CA so nobody clicks through certificate prompts.
 #    Fiddler installs its CA into the CURRENT USER's Root store, and Windows
