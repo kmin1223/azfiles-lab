@@ -670,7 +670,11 @@ $fault = @'
                  Fiddler leaves when it exits uncleanly. Entra Kerberos rides
                  HTTPS through the KDC Proxy, so the machine proxy stack is part
                  of the authentication path.
-                 Diagnose: netsh winhttp show proxy
+                 Diagnose: netsh winhttp show proxy; inspect ProxyMgr if reset
+                 does not restore fresh ticket acquisition. Repair checks both
+                 StaticProxy and ConfigurationURL for the exact lab endpoint,
+                 preserves unrelated entries, and fails on incomplete cleanup.
+                 Use only in the disposable lab, not with corporate proxies.
 
 .EXAMPLE
   C:\LabTools\Invoke-LabFault.ps1 -Fault NoCloudTgt
@@ -697,6 +701,82 @@ Write-Host "[$mode] $Fault" -ForegroundColor Yellow
 
 function Show([string[]]$lines) { $lines | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray } }
 
+function Invoke-LabProxyNative {
+    param(
+        [ValidateSet('netsh', 'klist')][string]$Command,
+        [string[]]$Arguments
+    )
+    $output = & $Command @Arguments 2>&1
+    $code = $LASTEXITCODE
+    $output | ForEach-Object { Write-Host $_ }
+    if ($code -ne 0) {
+        throw "PROXY_COMMAND_FAILED: $Command $($Arguments -join ' ') exited $code."
+    }
+}
+
+function Get-LabProxyMgrCleanup {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) { return }
+    foreach ($key in Get-ChildItem -LiteralPath $Path -ErrorAction Stop) {
+        $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+        $hasLabProxy = $false
+        $hasOtherProxy = $false
+        foreach ($name in @('StaticProxy', 'ConfigurationURL')) {
+            $property = $values.PSObject.Properties[$name]
+            if ($null -eq $property -or $null -eq $property.Value -or $property.Value -eq '') { continue }
+            if ($property.Value -isnot [string]) {
+                $hasOtherProxy = $true
+                continue
+            }
+            $endpoints = if ($name -eq 'StaticProxy') { $property.Value -split ';' } else { @($property.Value) }
+            foreach ($endpoint in $endpoints) {
+                $endpoint = $endpoint.Trim()
+                if ($endpoint.Length -eq 0) { continue }
+                $isLab = if ($name -eq 'StaticProxy') {
+                    $endpoint -match '^(?:(?:http|https)=)?(?:https?://)?127\.0\.0\.1:8888/?$'
+                } else {
+                    $endpoint -match '^https?://127\.0\.0\.1:8888(?:[/?#].*)?$'
+                }
+                if ($isLab) { $hasLabProxy = $true } else { $hasOtherProxy = $true }
+            }
+        }
+        if ($hasLabProxy -and $hasOtherProxy) {
+            throw "PROXY_REPAIR_MIXED_CONFIGURATION: Preserving $($key.PSPath); lab and other proxy settings share this key. Review it manually."
+        }
+        if ($hasLabProxy) {
+            # Delete only a leaf cache entry, never an unexpected subtree.
+            if (@(Get-ChildItem -LiteralPath $key.PSPath -ErrorAction Stop).Count -ne 0) {
+                throw "PROXY_REPAIR_UNEXPECTED_CHILDREN: Preserving $($key.PSPath); review its child keys manually."
+            }
+            $key.PSPath
+        }
+    }
+}
+
+function Repair-LabProxy {
+    $mgr = 'HKLM:\SYSTEM\CurrentControlSet\Services\iphlpsvc\Parameters\ProxyMgr'
+    # Detect mixed configurations before changing anything; reset may refresh the cache.
+    Get-LabProxyMgrCleanup -Path $mgr | Out-Null
+    Invoke-LabProxyNative -Command netsh -Arguments @('winhttp', 'reset', 'proxy')
+    Invoke-LabProxyNative -Command netsh -Arguments @('winhttp', 'reset', 'autoproxy')
+    foreach ($path in @(Get-LabProxyMgrCleanup -Path $mgr)) {
+        if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            Write-Host "Removed lab ProxyMgr entry: $path"
+        }
+    }
+    $remaining = @(Get-LabProxyMgrCleanup -Path $mgr)
+    if ($remaining.Count -ne 0) {
+        throw "PROXY_REPAIR_INCOMPLETE: Lab ProxyMgr entries remain: $($remaining -join ', ')."
+    }
+    Invoke-LabProxyNative -Command klist -Arguments @('purge')
+    Show @(
+        'Proxy reset complete; no matching lab ProxyMgr entries remain.'
+        'Tickets were purged only in this logon session.'
+        'In the normal lab user window, verify a fresh CIFS ticket and actual file access.'
+    )
+}
+
 switch ($Fault) {
     'NoCloudTgt' {
         if (-not $Repair) {
@@ -722,9 +802,10 @@ switch ($Fault) {
 
     'ProxyMangled' {
         if (-not $Repair) {
-            netsh winhttp set proxy 127.0.0.1:8888 | Out-Null
+            Invoke-LabProxyNative -Command netsh -Arguments @('winhttp', 'set', 'proxy', '127.0.0.1:8888')
             Show @(
-                'WinHTTP now points at 127.0.0.1:8888 - nothing is listening there.'
+                'WinHTTP now points at 127.0.0.1:8888.'
+                'Close Fiddler first: a working proxy at that endpoint may let requests succeed.'
                 ''
                 'No sign-out needed. Reproduce:'
                 '  klist purge'
@@ -734,18 +815,7 @@ switch ($Fault) {
                 'Diagnose in 30 seconds:  netsh winhttp show proxy'
             )
         } else {
-            netsh winhttp reset proxy      | Out-Null
-            netsh winhttp reset autoproxy  | Out-Null
-            # Fiddler also leaves :8888 entries behind here; the TSG says clear them.
-            $mgr = 'HKLM:\SYSTEM\CurrentControlSet\Services\iphlpsvc\Parameters\ProxyMgr'
-            if (Test-Path $mgr) {
-                Get-ChildItem $mgr -ErrorAction SilentlyContinue | ForEach-Object {
-                    $v = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ConfigurationURL
-                    if ($v -match '8888') { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue }
-                }
-            }
-            klist purge | Out-Null
-            Show @('Proxy reset and tickets purged. Retry the mount.')
+            Repair-LabProxy
         }
     }
 }

@@ -157,6 +157,9 @@ C:\LabTools\Invoke-LabFault.ps1 -Fault ProxyMangled
 [COMMENTS]
 [B] Make a fresh request and record the result.
 [B-admin] Observe and repair:
+Repair resets WinHTTP proxy/autoproxy; it does not restore a previous corporate proxy.
+It checks ProxyMgr StaticProxy and ConfigurationURL for the exact 127.0.0.1:8888 endpoint.
+Unrelated entries are preserved; mixed settings or incomplete cleanup stop with an error.
 [COMMANDS | B-admin | Inspect and repair]
 ```powershell
 netsh winhttp show proxy
@@ -164,7 +167,9 @@ C:\LabTools\Invoke-LabFault.ps1 -Fault ProxyMangled -Repair
 ```
 
 [COMMENTS]
-[B] Repeat fresh-request checks. Verify original proxy and file access.
+[B] Repeat fresh-request checks in the normal lab user window and verify file access.
+The admin-window ticket purge does not establish that the normal user's cache is clear.
+The repair completion message confirms configuration cleanup, not authentication recovery.
 
 --- FIDDLER / KERBEROS.NET - before Consent injection ---
 [COMMENTS / MANUAL ACTIONS]
