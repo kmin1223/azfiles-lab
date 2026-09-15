@@ -16,8 +16,10 @@
     5. system-assigned managed identity
     6. client config: DNS suffix, cloud-Kerberos policy, lab fault script, Fiddler
     7. RESTART (both of those settings need one)
-    8. outbound check, then the Entra join
+    8. outbound check, then install the Entra join extension (no polling)
     9. RBAC: VM sign-in + share access
+    Finally, check AzureAdJoined once before saving/downloading the report.
+    A NO/unknown result is reported as incomplete; output files are still saved.
 
   FIVE THINGS THAT FAIL SILENTLY IF OMITTED - all learned the hard way, all
   handled below. If you adapt this script, keep them:
@@ -348,30 +350,8 @@ Remove-AzVMExtension -ResourceGroupName $ResourceGroupName -VMName $vmName `
 Set-AzVMExtension -ResourceGroupName $ResourceGroupName -VMName $vmName `
     -Name 'AADLoginForWindows' -Publisher 'Microsoft.Azure.ActiveDirectory' `
     -ExtensionType 'AADLoginForWindows' -TypeHandlerVersion '2.0' -Location $Location | Out-Null
-Write-Host '  extension installed - waiting for the join (up to 6 min)'
-
-$joined = $false
-for ($i = 0; $i -lt 12 -and -not $joined; $i++) {
-    Start-Sleep 30
-    try {
-        $st = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName `
-            -CommandId 'RunPowerShellScript' `
-            -ScriptString 'dsregcmd /status | Select-String "AzureAdJoined"'
-        $txt  = ($st.Value | Where-Object Code -like '*StdOut*').Message
-        $line = @($txt -split "`r?`n" | Where-Object { $_ -match 'AzureAdJoined' })[0]
-        if ($line) { Write-Host "  $($line.Trim())" }
-        if ($txt -match 'AzureAdJoined\s*:\s*YES') { $joined = $true }
-    } catch { Write-Host '  (run command busy, retrying)' }
-}
-if (-not $joined) {
-    Write-Warning @"
-The device is not Entra joined after 6 minutes. Read the logs; do not guess:
-  Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $vmName ``
-    -CommandId RunPowerShellScript -ScriptString 'Get-WinEvent -LogName "Microsoft-Windows-User Device Registration/Admin" -MaxEvents 15 | Format-List TimeCreated,Id,Message'
-That channel is the primary evidence for device registration.
-"@
-}
-$deploymentInfo['Entra joined'] = if ($joined) { 'YES' } else { 'NOT CONFIRMED' }
+Write-Host '  extension installed - continuing with RBAC; Join will be checked once before the final report'
+$deploymentInfo['Entra joined'] = 'NOT CHECKED'
 
 # ------------------------------------------------------------------ 9. RBAC
 # 'Virtual Machine Administrator Login' is what makes the lab user a local admin
@@ -406,6 +386,25 @@ $deploymentInfo['SMB role assigned'] = 'labuser1: Storage File Data SMB Share Co
 $deploymentInfo['labuser2 SMB role'] = 'Not assigned by this deployment; inherited permissions are not ruled out'
 $deploymentInfo['Directory scope'] = 'Users, device and storage app are tenant objects, not RG resources'
 
+# Check once after all configuration, without delaying role assignment or polling.
+Step 'Final Entra join check (single attempt)'
+Write-Host '  One Run Command request; its execution time still applies. No retry/sleep loop.'
+$joinResult = Get-CloudOnlyJoinStatus -ResourceGroupName $ResourceGroupName -VMName $vmName
+$joined = $joinResult.Joined
+$deploymentInfo['Entra joined'] = $joinResult.Status
+$deploymentInfo['Entra join checked UTC'] = $joinResult.CheckedUtc
+if ($joinResult.Error) { $deploymentInfo['Entra join check error'] = $joinResult.Error }
+if (-not $joined) {
+    Write-Warning @"
+Entra Join is not confirmed ($($joinResult.Status)). RBAC configuration is applied;
+output files will still be saved/downloaded, but the lab is NOT ready for Entra
+user sign-in or Lab A. Do not assume Join will succeed later without checking.
+Review AADLoginForWindows extension status and Microsoft-Windows-User Device
+Registration/Admin on the VM. After addressing the cause, check dsregcmd /status
+again; a full redeployment is not a Join diagnostic or repair.
+"@
+}
+
 # ------------------------------------------------------------------- report
 $rdp = @"
 full address:s:$fqdn
@@ -430,7 +429,7 @@ Write-Host @"
  file share      : $ShareName
  lab user        : labuser1@$initialDomain
  RDP host        : $fqdn
- Entra joined    : $(if ($joined) { 'YES' } else { 'NOT YET - see the warning above' })
+ Entra joined    : $($joinResult.Status)$(if (-not $joined) { ' - NOT CONFIRMED; see the warning above' })
  lab output      : $($logRun.InfoFile)
  RDP file        : $rdpPath
 
