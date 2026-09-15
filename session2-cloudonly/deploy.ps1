@@ -35,6 +35,10 @@
   The one thing that cannot be automated: security defaults force MFA
   registration on first sign-in. That is a prework item, not a bug.
 
+.PARAMETER ResourceGroupName
+  Defaults to azfiles-cloudonly. Creates the resource group if absent, or
+  reuses it in the selected subscription. Pass a name to use a different lab.
+
 .PARAMETER Prefix
   Optional explicit resource prefix (up to 11 lowercase letters/digits).
   Otherwise derived from the signed-in Azure account, tenant, subscription
@@ -51,11 +55,15 @@
 
 .EXAMPLE
   # Azure Cloud Shell (PowerShell) - already signed in
-  ./deploy.ps1 -ResourceGroupName azfiles-cloudonly
+  ./deploy.ps1
+
+.EXAMPLE
+  # Optional: use a different resource group
+  ./deploy.ps1 -ResourceGroupName my-cloudonly-lab
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [string]$ResourceGroupName,
+    [string]$ResourceGroupName = 'azfiles-cloudonly',
     [string]$Location  = 'koreacentral',
     [ValidatePattern('^[a-z0-9]{1,11}$')]
     [string]$Prefix,

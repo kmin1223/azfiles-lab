@@ -254,9 +254,13 @@ retain their existing Azure-account-based names.
 ```powershell
 git clone https://github.com/kmin1223/azfiles-lab.git
 cd azfiles-lab
-./session2-cloudonly/deploy.ps1 `
-    -ResourceGroupName azfiles-cloudonly
+./session2-cloudonly/deploy.ps1
 ```
+
+`-ResourceGroupName` is optional: deployment creates `azfiles-cloudonly` if it
+does not exist in the selected subscription, or reuses it if present. To use
+another group, pass `-ResourceGroupName <name>` and use that same name in later
+fault and cleanup commands. Rerunning does not create a new group each time.
 
 Use a separate disposable tenant per participant with Global Administrator
 permissions. Do not run in a corporate/production or shared participant tenant:

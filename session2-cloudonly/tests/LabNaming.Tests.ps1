@@ -20,6 +20,14 @@ function Update-AzTag {
     [CmdletBinding()] param($ResourceId, [hashtable]$Tag, $Operation)
     throw 'Unmocked tag update'
 }
+function Get-AzResourceGroup {
+    [CmdletBinding()] param($Name)
+    throw 'Unmocked resource group read'
+}
+function New-AzResourceGroup {
+    [CmdletBinding()] param($Name, $Location)
+    throw 'Unmocked resource group creation'
+}
 
 # Execute real entry-point preflights only; exclude all deployment/fault mutations.
 $entryPreflights = @{}
@@ -46,6 +54,14 @@ foreach ($entry in @('deploy.ps1', 'faults\Invoke-Fault.ps1')) {
         } | Select-Object -First 1
         if (-not $deploymentTry) { throw 'Missing deployment try/finally boundary' }
         $deploymentStatements = $deploymentTry.Body.Statements
+        $groupStatement = $deploymentStatements | Where-Object {
+            $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Extent.Text -match '^if \(-not \(Get-AzResourceGroup'
+        } | Select-Object -First 1
+        if (-not $groupStatement) { throw 'Missing resource group provisioning statement' }
+        $resourceGroupProvision = [scriptblock]::Create(
+            "[CmdletBinding()]`n" + $ast.ParamBlock.Extent.Text + "`n" + $groupStatement.Extent.Text
+        )
         $start = $deploymentStatements | Where-Object {
             $_ -is [Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq '$accounts'
         } | Select-Object -First 1
@@ -237,6 +253,36 @@ Describe 'Cloud-only automatic naming (offline)' {
         $faultPrefix | Should Be $deployPrefix
         $repairPrefix | Should Be $deployPrefix
         Assert-MockCalled Get-AzStorageAccount -Times 0 -Exactly -Scope It
+    }
+
+    It 'uses the default resource group without prompting and preserves its prefix' {
+        & $entryPreflights['deploy.ps1'] | Should Be 'azf560970e8'
+        & $entryPreflights['deploy.ps1'] -ResourceGroupName azfiles-cloudonly | Should Be 'azf560970e8'
+        & $entryPreflights['deploy.ps1'] -ResourceGroupName custom-lab |
+            Should Be (Resolve-CloudOnlyLabPrefix -ResourceGroupName custom-lab -AzureContext $namingContext)
+    }
+
+    It 'creates a missing group or reuses an existing one: <Group> / <Exists>' -TestCases @(
+        @{ Group = 'azfiles-cloudonly'; Exists = $false },
+        @{ Group = 'azfiles-cloudonly'; Exists = $true },
+        @{ Group = 'custom-lab'; Exists = $false },
+        @{ Group = 'custom-lab'; Exists = $true }
+    ) {
+        param($Group, $Exists)
+        $script:resourceGroupExists = $Exists
+        Mock Get-AzResourceGroup { if ($script:resourceGroupExists) { [pscustomobject]@{ ResourceGroupName = $Name } } }
+        Mock New-AzResourceGroup {}
+        $parameters = @{}
+        if ($Group -ne 'azfiles-cloudonly') { $parameters.ResourceGroupName = $Group }
+        & $resourceGroupProvision @parameters
+        Assert-MockCalled Get-AzResourceGroup -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq $Group }
+        $createCount = if ($Exists) { 0 } else { 1 }
+        Assert-MockCalled New-AzResourceGroup -Times $createCount -Exactly -Scope It
+        if (-not $Exists) {
+            Assert-MockCalled New-AzResourceGroup -Times 1 -Exactly -Scope It -ParameterFilter {
+                $Name -eq $Group -and $Location -eq 'koreacentral'
+            }
+        }
     }
 
     It 'preserves an explicit prefix through both real entry points' {
