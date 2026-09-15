@@ -242,6 +242,8 @@ foreach ($u in $users) {
     }
 }
 
+$deploymentInfo['RDP sign-in user'] = "labuser1@$initialDomain"
+
 # --------------------------------------------------------------- 4. VM + IP
 Step '4/9 Windows Server 2025 VM'
 $vmName = "$Prefix-cli"

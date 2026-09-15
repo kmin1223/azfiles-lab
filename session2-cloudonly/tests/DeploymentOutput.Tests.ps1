@@ -61,17 +61,42 @@ Describe 'Cloud-only personalized command output (offline)' {
         { New-CloudDeploymentCommands -Info $info } | Should Throw 'DEPLOY_OUTPUT_MISSING'
     }
 
-    It 'emits parseable PowerShell assignments and command examples' {
+    It 'separates every command into a labelled parseable block without prose or comment tokens' {
         $text = New-CloudDeploymentCommands -Info $info
-        $commands = @($text -split "`r?`n" | Where-Object {
-            $_ -match '^(\$|Get-|Set-|Import-|Connect-|Debug-|whoami |dsregcmd |klist(?: |$)|net use |netsh |C:\\LabTools\\|\.\/faults\/)'
-        })
-        ($commands.Count -gt 35) | Should Be $true
-        foreach ($line in $commands) {
+        $pattern = '(?ms)^\[COMMANDS \| (A|B|B-admin) \| ([^\r\n]+)\]\r?\n```powershell\r?\n(.*?)^```\r?$'
+        $blocks = [regex]::Matches($text, $pattern)
+        $blocks.Count | Should Be 21
+        ([regex]::Matches($text, '(?m)^```powershell\r?$')).Count | Should Be $blocks.Count
+        ([regex]::Matches($text, '(?m)^```\r?$')).Count | Should Be $blocks.Count
+        $commandPattern = '^(\$|Get-|Set-|Import-|Connect-|Debug-|whoami |dsregcmd |klist(?: |$)|net use(?: |$)|netsh |C:\\LabTools\\|\.\/faults\/)'
+        $commandCount = 0
+        foreach ($block in $blocks) {
+            $code = $block.Groups[3].Value
+            $parseTokens = $null
             $parseErrors = $null
-            $null = [Management.Automation.Language.Parser]::ParseInput($line, [ref]$null, [ref]$parseErrors)
-            if ($parseErrors.Count) { throw "Invalid output command: $line`n$parseErrors" }
+            $null = [Management.Automation.Language.Parser]::ParseInput($code, [ref]$parseTokens, [ref]$parseErrors)
+            if ($parseErrors.Count) { throw "Invalid command block: $code`n$parseErrors" }
+            @($parseTokens | Where-Object { $_.Kind -eq 'Comment' }).Count | Should Be 0
+            foreach ($line in ($code -split "`r?`n" | Where-Object { $_.Trim() })) {
+                $line | Should Match $commandPattern
+                $commandCount++
+            }
+            ([regex]::Matches($code, '-Fault ')).Count -le 1 | Should Be $true
+            ([regex]::Matches($code, '/delete')).Count -le 1 | Should Be $true
+            $code | Should Not Match '(?s)-StartTrace.*-StopTrace'
+            if ($code -match 'C:\\LabTools\\(Invoke-LabFault|Get-KerberosEvidence)') {
+                $block.Groups[1].Value | Should Be 'B-admin'
+            }
+            if ($code -match '\./faults/Invoke-Fault') {
+                $block.Groups[1].Value | Should Be 'A'
+            }
         }
+        ($commandCount -gt 35) | Should Be $true
+        foreach ($line in ([regex]::Replace($text, $pattern, '') -split "`r?`n")) {
+            $line | Should Not Match $commandPattern
+        }
+        $text | Should Match '\[COMMENTS / MANUAL ACTIONS\]'
+        $text | Should Match 'Copy only the lines INSIDE a COMMANDS code block'
     }
 
     It 'keeps reboot recovery context boundaries and private trace guidance' {
@@ -109,7 +134,7 @@ Describe 'Cloud-only personalized command output (offline)' {
             $saved | Should Match 'Finished UTC :'
             $saved | Should Match 'Elapsed :'
             $saved | Should Match 'LAB COMMANDS'
-            $saved | Should Match 'Generated password : not-a-real-credential'
+            $saved | Should Match 'PASSWORD : not-a-real-credential'
             $saved | Should Match 'User baseline : NOT VERIFIED'
             Assert-MockCalled Stop-Transcript -Times 1 -Exactly -Scope It
         }
@@ -132,9 +157,10 @@ Describe 'Cloud-only personalized command output (offline)' {
         $source | Should Match ([regex]::Escape('$logRun.Commands = New-CloudDeploymentCommands -Info $deploymentInfo'))
         foreach ($field in @('Azure tenant ID','Subscription ID','VM resource ID','NIC resource ID',
             'Subnet resource ID','OS disk resource ID','Storage resource ID','Share UNC','CIFS SPN',
-            'labuser1 object ID','labuser2 object ID','Storage service principal ID')) {
+            'labuser1 object ID','labuser2 object ID','Storage service principal ID','RDP sign-in user')) {
             $source | Should Match ([regex]::Escape("'$field'"))
         }
+        $source | Should Match ([regex]::Escape('$deploymentInfo[''RDP sign-in user''] = "labuser1@$initialDomain"'))
         $source | Should Not Match 'sign out/in after'
     }
 }

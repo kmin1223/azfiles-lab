@@ -87,12 +87,46 @@ Describe 'Cloud-only deployment output (offline)' {
         Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
         $text = Get-Content -LiteralPath $logRun.InfoFile -Raw
         $text | Should Match 'Status : IN PROGRESS'
-        $text | Should Match 'Generated password : not-a-real-credential'
+        $text | Should Match 'PASSWORD : not-a-real-credential'
         $text | Should Match 'SENSITIVE'
         $deploymentInfo['Storage account'] = 'azf560970e8abcdefgh'
         Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo
         (Get-Content -LiteralPath $logRun.InfoFile -Raw) | Should Match 'Storage account : azf560970e8abcdefgh'
         Test-Path -LiteralPath (Join-Path $logRun.Directory 'lab-info.tmp') | Should Be $false
+    }
+
+    It 'puts the Entra RDP identity and password above resource details without printing credentials' {
+        $deploymentInfo['RDP sign-in user'] = 'labuser1@example.onmicrosoft.com'
+        $deploymentInfo['RDP host'] = 'example-cli.koreacentral.cloudapp.azure.com'
+        $deploymentInfo['RDP file'] = '/home/example/azfiles-cloudonly.rdp'
+        $deploymentInfo['Entra joined'] = 'NO'
+        @(Save-CloudDeploymentInfo -Run $logRun -Info $deploymentInfo).Count | Should Be 0
+        $text = Get-Content -LiteralPath $logRun.InfoFile -Raw
+        $header = ($text -split 'DEPLOYMENT / RESOURCE DETAILS')[0]
+        $header | Should Match 'RDP SIGN-IN - ENTRA LAB USER \(NOT localadmin\)'
+        $header | Should Match 'USER ID  : labuser1@example.onmicrosoft.com'
+        $header | Should Match 'PASSWORD : not-a-real-credential'
+        $header | Should Match 'RDP HOST : example-cli.koreacentral.cloudapp.azure.com'
+        $header | Should Match 'RDP FILE : /home/example/azfiles-cloudonly.rdp'
+        $header | Should Match 'JOIN     : NO'
+        $header | Should Match 'readiness is unverified'
+        ([regex]::Matches($text, 'not-a-real-credential')).Count | Should Be 1
+        $text | Should Not Match 'Generated password :'
+        Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It
+        Assert-MockCalled Write-Warning -Times 0 -Exactly -Scope It
+    }
+
+    It 'labels missing early-stage credentials and connection details rather than inventing defaults' {
+        $partial = [ordered]@{ Status = 'IN PROGRESS' }
+        Save-CloudDeploymentInfo -Run $logRun -Info $partial
+        $text = Get-Content -LiteralPath $logRun.InfoFile -Raw
+        $text | Should Match 'USER ID  : NOT YET RECORDED'
+        $text | Should Match 'PASSWORD : NOT YET GENERATED'
+        $text | Should Match 'RDP HOST : NOT YET RECORDED'
+        $text | Should Match 'RDP FILE : NOT YET GENERATED'
+        $text | Should Match 'JOIN     : NOT CHECKED'
+        $text | Should Match 'Status : IN PROGRESS'
+        $partial.Count | Should Be 1
     }
 
     It 'records the actual step and prints its elapsed time' {

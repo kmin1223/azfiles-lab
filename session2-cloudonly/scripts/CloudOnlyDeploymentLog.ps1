@@ -56,13 +56,37 @@ function Save-CloudDeploymentInfo {
         [Parameter(Mandatory)] [object]$Run,
         [Parameter(Mandatory)] [System.Collections.IDictionary]$Info
     )
+    $rdpUser = if ($Info['RDP sign-in user']) { $Info['RDP sign-in user'] } else { 'NOT YET RECORDED' }
+    $password = if ($Info['Generated password']) { $Info['Generated password'] } else { 'NOT YET GENERATED' }
+    $rdpHost = if ($Info['RDP host']) { $Info['RDP host'] } else { 'NOT YET RECORDED' }
+    $rdpFile = if ($Info['RDP file']) { $Info['RDP file'] } else { 'NOT YET GENERATED' }
+    $joinStatus = if ($Info['Entra joined']) { $Info['Entra joined'] } else { 'NOT CHECKED' }
     $lines = @(
         'Azure Files Cloud-only deployment'
         'SENSITIVE: contains generated lab credentials. Do not commit or share.'
+        ''
+        '=============================================================='
+        'RDP SIGN-IN - ENTRA LAB USER (NOT localadmin)'
+        '=============================================================='
+        "USER ID  : $rdpUser"
+        "PASSWORD : $password"
+        ''
+        "RDP HOST : $rdpHost"
+        "RDP FILE : $rdpFile"
+        "JOIN     : $joinStatus"
+        'Use the USER ID and PASSWORD above with the generated RDP file.'
+        'Credentials being listed does not prove Join or sign-in succeeded.'
+        'NO / UNKNOWN / NOT CHECKED: Entra lab sign-in readiness is unverified.'
+        '=============================================================='
+        ''
+        'DEPLOYMENT / RESOURCE DETAILS - information, not commands'
         'IN PROGRESS means no final outcome was recorded; inspect deploy.log.'
         ''
     )
-    foreach ($key in $Info.Keys) { $lines += '{0} : {1}' -f $key, $Info[$key] }
+    foreach ($key in $Info.Keys) {
+        if ($key -in @('Generated password', 'RDP sign-in user')) { continue }
+        $lines += '{0} : {1}' -f $key, $Info[$key]
+    }
     if ($Run.Commands) { $lines += $Run.Commands }
     $temporary = Join-Path $Run.Directory 'lab-info.tmp'
     $lines | Set-Content -LiteralPath $temporary -Encoding UTF8 -ErrorAction Stop
