@@ -230,7 +230,7 @@ C:\LabTools\Get-KerberosEvidence.ps1 -ConvertTrace -Path 'C:\Private capture\tra
 ```
 
 [COMMENTS / OUTPUT]
-Output: private, unique folders under %LOCALAPPDATA%\AzFilesLab-Traces.
+Output: private, unique folders under C:\LabTools\evidence (same root as Session 1).
 This helper only starts/stops netsh and converts ETL; it does not decrypt HTTPS.
 Do not commit/share captures or credentials.
 

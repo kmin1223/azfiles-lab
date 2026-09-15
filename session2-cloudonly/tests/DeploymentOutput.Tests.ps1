@@ -107,6 +107,8 @@ Describe 'Cloud-only personalized command output (offline)' {
         $text | Should Match 'Get-KerberosEvidence.ps1 -StartTrace'
         $text | Should Match 'Get-KerberosEvidence.ps1 -StopTrace'
         $text | Should Match 'Get-KerberosEvidence.ps1 -ConvertTrace'
+        $text | Should Match ([regex]::Escape('C:\LabTools\evidence (same root as Session 1)'))
+        $text | Should Not Match 'AzFilesLab-Traces'
         $text | Should Match 'Do not commit/share captures or credentials'
         $text | Should Not Match 'net use \* /delete'
         $text | Should Not Match 'Remove-AzResourceGroup.*-Force'

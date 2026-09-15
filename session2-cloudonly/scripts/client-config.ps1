@@ -291,6 +291,8 @@ function Get-LabTraceHelperContent {
   Reproduce the problem yourself in the affected user's normal window.
   StopTrace also converts to pcapng. ConvertTrace retries conversion of a saved
   ETL into a NEW private folder; it never starts or stops a trace.
+  Output accumulates in C:\LabTools\evidence\<timestamp>-<unique ID>\.
+  An already-stopped recorded trace can be finalized with StopTrace again.
   Captures contain sensitive network traffic. Keep them local and private;
   do not commit, upload or share them. Conversion does not decrypt TLS.
 .EXAMPLE
@@ -298,7 +300,7 @@ function Get-LabTraceHelperContent {
 .EXAMPLE
   C:\LabTools\Get-KerberosEvidence.ps1 -StopTrace
 .EXAMPLE
-  C:\LabTools\Get-KerberosEvidence.ps1 -ConvertTrace -Path 'C:\Users\Lab User\AppData\Local\AzFilesLab-Traces\run\trace.etl'
+  C:\LabTools\Get-KerberosEvidence.ps1 -ConvertTrace -Path 'C:\LabTools\evidence\saved-run\trace.etl'
 #>
 [CmdletBinding(DefaultParameterSetName = 'Start')]
 param(
@@ -359,8 +361,14 @@ function New-TraceRunDirectory {
     $run
 }
 
+function Test-TraceInactiveStatus {
+    param([string]$Status)
+    $Status.Trim() -eq 'There is no trace session currently in progress.'
+}
+
 function Invoke-TraceNative {
-    param([string]$FilePath, [string[]]$Arguments, [string]$WorkDirectory)
+    param([string]$FilePath, [string[]]$Arguments, [string]$WorkDirectory,
+        [switch]$AllowNoTraceSession)
     # Start-Process joins ArgumentList with spaces, so quote EVERY argument
     # explicitly for both Windows PowerShell 5.1 and PowerShell 7.
     $quoted = foreach ($argument in $Arguments) {
@@ -380,7 +388,13 @@ function Invoke-TraceNative {
             if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw }
             if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw }
         ) -join "`n"
-        if ($process.ExitCode -ne 0) {
+        # netsh status can return 1 for the normal no-session state. Do not
+        # suppress other failures or apply this exception to start/stop/conversion.
+        $knownInactiveStatus = $AllowNoTraceSession -and
+            ([IO.Path]::GetFileName($FilePath) -eq 'netsh.exe') -and
+            (($Arguments -join '|') -eq 'trace|show|status') -and
+            (Test-TraceInactiveStatus -Status $output)
+        if ($process.ExitCode -ne 0 -and -not ($process.ExitCode -eq 1 -and $knownInactiveStatus)) {
             throw "TRACE_COMMAND_FAILED: $FilePath $($quoted -join ' ') exited $($process.ExitCode).`n$output"
         }
         $output
@@ -392,20 +406,25 @@ function Invoke-TraceNative {
 }
 
 function Assert-TraceSession {
-    param([string]$EtlPath, [string]$Root, [switch]$Stopped)
+    param([string]$EtlPath, [string]$Root, [switch]$Stopped, [switch]$AllowInactive)
     $status = Invoke-TraceNative -FilePath "$env:WINDIR\System32\netsh.exe" `
-        -Arguments @('trace', 'show', 'status') -WorkDirectory $Root
+        -Arguments @('trace', 'show', 'status') -WorkDirectory $Root -AllowNoTraceSession
     # Match the complete recorded path, not localized netsh field labels.
     $pattern = '(?im)(?:^|[ \t"=])' + [regex]::Escape($EtlPath) + '[" \t]*\r?$'
     if ($Stopped) {
         if ($status -match $pattern) {
             throw "TRACE_STOP_INCOMPLETE: netsh still reports '$EtlPath' after stop. State retained; inspect 'netsh trace show status' before retrying -StopTrace."
         }
+        if (-not (Test-TraceInactiveStatus -Status $status)) {
+            throw "TRACE_STOP_UNCONFIRMED: netsh did not report the recognized no-session status. State retained; inspect before retrying -StopTrace.`n$status"
+        }
         return
     }
+    if ($AllowInactive -and (Test-TraceInactiveStatus -Status $status)) { return $false }
     if ($status -notmatch $pattern) {
         throw "TRACE_SESSION_MISMATCH: netsh did not report the recorded ETL '$EtlPath'. No trace was stopped. Inspect 'netsh trace show status' before taking any manual action.`n$status"
     }
+    if ($AllowInactive) { return $true }
 }
 
 function Convert-TraceEtl {
@@ -445,18 +464,18 @@ function Convert-TraceEtl {
 function Invoke-LabTraceAction {
     param([ValidateSet('Start', 'Stop', 'Convert')][string]$Action, [string]$Path)
     if ($Action -ne 'Convert') { Assert-TraceAdmin }
-    $root = Get-LocalTracePath -Path (Join-Path $env:LOCALAPPDATA 'AzFilesLab-Traces')
+    $root = Get-LocalTracePath -Path 'C:\LabTools\evidence'
     Set-PrivateTraceDirectory -Path $root
     $pointer = Join-Path $root '.active-trace.txt'
     $lock = $null
     try {
-        # Serialize this user's helper calls; never run an implicit netsh stop.
+        # Serialize helper calls at the fixed root; never run an implicit stop.
         $lock = [IO.File]::Open((Join-Path $root '.helper.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
         Write-Warning "Captures are sensitive. Keep local/private; do not upload or commit. Private root: $root"
         switch ($Action) {
             'Start' {
                 if (Test-Path -LiteralPath $pointer) {
-                    throw "TRACE_PENDING: Use -StopTrace as this user first. State: $pointer. If the trace was stopped externally, inspect 'netsh trace show status' and remove this state file deliberately before starting again."
+                    throw "TRACE_PENDING: Use -StopTrace as this user first. State: $pointer. If netsh reports no session, -StopTrace finalizes the recorded ETL without stopping another trace."
                 }
                 $run = New-TraceRunDirectory -Root $root
                 $etl = Join-Path $run 'trace.etl'
@@ -485,14 +504,18 @@ function Invoke-LabTraceAction {
                 if (-not $etl.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
                     throw "TRACE_STATE_INVALID: Recorded ETL is outside the private root: $etl. No trace was stopped."
                 }
-                Assert-TraceSession -EtlPath $etl -Root $root
-                Write-Host "Stopping recorded trace (can take a minute): $etl"
-                $result = Invoke-TraceNative -FilePath "$env:WINDIR\System32\netsh.exe" `
-                    -Arguments @('trace', 'stop') -WorkDirectory $root
-                Assert-TraceSession -EtlPath $etl -Root $root -Stopped
+                $running = Assert-TraceSession -EtlPath $etl -Root $root -AllowInactive
+                if ($running) {
+                    Write-Host "Stopping recorded trace (can take a minute): $etl"
+                    $result = Invoke-TraceNative -FilePath "$env:WINDIR\System32\netsh.exe" `
+                        -Arguments @('trace', 'stop') -WorkDirectory $root
+                    Write-Host $result
+                    Assert-TraceSession -EtlPath $etl -Root $root -Stopped
+                } else {
+                    Write-Warning "TRACE_ALREADY_STOPPED: netsh reports no active trace. Finalizing recorded ETL without another stop: $etl"
+                }
                 Remove-Item -LiteralPath $pointer -ErrorAction Stop
-                Write-Host $result
-                Write-Output "Trace stopped. ETL: $etl"
+                Write-Output "Trace is stopped. ETL: $etl"
                 Convert-TraceEtl -EtlPath $etl -OutputDirectory (Split-Path $etl -Parent)
             }
             'Convert' {

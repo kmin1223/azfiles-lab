@@ -18,6 +18,7 @@ foreach ($definition in $helperAst.EndBlock.Statements | Where-Object {
 }) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
+$script:realTraceNative = (Get-Command Invoke-TraceNative).ScriptBlock
 
 Describe 'Cloud-only trace helper deployment (offline)' {
     BeforeEach {
@@ -83,6 +84,8 @@ Describe 'Cloud-only trace helper deployment (offline)' {
         $helper | Should Not Match '(?im)\b(klist|wevtutil|auditpol|Set-ItemProperty|Invoke-WebRequest|Invoke-RestMethod|net use|winhttp)\b'
         $helperAst.EndBlock.Statements[-1].Extent.Text |
             Should Be 'Invoke-LabTraceAction -Action $PSCmdlet.ParameterSetName -Path $Path'
+        $helper | Should Match ([regex]::Escape("Get-LocalTracePath -Path 'C:\LabTools\evidence'"))
+        $helper | Should Not Match 'AzFilesLab-Traces'
     }
 }
 
@@ -95,13 +98,14 @@ Describe 'Trace lifecycle and conversion (offline native mocks)' {
         $script:etlMode = 'good'
         $script:traceStopped = $false
         $script:stopIncomplete = $false
+        $script:postStopStatus = 'There is no trace session currently in progress.'
         $script:nativeCalls = @()
         $script:lastEtl = $null
         Mock Write-Host {}
         Mock Write-Warning {}
         Mock Assert-TraceAdmin {}
         Mock Get-LocalTracePath {
-            if ($Path -like '*\AzFilesLab-Traces') { $script:traceRoot } else { $Path }
+            if ($Path -eq 'C:\LabTools\evidence') { $script:traceRoot } else { $Path }
         }
         Mock Set-PrivateTraceDirectory { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
         Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq 'C:\LabTools\etl2pcapng.exe' }
@@ -121,7 +125,7 @@ Describe 'Trace lifecycle and conversion (offline native mocks)' {
                     }
                     'show' {
                         if ($script:traceStopped -and -not $script:stopIncomplete) {
-                            return 'There is no trace session currently in progress.'
+                            return $script:postStopStatus
                         }
                         switch ($script:statusMode) {
                             'owned' { "추적 파일: $script:lastEtl`r`n" }
@@ -179,8 +183,8 @@ Describe 'Trace lifecycle and conversion (offline native mocks)' {
         Assert-MockCalled Invoke-TraceNative -Times 0 -Exactly -Scope It
     }
 
-    It 'refuses unrelated inactive or ambiguous sessions: <Mode>' -TestCases @(
-        @{ Mode = 'other' }, @{ Mode = 'prefix' }, @{ Mode = 'idle' }
+    It 'refuses unrelated or ambiguous sessions: <Mode>' -TestCases @(
+        @{ Mode = 'other' }, @{ Mode = 'prefix' }
     ) {
         param($Mode)
         Invoke-LabTraceAction -Action Start | Out-Null
@@ -188,6 +192,71 @@ Describe 'Trace lifecycle and conversion (offline native mocks)' {
         { Invoke-LabTraceAction -Action Stop } | Should Throw 'TRACE_SESSION_MISMATCH'
         @($script:nativeCalls | Where-Object { $_ -eq 'trace|stop' }).Count | Should Be 0
         Test-Path -LiteralPath (Join-Path $script:traceRoot '.active-trace.txt') | Should Be $true
+    }
+
+    It 'finalizes an already-stopped recorded ETL without issuing another stop' {
+        Invoke-LabTraceAction -Action Start | Out-Null
+        $script:statusMode = 'idle'
+        (Invoke-LabTraceAction -Action Stop) -join "`n" | Should Match 'pcapng ready:'
+        @($script:nativeCalls | Where-Object { $_ -eq 'trace|stop' }).Count | Should Be 0
+        Test-Path -LiteralPath (Join-Path $script:traceRoot '.active-trace.txt') | Should Be $false
+        Assert-MockCalled Write-Warning -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Message -like 'TRACE_ALREADY_STOPPED:*'
+        }
+    }
+
+    It 'retains the recorded state if the post-stop result is unrecognized: <Status>' -TestCases @(
+        @{ Status = 'Unrecognized status output' },
+        @{ Status = 'Trace File: C:\Unrelated\trace.etl' }
+    ) {
+        param($Status)
+        Invoke-LabTraceAction -Action Start | Out-Null
+        $script:postStopStatus = $Status
+        { Invoke-LabTraceAction -Action Stop } | Should Throw 'TRACE_STOP_UNCONFIRMED'
+        Test-Path -LiteralPath (Join-Path $script:traceRoot '.active-trace.txt') | Should Be $true
+        @($script:nativeCalls | Where-Object { $_ -like '*.pcapng' }).Count | Should Be 0
+    }
+
+    It 'handles the real native exit-one idle result through the full stop and conversion flow' {
+        Mock Invoke-TraceNative {
+            & $script:realTraceNative -FilePath $FilePath -Arguments $Arguments `
+                -WorkDirectory $WorkDirectory -AllowNoTraceSession:$AllowNoTraceSession
+        }
+        Mock Start-Process {
+            $exitCode = 0
+            $stdout = 'native success'
+            if ($FilePath -like '*netsh.exe') {
+                switch -Regex ($ArgumentList) {
+                    '^"trace" "start"' {
+                        $script:lastEtl = [regex]::Match($ArgumentList, '"tracefile=([^"]+)"').Groups[1].Value
+                        Set-Content -LiteralPath $script:lastEtl -Value 'etl fixture'
+                    }
+                    '^"trace" "show" "status"$' {
+                        if ($script:traceStopped) {
+                            $exitCode = 1
+                            $stdout = 'There is no trace session currently in progress.'
+                        } else {
+                            $stdout = "Trace File: $script:lastEtl"
+                        }
+                    }
+                    '^"trace" "stop"$' { $script:traceStopped = $true }
+                    default { throw "Unexpected netsh arguments: $ArgumentList" }
+                }
+            } else {
+                $outputPath = [regex]::Matches($ArgumentList, '"([^"]+)"')[1].Groups[1].Value
+                Set-Content -LiteralPath $outputPath -Value 'pcap fixture'
+            }
+            Set-Content -LiteralPath $RedirectStandardOutput -Value $stdout
+            Set-Content -LiteralPath $RedirectStandardError -Value ''
+            [pscustomobject]@{ ExitCode = $exitCode }
+        }
+        Invoke-LabTraceAction -Action Start | Out-Null
+        (Invoke-LabTraceAction -Action Stop) -join "`n" | Should Match 'pcapng ready:'
+        Test-Path -LiteralPath (Join-Path (Split-Path $script:lastEtl -Parent) 'trace.pcapng') | Should Be $true
+        Test-Path -LiteralPath (Join-Path $script:traceRoot '.active-trace.txt') | Should Be $false
+        Assert-MockCalled Start-Process -Times 1 -Exactly -Scope It -ParameterFilter {
+            $ArgumentList -eq '"trace" "stop"'
+        }
     }
 
     It 'does not accept a zero start exit without a matching active path' {
@@ -273,6 +342,20 @@ Describe 'Trace lifecycle and conversion (offline native mocks)' {
         { Invoke-LabTraceAction -Action Convert -Path $script:lastEtl } | Should Throw 'TRACE_STILL_ACTIVE'
     }
 
+    It 'converts a saved legacy ETL into the fixed output root without deleting or moving the source' {
+        $legacy = Join-Path $TestDrive 'legacy-profile\AzFilesLab-Traces\old-run'
+        New-Item -ItemType Directory -Path $legacy -Force | Out-Null
+        $etl = Join-Path $legacy 'trace.etl'
+        Set-Content -LiteralPath $etl -Value 'legacy etl fixture'
+        Invoke-LabTraceAction -Action Convert -Path $etl | Out-Null
+        (Get-Content -LiteralPath $etl -Raw).Trim() | Should Be 'legacy etl fixture'
+        @(Get-ChildItem -LiteralPath $script:traceRoot -Recurse -Filter trace.pcapng).Count | Should Be 1
+        @($script:nativeCalls | Where-Object { $_ -like 'trace|*' }).Count | Should Be 0
+        Assert-MockCalled Get-LocalTracePath -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Path -eq 'C:\LabTools\evidence'
+        }
+    }
+
     It 'refuses conversion of an ETL opened for writing outside this helper' {
         $etl = Join-Path $TestDrive 'external.etl'
         Set-Content -LiteralPath $etl -Value 'external capture fixture'
@@ -289,11 +372,48 @@ Describe 'Trace lifecycle and conversion (offline native mocks)' {
 Describe 'Native quoting exit handling and private storage (offline)' {
     BeforeEach {
         $script:exitCode = 0
+        $script:nativeStdout = 'native stdout'
+        $script:nativeStderr = 'native stderr'
         Mock Start-Process {
-            Set-Content -LiteralPath $RedirectStandardOutput -Value 'native stdout'
-            Set-Content -LiteralPath $RedirectStandardError -Value 'native stderr'
+            Set-Content -LiteralPath $RedirectStandardOutput -Value $script:nativeStdout
+            Set-Content -LiteralPath $RedirectStandardError -Value $script:nativeStderr
             [pscustomobject]@{ ExitCode = $script:exitCode }
         }
+    }
+
+    It 'accepts exit one only for an opted-in recognized netsh idle status' {
+        $script:exitCode = 1
+        $script:nativeStdout = 'There is no trace session currently in progress.'
+        $script:nativeStderr = ''
+        (Invoke-TraceNative -FilePath 'C:\Windows\System32\netsh.exe' `
+            -Arguments @('trace', 'show', 'status') -WorkDirectory $TestDrive -AllowNoTraceSession).Trim() |
+            Should Be $script:nativeStdout
+        { Invoke-TraceNative -FilePath 'C:\Windows\System32\netsh.exe' `
+            -Arguments @('trace', 'show', 'status') -WorkDirectory $TestDrive } |
+            Should Throw 'TRACE_COMMAND_FAILED'
+        @(Get-ChildItem -LiteralPath $TestDrive).Count | Should Be 0
+    }
+
+    It 'does not suppress unrelated native errors with the idle-status exception: <Kind>' -TestCases @(
+        @{ Kind = 'denied' }, @{ Kind = 'empty' }, @{ Kind = 'unexpected-code' },
+        @{ Kind = 'stop' }, @{ Kind = 'converter' }, @{ Kind = 'stderr' }
+    ) {
+        param($Kind)
+        $script:exitCode = 1
+        $script:nativeStdout = 'There is no trace session currently in progress.'
+        $script:nativeStderr = ''
+        $file = 'C:\Windows\System32\netsh.exe'
+        $arguments = @('trace', 'show', 'status')
+        switch ($Kind) {
+            'denied' { $script:nativeStdout = 'Access is denied.' }
+            'empty' { $script:nativeStdout = '' }
+            'unexpected-code' { $script:exitCode = 5 }
+            'stop' { $arguments = @('trace', 'stop') }
+            'converter' { $file = 'C:\LabTools\etl2pcapng.exe' }
+            'stderr' { $script:nativeStderr = 'Unexpected native error' }
+        }
+        { Invoke-TraceNative -FilePath $file -Arguments $arguments -WorkDirectory $TestDrive -AllowNoTraceSession } |
+            Should Throw 'TRACE_COMMAND_FAILED'
     }
 
     It 'quotes spaced trace and conversion paths as single native arguments' {
